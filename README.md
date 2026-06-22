@@ -14,15 +14,30 @@ rest of [ducklink](https://github.com/tegmentum/ducklink).
 
 ## Building
 
-Requires the wasi-sdk toolchain and `cargo component`:
+Requires `cargo component`, the `wasm32-wasip2` Rust target, and four build
+inputs (wasi-sdk 33.0+, the prebuilt `libduckdb-wasi.a`, the DuckDB headers, and
+the DuckDB wasm CMake build dir). `scripts/setup-env.sh` wires them, defaulting
+to the sibling `ducklink` checkout's prebuilt artifacts (override any var to go
+standalone):
 
 ```sh
-./scripts/build-libduckdb-wasm.sh        # build libduckdb.a for wasm
-./scripts/sync-core-wit.sh               # regenerate core/wit from wit/
+make core            # standalone/server core (wasi feature)
+make core-browser    # browser core (no fs shims)
+make env             # print the resolved inputs (+ whether each exists)
+```
+
+Equivalently, by hand:
+
+```sh
+source scripts/setup-env.sh
 cargo component build -p duckdb-component-core --target wasm32-wasip2 --release --features wasi
 ```
 
 The compiled component is `target/wasm32-wasip2/release/ducklink_core.wasm`.
+
+To rebuild `libduckdb-wasi.a` itself from DuckDB source (needs wasi-sdk), use
+`./scripts/build-libduckdb-wasm.sh`; `./scripts/sync-core-wit.sh` regenerates
+`core/wit` from a canonical `wit/`.
 
 ## Consumers
 
