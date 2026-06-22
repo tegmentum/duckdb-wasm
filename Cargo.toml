@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "libduckdb-sys",
+    "core",
+]
+# `core` compiles to the `ducklink_core.wasm` component and is the default build
+# target; the workspace members share one lockfile but need
+# `--target wasm32-wasip2` + the wasi-sdk env to actually build (see README).
+default-members = ["core"]
+resolver = "2"

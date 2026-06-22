@@ -1,0 +1,50 @@
+[package]
+name = "duckdb-component-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# Keep the compiled cdylib named `ducklink_core.wasm` (the ducklink host loads
+# it by that name) even though the package is now neutrally named.
+name = "ducklink_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+libduckdb-sys = { path = "../libduckdb-sys" }
+thiserror = "1.0"
+wit-bindgen-rt = { version = "0.41.0", features = ["bitflags"] }
+libc = { version = "0.2", default-features = false }
+arrow-array = { version = "53", default-features = false, features = ["ffi"] }
+arrow-schema = { version = "53", default-features = false, features = ["ffi"] }
+arrow-data = { version = "53", default-features = false, features = ["ffi"] }
+arrow-ipc = { version = "53", default-features = false }
+
+# NOTE: the embed framework (compile a WIT-free algorithm crate directly into
+# the core as a native scalar) lives in this crate, but the concrete embeddable
+# extensions (isin, ...) and their `embed-<name>` features stay ducklink-side —
+# this repo ships pure DuckDB with no path-deps back into ducklink/extensions.
+
+[features]
+default = ["wasi"]
+wasi = ["fs_shims"]
+browser = []
+fs_shims = []
+
+[package.metadata.component]
+package = "duckdb:component"
+
+[package.metadata.component.target]
+path = "wit"
+world = "libduckdb"
+
+[package.metadata.component.target.dependencies]
+# Self-contained: the duckdb:extension contract is vendored under this crate's
+# own wit/deps (was `../../wit/duckdb-extension` into ducklink).
+"duckdb:extension" = { path = "wit/deps/duckdb-extension" }
+"wasi:cli" = { path = "wit/deps/wasi-cli" }
+"wasi:filesystem" = { path = "wit/deps/wasi-filesystem" }
+"wasi:io" = { path = "wit/deps/wasi-io" }
+"wasi:clocks" = { path = "wit/deps/wasi-clocks" }
+"wasi:sockets" = { path = "wit/deps/wasi-sockets" }
+"wasi:random" = { path = "wit/deps/wasi-random" }
+"tvm:memory" = { path = "wit/deps/tvm" }
