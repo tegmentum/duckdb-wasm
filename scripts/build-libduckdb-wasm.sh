@@ -800,6 +800,31 @@ open(p, 'w').write(s)
 print('patched block_allocator.cpp: wasi has no madvise (no-op success, like __MVS__)')
 PY
 
+# DuckDB 1.5.4 takes an fcntl(F_SETLK) advisory lock when opening a disk
+# database; the wasi sysroot's fcntl(F_SETLK) returns ENOSYS, which DuckDB turns
+# into "Could not set lock on file". wasi is a single-process sandbox with no
+# concurrent access, so the lock is meaningless -- report success (rc=0) on wasi
+# so the lock path is skipped (only the first/write-lock attempt is reachable;
+# the F_GETLK retry is gated behind has_error, which never fires here).
+python3 - "$DUCKDB_SOURCE_DIR/src/common/local_file_system.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if 'wasi: single-process sandbox, no file locking' in s:
+    sys.exit(0)
+old = 'rc = fcntl(fd, F_SETLK, &fl);'
+new = ('#ifdef __wasi__\n'
+       '\t\t\t\trc = 0; // wasi: single-process sandbox, no file locking\n'
+       '#else\n'
+       '\t\t\t\trc = fcntl(fd, F_SETLK, &fl);\n'
+       '#endif')
+i = s.find(old)  # first occurrence = the initial write-lock attempt
+if i == -1:
+    sys.exit('local_file_system.cpp: F_SETLK anchor not found')
+s = s[:i] + new + s[i + len(old):]
+open(p, 'w').write(s)
+print('patched local_file_system.cpp: wasi skips fcntl(F_SETLK) file locking')
+PY
+
 echo "Building libduckdb static archive" >&2
 cmake --build "$BUILD_DIR" --target duckdb_static
 
