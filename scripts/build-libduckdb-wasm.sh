@@ -447,9 +447,13 @@ p, inc = sys.argv[1], sys.argv[2]
 s = open(p).read()
 if 'mysql-deps.cmake' in s:
     sys.exit(0)
-if 'find_package(libmysql REQUIRED)' not in s:
-    sys.stderr.write('mysql anchor not found: find_package(libmysql)\n'); sys.exit(1)
-s = s.replace('find_package(libmysql REQUIRED)', 'include("%s")' % inc, 1)
+if 'find_package(libmariadb REQUIRED)' not in s:
+    sys.stderr.write('mysql anchor not found: find_package(libmariadb)\n'); sys.exit(1)
+s = s.replace('find_package(libmariadb REQUIRED)', 'include("%s")' % inc, 1)
+# the extension resets MYSQL_INCLUDE_DIR to a vcpkg path absent on wasi; keep the
+# mariadb include from mysql-deps.cmake.
+s = s.replace('set(MYSQL_INCLUDE_DIR\n    ${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include/mysql)',
+              '# MYSQL_INCLUDE_DIR provided by mysql-deps.cmake', 1)
 anchor = 'build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})'
 if anchor not in s:
     sys.stderr.write('mysql anchor not found: build_loadable_extension\n'); sys.exit(1)
@@ -463,6 +467,11 @@ s = s.replace(anchor, add, 1)
 open(p, 'w').write(s)
 print('patched mysql CMakeLists: libmariadb deps + static build + export')
 PY
+  # mysql_scanner 1.5.4 also uses the database-connector git submodule.
+  if [[ -d "$MY_SRC/.git" || -f "$MY_SRC/.git" ]]; then
+    git -C "$MY_SRC" submodule update --init database-connector 2>/dev/null \
+      && echo "initialized mysql_scanner database-connector submodule" >&2
+  fi
   # postgres + mysql both vendor these database-connector helpers in the duckdb
   # namespace with different bodies (e.g. EscapeConnectionString escapes ' vs ")
   # -> duplicate-symbol clash when both are linked. They're single-file in the
