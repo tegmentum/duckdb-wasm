@@ -731,19 +731,55 @@ decl = ('\n#ifdef __wasi__\n'
         'extern "C" int tvm_spill_available();\n'
         '#endif\n')
 s = s.replace('namespace duckdb {\n', 'namespace duckdb {\n' + decl, 1)
-anchor = ('\tif (block_id >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() &&\n'
-          '\t    !block_manager.buffer_manager.HasTemporaryDirectory()) {')
-repl = ('\tif (block_id >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() &&\n'
-        '\t    !block_manager.buffer_manager.HasTemporaryDirectory()\n'
-        '#ifdef __wasi__\n'
-        '\t    && !tvm_spill_available()\n'
-        '#endif\n'
-        '\t    ) {')
-if anchor not in s:
+# DuckDB 1.5.4 moved CanUnload into BlockMemory and collapsed the guard onto one
+# line with accessor calls (BlockId()/GetBufferManager()); earlier versions used
+# block_manager.buffer_manager across two lines. Handle both forms.
+candidates = [
+    # 1.5.4+ single-line form
+    ('\tif (BlockId() >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() && '
+     '!GetBufferManager().HasTemporaryDirectory()) {',
+     '\tif (BlockId() >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() && '
+     '!GetBufferManager().HasTemporaryDirectory()\n'
+     '#ifdef __wasi__\n'
+     '\t    && !tvm_spill_available()\n'
+     '#endif\n'
+     '\t    ) {'),
+    # pre-1.5 two-line form
+    ('\tif (block_id >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() &&\n'
+     '\t    !block_manager.buffer_manager.HasTemporaryDirectory()) {',
+     '\tif (block_id >= MAXIMUM_BLOCK && MustWriteToTemporaryFile() &&\n'
+     '\t    !block_manager.buffer_manager.HasTemporaryDirectory()\n'
+     '#ifdef __wasi__\n'
+     '\t    && !tvm_spill_available()\n'
+     '#endif\n'
+     '\t    ) {'),
+]
+for anchor, repl in candidates:
+    if anchor in s:
+        s = s.replace(anchor, repl, 1)
+        break
+else:
     sys.exit('block_handle.cpp: CanUnload anchor not found')
-s = s.replace(anchor, repl, 1)
 open(p, 'w').write(s)
 print('patched block_handle.cpp: TVM makes temp blocks evictable without a temp dir')
+PY
+
+# DuckDB 1.5.4's TaskScheduler::GetEstimatedCPUId only special-cases
+# __EMSCRIPTEN__ (returns 0); a wasi (non-emscripten) build falls into the
+# _GNU_SOURCE branch and calls sched_getcpu(), which the wasi sysroot does not
+# provide. Treat __wasi__ like emscripten -> a single estimated CPU id.
+python3 - "$DUCKDB_SOURCE_DIR/src/parallel/task_scheduler.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+anchor = 'idx_t TaskScheduler::GetEstimatedCPUId() {\n#if defined(__EMSCRIPTEN__)'
+new = 'idx_t TaskScheduler::GetEstimatedCPUId() {\n#if defined(__EMSCRIPTEN__) || defined(__wasi__)'
+if new in s:
+    sys.exit(0)
+if anchor not in s:
+    sys.exit('task_scheduler.cpp: GetEstimatedCPUId anchor not found')
+s = s.replace(anchor, new, 1)
+open(p, 'w').write(s)
+print('patched task_scheduler.cpp: wasi has no sched_getcpu (estimated cpu id = 0)')
 PY
 
 echo "Building libduckdb static archive" >&2
