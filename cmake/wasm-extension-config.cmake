@@ -63,7 +63,7 @@ embed_ext(inet           # INET/IPv4/IPv6 type + functions (pure C++)
 )
 embed_ext(fts            # full-text search (Porter stemmer, BM25; pure C++ + SQL macros)
   GIT_URL https://github.com/duckdb/duckdb-fts
-  GIT_TAG 39376623630a968154bef4e6930d12ad0b59d7fb   # DuckDB 1.5.4-pinned commit for this version
+  GIT_TAG 6814ec9a7d5fd63500176507262b0dbf7cea0095   # DuckDB 1.5.4-pinned commit for this version
   INCLUDE_DIR extension/fts/include                  # nested layout; so the generated loader finds fts_extension.hpp
 )
 embed_ext(vss            # vector similarity search (HNSW index; pure C++ usearch)
@@ -83,7 +83,7 @@ embed_ext(ducklake        # DuckLake lakehouse format (SQL catalog + parquet sto
 )
 embed_ext(encodings       # decode legacy text encodings (CSV in non-UTF8); pure C++, generated charset tables (~80 MB), no deps
   GIT_URL https://github.com/duckdb/duckdb-encodings
-  GIT_TAG b5a547ec74fad87698ed3142033d7b9cf86e0b2f   # DuckDB 1.4.0-pinned commit (.github/config/extensions/encodings.cmake)
+  GIT_TAG 06295e77b13de65842992c82f14289ea679e4730   # DuckDB 1.4.0-pinned commit (.github/config/extensions/encodings.cmake)
   INCLUDE_DIR src/include
 )
 
@@ -141,13 +141,13 @@ if(EXISTS "${WASI_DEPS}/avro-c/lib/libavro.a")
   set(ZLIB_LIBRARY "$ENV{HOME}/git/curl-wasm/build/zlib/lib/libz.a" CACHE FILEPATH "" FORCE)
   embed_ext(avro          # read_avro table function (libavro-c + jansson, deflate codec)
     GIT_URL https://github.com/duckdb/duckdb-avro
-    GIT_TAG 0c97a61781f63f8c5444cf3e0c6881ecbaa9fe13   # DuckDB 1.5.4-pinned commit
+    GIT_TAG f9d590297485f0318f480372c70bdd852826e258   # DuckDB 1.5.4-pinned commit
   )
   if(EXISTS "${WASI_DEPS}/roaring/lib/libroaring.a")
     set(roaring_DIR "${WASI_DEPS}/roaring/lib/cmake/roaring" CACHE PATH "" FORCE)
     embed_ext(iceberg     # Apache Iceberg tables (avro manifests + roaring; AWS SDK skipped on wasi)
       GIT_URL https://github.com/duckdb/duckdb-iceberg
-      GIT_TAG 49d67e45a6f15ad855f3760658b4ab42967d9cdc # DuckDB 1.5.4-pinned commit
+      GIT_TAG e6fe0a4b28ed13f4a1ae5c7e12bad338c6fc13c7 # DuckDB 1.5.4-pinned commit
       INCLUDE_DIR src/include
     )
   endif()
@@ -165,7 +165,7 @@ if(EXISTS "$ENV{HOME}/git/gdal-wasm/build/deps/gdal/libgdal.a"
    AND EXISTS "$ENV{HOME}/git/proj-wasm/build_cbor/deps/proj/lib/libproj.a")
   embed_ext(spatial       # ST_* geometry (GEOS) + transforms (PROJ) + format I/O (GDAL/OGR)
     GIT_URL https://github.com/duckdb/duckdb-spatial
-    GIT_TAG a6a607fe3a98ef9ad4bed218490b770f725fbc12   # DuckDB 1.5.4-pinned commit
+    GIT_TAG b68b309d371dba936c5bb362980e559b7756b16d   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/spatial                            # spatial_extension.hpp for the generated loader
   )
 endif()
@@ -177,7 +177,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/minizip/lib/libminizip-n
    AND EXISTS "$ENV{HOME}/git/expat-wasm/build/lib/libexpat.a")
   embed_ext(excel          # read_xlsx/COPY TO xlsx + Excel number formatting
     GIT_URL https://github.com/duckdb/duckdb-excel
-    GIT_TAG 8504be9ec8183e4082141f9359b53a64d3a440b7   # DuckDB 1.5.4-pinned commit
+    GIT_TAG f4c72b5ef04a03b3a78a95b5a2ee94ba93e3178d   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/excel/include                      # excel_extension.hpp for the generated loader
   )
 endif()
@@ -192,7 +192,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/src/postgresql-15.13/src
    AND EXISTS "$ENV{HOME}/git/openssl-wasm/build/openssl/libssl.a")
   embed_ext(postgres_scanner # ATTACH/scan PostgreSQL over TCP (libpq compiled inline)
     GIT_URL https://github.com/duckdb/duckdb-postgres
-    GIT_TAG f012a4f99cea1d276d1787d0dc84b1f1a0e0f0b2   # DuckDB 1.5.4-pinned commit
+    GIT_TAG 8f813f9b9c9e52a9074a050a0be60f49160a6baa   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/include                            # postgres_scanner_extension.hpp for the loader
   )
 endif()
@@ -205,7 +205,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/mariadb/lib/mariadb/libm
    AND EXISTS "$ENV{HOME}/git/openssl-wasm/build/openssl/libssl.a")
   embed_ext(mysql_scanner    # ATTACH/scan MySQL/MariaDB over TCP (libmariadb)
     GIT_URL https://github.com/duckdb/duckdb-mysql
-    GIT_TAG 8a32d4e069438585e80494e296e407653aebfed3   # DuckDB 1.5.4-pinned commit
+    GIT_TAG 37006e53a58ddc31eeb96ff95c21f3196e27fcf2   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/include                            # mysql_scanner_extension.hpp for the loader
   )
 endif()
@@ -249,7 +249,7 @@ if((_w_httpfs OR _w_ui OR _w_uc)
 
   embed_ext(httpfs        # HTTP/S3 filesystem (httplib + openssl-wasm + curl-wasm + wasi:sockets)
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 354d3f436a33f80f03a74419e76eb59459e19168   # DuckDB 1.5.4-pinned commit
+    GIT_TAG c3f215ab360f04dc3d3d5305fa81849c0121f111   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR extension/httpfs/include
   )
 
