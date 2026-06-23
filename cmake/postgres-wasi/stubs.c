@@ -3,6 +3,7 @@
    wasi-libc impl wins. */
 #include <stddef.h>
 #include <errno.h>
+#include <sys/types.h>
 #include "pwd.h"
 typedef unsigned long __sigset_t_compat;
 #define WEAK __attribute__((weak))
@@ -22,6 +23,7 @@ WEAK int getpwuid_r(uid_t u, struct passwd *p, char *b, size_t n, struct passwd 
     (void)u;(void)p;(void)b;(void)n; if(r)*r=NULL; return 0; }
 WEAK uid_t getuid(void) { return 0; }
 WEAK uid_t geteuid(void) { return 0; }
+WEAK mode_t umask(mode_t m) { (void)m; return 0; }
 /* unix-socket peer creds; never reached for TCP connections */
 WEAK int getpeereid(int fd, uid_t *u, gid_t *g) { (void)fd; if(u)*u=0; if(g)*g=0; return -1; }
 WEAK void *popen(const char *c, const char *m) { (void)c;(void)m; return NULL; }

@@ -77,8 +77,14 @@ extern "C" {
 #endif
 uid_t getuid(void);
 uid_t geteuid(void);
+mode_t umask(mode_t);
 FILE *popen(const char *, const char *);
 int pclose(FILE *);
+/* CLK_TCK: obsolete clock-ticks-per-second constant that postgres src/port/
+   getrusage.c references; wasi libc omits it. Conventional value. */
+#ifndef CLK_TCK
+#define CLK_TCK 100
+#endif
 /* getnameinfo: provided by the wasip2 socket graft at link, but its decl is
    guarded out of <netdb.h> (the NI_* flag macros are not). */
 #include <sys/socket.h>
