@@ -17,6 +17,14 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 DUCKLINK="${DUCKLINK_DIR:-$HERE/../ducklink}"
 
+# In-tree-vendored extensions (delta, ui) reference their sources via the cmake
+# config's ${CMAKE_CURRENT_LIST_DIR}/../external/duckdb path = $HERE/external/duckdb.
+# The actual DuckDB checkout lives under ducklink; symlink it so those resolve.
+if [ ! -e "$HERE/external/duckdb" ] && [ -d "$DUCKLINK/external/duckdb" ]; then
+  mkdir -p "$HERE/external"
+  ln -s "$DUCKLINK/external/duckdb" "$HERE/external/duckdb"
+fi
+
 # Derive the wasi-sdk platform suffix (override WASI_SDK_PREFIX to bypass).
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  WASI_PLAT="arm64-macos" ;;

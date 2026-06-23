@@ -57,6 +57,7 @@ configure_duckdb() {
   env WASM_EXTENSIONS="$WASM_EXTENSIONS" cmake -S "$DUCKDB_SOURCE_DIR" -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/toolchains/wasi-sdk.cmake" \
     -DWASI_SDK_PREFIX:PATH="$WASI_SDK_PREFIX" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DDUCKDB_EXTENSION_CONFIGS="$DUCKDB_EXTENSION_CONFIGS" \
     -DEMBED_EXTENSIONS="$EMBED_EXTENSIONS" \
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
@@ -562,6 +563,14 @@ stage_delta_kernel() {
   # (idempotent; guarded on the engine-swap marker). Lets a freshly re-vendored
   # pristine fa847248 be made wasm-ready without manual edits.
   local DELTA_DIR="$DUCKDB_SOURCE_DIR/extension/delta"
+  # delta is vendored in-tree (not FetchContent). Clone the kernel-matched
+  # duckdb-delta @ fa847248 if the tree is absent (e.g. after a clean checkout).
+  if [[ ! -d "$DELTA_DIR/src" ]]; then
+    echo "delta: vendoring duckdb-delta @ fa847248 into $DELTA_DIR" >&2
+    rm -rf "$DELTA_DIR"
+    git clone --quiet https://github.com/duckdb/duckdb-delta "$DELTA_DIR" \
+      && ( cd "$DELTA_DIR" && git checkout --quiet fa847248 )
+  fi
   if [[ -f "$DELTA_DIR/src/functions/delta_scan/delta_multi_file_list.cpp" ]] \
      && ! grep -q 'get_sync_engine' "$DELTA_DIR/src/functions/delta_scan/delta_multi_file_list.cpp"; then
     for p in "$(pwd)"/cmake/delta-wasi/delta-fa847248-*.patch; do
