@@ -26,10 +26,14 @@ case "$(uname -s)-$(uname -m)" in
   *)             WASI_PLAT="arm64-macos" ;;
 esac
 
+# wasi-sdk toolchain + the DuckDB source checkout are shared inputs that still
+# live under ducklink/external (override with WASI_SDK_PREFIX / DUCKDB_SOURCE_DIR
+# or DUCKLINK_DIR). The static lib + CMake build dir are OUTPUTS of this repo's
+# own build-libduckdb-wasm.sh, so they default to this repo's tree.
 export WASI_SDK_PREFIX="${WASI_SDK_PREFIX:-$DUCKLINK/external/wasi-sdk-33.0-$WASI_PLAT}"
-export DUCKDB_STATIC_LIB="${DUCKDB_STATIC_LIB:-$DUCKLINK/artifacts/libduckdb-wasi.a}"
+export DUCKDB_STATIC_LIB="${DUCKDB_STATIC_LIB:-$HERE/artifacts/libduckdb-wasi.a}"
 export DUCKDB_SOURCE_DIR="${DUCKDB_SOURCE_DIR:-$DUCKLINK/external/duckdb}"
-export DUCKDB_BUILD_DIR="${DUCKDB_BUILD_DIR:-$DUCKLINK/build/duckdb-wasi}"
+export DUCKDB_BUILD_DIR="${DUCKDB_BUILD_DIR:-$HERE/build/duckdb-wasi}"
 
 echo "duckdb-wasm build env:"
 for v in WASI_SDK_PREFIX DUCKDB_STATIC_LIB DUCKDB_SOURCE_DIR DUCKDB_BUILD_DIR; do

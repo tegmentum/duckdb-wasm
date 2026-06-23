@@ -867,6 +867,33 @@ open(p, 'w').write(s)
 print('patched extension_load.cpp: LOAD routes to host component loader on wasi')
 PY
 
+# icu extension: 1.5.4 bundles an ICU whose putil.cpp uses U_TZSET (=tzset) and
+# U_TIMEZONE (=timezone) on unrecognised platforms. wasi has no tzset, and
+# `timezone` is a struct (sys/time.h), not the POSIX global. Add a wasi branch to
+# putilimp.h's macro chains: U_TZSET no-op, U_TIMEZONE 0 (UTC; real zone comes
+# from getenv("TZ") / SET TimeZone). Only matters when icu is embedded; idempotent.
+ICU_PUTILIMP="$DUCKDB_SOURCE_DIR/extension/icu/third_party/icu/common/putilimp.h"
+if [[ -f "$ICU_PUTILIMP" ]]; then
+  python3 - "$ICU_PUTILIMP" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if 'wasi: no tzset' in s:
+    sys.exit(0)
+subs = [
+    ('#else\n#   define U_TZSET tzset',
+     '#elif defined(__wasi__)\n#   define U_TZSET() /* wasi: no tzset */\n#else\n#   define U_TZSET tzset'),
+    ('#else\n#   define U_TIMEZONE timezone',
+     '#elif defined(__wasi__)\n#   define U_TIMEZONE 0 /* wasi: UTC */\n#else\n#   define U_TIMEZONE timezone'),
+]
+for old, new in subs:
+    if old not in s:
+        sys.exit('putilimp.h: anchor not found: %r' % old[:40])
+    s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+print('patched icu putilimp.h: wasi U_TZSET/U_TIMEZONE')
+PY
+fi
+
 echo "Building libduckdb static archive" >&2
 cmake --build "$BUILD_DIR" --target duckdb_static
 
@@ -917,19 +944,22 @@ ADDLIBS=$'ADDLIB libduckdb_base.a\nADDLIB libc++abi.a\nADDLIB libc++.a\nADDLIB l
 GEN_LOADER="$BUILD_DIR/codegen/src/generated_extension_loader.cpp"
 if [[ -f "$GEN_LOADER" && -f "$BUILD_DIR/compile_commands.json" ]]; then
   GEN_CMD="$(python3 - "$BUILD_DIR/compile_commands.json" "$GEN_LOADER" "$TMPDIR/genextloader.o" "$BUILD_DIR" "$DUCKDB_SOURCE_DIR" <<'PY'
-import glob, json, os, re, shlex, sys
+import json, os, re, shlex, sys
 cc = json.load(open(sys.argv[1]))
 src, out, bdir, sdir = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 ref = next(e for e in cc if e["file"].endswith("ub_duckdb_main.cpp"))
 cmd = ref["command"].replace(ref["file"], src)
 cmd = re.sub(r'-o\s+\S+', '-o ' + shlex.quote(out), cmd)
 # The loader resolves each linked extension's class (CoreFunctionsExtension, ...)
-# through generated_extension_headers.hpp, gated on GENERATED_EXTENSION_HEADERS;
-# the borrowed core-TU flags lack that define + the codegen / per-extension
-# include dirs. Add them (every extension/*/include is harmless when unused).
+# through generated_extension_headers.hpp, gated on GENERATED_EXTENSION_HEADERS.
+# Embedded extensions live both in-tree (extension/<n>/include) and fetched into
+# the build dir, so harvest EVERY -I dir CMake used across the whole compilation
+# (from compile_commands.json) -- guarantees all extension headers resolve.
+incs = set()
+for e in cc:
+    incs.update(re.findall(r'-I\s*(\S+)', e['command']))
 extra = ['-DGENERATED_EXTENSION_HEADERS', '-I' + os.path.join(bdir, 'codegen', 'include')]
-for inc in sorted(glob.glob(os.path.join(sdir, 'extension', '*', 'include'))):
-    extra.append('-I' + inc)
+extra += ['-I' + i for i in sorted(incs)]
 print(cmd + ' ' + ' '.join(shlex.quote(x) for x in extra))
 PY
 )"
