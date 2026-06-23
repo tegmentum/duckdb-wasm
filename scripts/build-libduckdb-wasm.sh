@@ -825,6 +825,48 @@ open(p, 'w').write(s)
 print('patched local_file_system.cpp: wasi skips fcntl(F_SETLK) file locking')
 PY
 
+# Route DuckDB's LOAD to the ducklink host component loader. The wasm toolchain
+# compiles with -DDUCKDB_DISABLE_EXTENSION_LOAD (no dlopen), so 1.5.4's
+# LoadExternalExtensionInternal throws immediately. Before throwing, call the
+# core's duckdb_component_load_extension(name): if the host loads a matching
+# duckdb:extension WebAssembly component (functions already registered on the
+# active connection), mark the load finished and return; otherwise fall through.
+python3 - "$DUCKDB_SOURCE_DIR/src/main/extension/extension_load.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if 'duckdb_component_load_extension' in s:
+    sys.exit(0)
+# 1. Declare the core's C bridge at global scope (extern "C" is not allowed in a
+#    function body).
+decl = 'extern "C" bool duckdb_component_load_extension(const char *name);\n\n'
+ns = s.find('namespace duckdb {\n')
+if ns == -1:
+    sys.exit('extension_load.cpp: namespace duckdb not found')
+s = s[:ns] + decl + s[ns:]
+# 2. Route the disabled-load throw (in LoadExternalExtensionInternal, which has
+#    `&info`; the identical throw in InitialLoad is unreachable when the macro is
+#    defined) to the component loader.
+fn = s.find('ExtensionActiveLoad &info) {')
+if fn == -1:
+    sys.exit('extension_load.cpp: LoadExternalExtensionInternal signature not found')
+needle = '\tthrow PermissionException("Loading external extensions is disabled through a compile time flag");'
+i = s.find(needle, fn)
+if i == -1:
+    sys.exit('extension_load.cpp: disabled-load throw anchor not found')
+inject = (
+    '\tif (duckdb_component_load_extension(extension.c_str())) {\n'
+    '\t\tExtensionInstallInfo wasm_install_info;\n'
+    '\t\twasm_install_info.mode = ExtensionInstallMode::STATICALLY_LINKED;\n'
+    '\t\twasm_install_info.full_path = extension;\n'
+    '\t\tinfo.FinishLoad(wasm_install_info);\n'
+    '\t\treturn;\n'
+    '\t}\n'
+)
+s = s[:i] + inject + s[i:]
+open(p, 'w').write(s)
+print('patched extension_load.cpp: LOAD routes to host component loader on wasi')
+PY
+
 echo "Building libduckdb static archive" >&2
 cmake --build "$BUILD_DIR" --target duckdb_static
 
