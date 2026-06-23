@@ -1066,7 +1066,11 @@ CURL_WASM_BUILD="${CURL_WASM_BUILD:-$HOME/git/curl-wasm/build}"
 # Merge libpq into the archive so the static extension resolves PQ* symbols; pull
 # openssl too unless httpfs already merges it (shared openssl-wasm).
 if ext_selected postgres_scanner; then
-  pgdeps=("$(pwd)/build/wasi-deps/src/postgresql-15.13/src/interfaces/libpq/libpq.a")
+  _PGI="$(pwd)/build/wasi-deps/src/postgresql-15.13/src"
+  # libpq.a (frontend) + libpgport/libpgcommon shlib variants it references
+  # (pg_snprintf / pg_getaddrinfo_all / encoding helpers).
+  pgdeps=("$_PGI/interfaces/libpq/libpq.a"
+          "$_PGI/port/libpgport_shlib.a" "$_PGI/common/libpgcommon_shlib.a")
   ext_selected httpfs \
     || pgdeps+=("$OPENSSL_WASM_BUILD/libssl.a" "$OPENSSL_WASM_BUILD/libcrypto.a")
   for src in "${pgdeps[@]}"; do
@@ -1181,8 +1185,6 @@ if ext_selected avro; then
   # zlib (deflate codec) -- only if httpfs didn't already merge it
   ext_selected httpfs \
     || deps+=("$HOME/git/curl-wasm/build/zlib/lib/libz.a")
-  ext_selected iceberg \
-    && deps+=("$WASI_DEPS/roaring/lib/libroaring.a")
   for src in "${deps[@]}"; do
     name="$(basename "$src")"
     if [[ -f "$src" ]]; then
@@ -1191,6 +1193,17 @@ if ext_selected avro; then
       echo "Merging avro/iceberg dep ($src) into libduckdb-wasi.a" >&2
     fi
   done
+fi
+
+# CRoaring: ducklake (1.5.4 deletion vectors) + iceberg (manifests) both link it.
+# Merge libroaring.a once if either is selected.
+if ext_selected ducklake || ext_selected iceberg; then
+  RB="$WASI_DEPS/roaring/lib/libroaring.a"
+  if [[ -f "$RB" ]]; then
+    cp "$RB" "$TMPDIR/libroaring.a"
+    ADDLIBS="$ADDLIBS"$'\n'"ADDLIB libroaring.a"
+    echo "Merging roaring (ducklake/iceberg) into libduckdb-wasi.a" >&2
+  fi
 fi
 
 # delta: merge the prebuilt delta-kernel-rs FFI staticlib (sync engine). CMake
