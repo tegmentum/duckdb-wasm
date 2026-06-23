@@ -38,3 +38,19 @@ set(OPENSSL_INCLUDE_DIR "${_OSSL_INC}")
 set(OPENSSL_SSL_LIBRARY "${_OSSL}/libssl.a")
 set(OPENSSL_CRYPTO_LIBRARY "${_OSSL}/libcrypto.a")
 set(OPENSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+
+# --- PostgreSQL / libpq -----------------------------------------------------
+# postgres_scanner 1.5.4 switched from compiling libpq inline to
+# find_package(PostgreSQL). Provide a prebuilt libpq.a (frontend OBJS + curated
+# libpgport/libpgcommon) built from the staged wasi-cross PG-15.13 tree by
+# build-wasi-deps.sh, plus its headers, so find_package is satisfied.
+get_filename_component(_PG "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/src/postgresql-15.13" ABSOLUTE)
+if(NOT TARGET PostgreSQL::PostgreSQL)
+  add_library(PostgreSQL::PostgreSQL STATIC IMPORTED GLOBAL)
+  set_target_properties(PostgreSQL::PostgreSQL PROPERTIES
+    IMPORTED_LOCATION "${_PG}/src/interfaces/libpq/libpq.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_PG}/src/interfaces/libpq;${_PG}/src/include")
+endif()
+set(PostgreSQL_FOUND TRUE)
+set(PostgreSQL_INCLUDE_DIRS "${_PG}/src/interfaces/libpq" "${_PG}/src/include")
+set(PostgreSQL_LIBRARIES PostgreSQL::PostgreSQL)

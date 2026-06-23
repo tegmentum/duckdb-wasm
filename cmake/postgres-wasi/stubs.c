@@ -24,6 +24,9 @@ WEAK int getpwuid_r(uid_t u, struct passwd *p, char *b, size_t n, struct passwd 
 WEAK uid_t getuid(void) { return 0; }
 WEAK uid_t geteuid(void) { return 0; }
 WEAK mode_t umask(mode_t m) { (void)m; return 0; }
+/* terminal control: sprompt.c (password echo toggle) never runs on wasi */
+WEAK int tcgetattr(int fd, void *t) { (void)fd; (void)t; return -1; }
+WEAK int tcsetattr(int fd, int a, const void *t) { (void)fd; (void)a; (void)t; return -1; }
 /* unix-socket peer creds; never reached for TCP connections */
 WEAK int getpeereid(int fd, uid_t *u, gid_t *g) { (void)fd; if(u)*u=0; if(g)*g=0; return -1; }
 WEAK void *popen(const char *c, const char *m) { (void)c;(void)m; return NULL; }

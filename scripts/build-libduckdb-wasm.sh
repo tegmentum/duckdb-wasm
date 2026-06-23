@@ -379,44 +379,22 @@ p, inc = sys.argv[1], sys.argv[2]
 s = open(p).read()
 if 'postgres-deps.cmake' in s:
     sys.exit(0)
+# postgres_scanner 1.5.4 uses find_package(OpenSSL)+find_package(PostgreSQL) and
+# already calls build_static_extension. cmake/postgres-deps.cmake provides both
+# (openssl-wasm + the prebuilt libpq.a) + the wasi shim force-include, so just
+# redirect the first find_package to the include and drop the second.
 if 'find_package(OpenSSL REQUIRED)' not in s:
     sys.stderr.write('postgres anchor not found: find_package(OpenSSL)\n'); sys.exit(1)
 s = s.replace('find_package(OpenSSL REQUIRED)', 'include("%s")' % inc, 1)
-# wasi provides getaddrinfo/getnameinfo/gettimeofday; drop pg's fallback files.
-# fe-print.c (libpq's PQprint result pretty-printer, unused by the scanner)
-# includes <sys/ioctl.h> which conflicts with the duckdb toolchain ioctl stub.
-for f in ('postgres/src/port/getaddrinfo.c', 'postgres/src/port/gettimeofday.c',
-          'postgres/src/interfaces/libpq/fe-print.c'):
-    s = s.replace('    %s\n' % f, '')
-# the extension is DONT_LINK upstream (loadable only); add a static build so it
-# links into the wasm core, with the same sources.
-anchor = ('build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES}\n'
-          '                         ${LIBPG_SOURCES_FULLPATH})')
-if anchor not in s:
-    sys.stderr.write('postgres anchor not found: build_loadable_extension\n'); sys.exit(1)
-# f012a4f is DONT_LINK (loadable only) -> no install(EXPORT) for the static
-# target. build_static_extension creates ${TARGET_NAME}_extension; export it
-# like the in-tree extensions do, else "not in any export set".
-static = ('build_static_extension(${TARGET_NAME} ${ALL_OBJECT_FILES}\n'
-          '                       ${LIBPG_SOURCES_FULLPATH})\n'
-          'install(TARGETS ${TARGET_NAME}_extension EXPORT "${DUCKDB_EXPORT_SET}"\n'
-          '        LIBRARY DESTINATION "${INSTALL_LIB_DIR}"\n'
-          '        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")')
-s = s.replace(anchor, anchor + '\n' + static, 1)
+s = s.replace('find_package(PostgreSQL REQUIRED)', '', 1)
 open(p, 'w').write(s)
-print('patched postgres CMakeLists: openssl deps + static build + export + drop pg fallbacks')
+print('patched postgres CMakeLists: openssl + prebuilt libpq via postgres-deps.cmake')
 PY
-  # stage the wasi-configured PG 15.13 source as the extension's postgres/ tree,
-  # force-replacing the host source the extension's own ./configure downloads
-  # (so the wasi pg_config.h is used, not a host one). -L: replace if not ours.
-  if [[ -d "$PG_STAGED/src/include" && -f "$PG_STAGED/src/include/pg_config.h" ]]; then
-    if [[ ! -L "$PG_SRC/postgres" ]]; then
-      rm -rf "$PG_SRC/postgres"
-      ln -s "$PG_STAGED" "$PG_SRC/postgres"
-      echo "staged wasi PG 15.13 source as postgres_scanner/postgres" >&2
-    fi
-  else
-    echo "WARNING: PG 15.13 source not configured at $PG_STAGED (run build-wasi-deps.sh)" >&2
+  # postgres_scanner 1.5.4 splits its connection helpers into a database-connector
+  # git submodule (dbconnector/*.hpp); FetchContent doesn't init it.
+  if [[ -d "$PG_SRC/.git" || -f "$PG_SRC/.git" ]]; then
+    git -C "$PG_SRC" submodule update --init database-connector 2>/dev/null \
+      && echo "initialized postgres_scanner database-connector submodule" >&2
   fi
 fi
 
@@ -1000,6 +978,25 @@ fi
 # is enabled in the config; harmless if the libs are absent.
 OPENSSL_WASM_BUILD="${OPENSSL_WASM_BUILD:-$HOME/git/openssl-wasm/build/openssl}"
 CURL_WASM_BUILD="${CURL_WASM_BUILD:-$HOME/git/curl-wasm/build}"
+
+# postgres_scanner 1.5.4 links a prebuilt libpq.a (built from the staged
+# wasi-cross PG-15.13 tree by build-wasi-deps.sh) instead of compiling it inline.
+# Merge libpq into the archive so the static extension resolves PQ* symbols; pull
+# openssl too unless httpfs already merges it (shared openssl-wasm).
+if ext_selected postgres_scanner; then
+  pgdeps=("$(pwd)/build/wasi-deps/src/postgresql-15.13/src/interfaces/libpq/libpq.a")
+  ext_selected httpfs \
+    || pgdeps+=("$OPENSSL_WASM_BUILD/libssl.a" "$OPENSSL_WASM_BUILD/libcrypto.a")
+  for src in "${pgdeps[@]}"; do
+    name="$(basename "$src")"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$TMPDIR/$name"
+      ADDLIBS="$ADDLIBS"$'\n'"ADDLIB $name"
+      echo "Merging postgres dep ($src) into libduckdb-wasi.a" >&2
+    fi
+  done
+fi
+
 if ext_selected httpfs; then
   # curl-wasm is built with HTTP/2 (nghttp2) + HTTP/3 (USE_NGTCP2: ngtcp2 +
   # nghttp3). Merge those too, alongside openssl/zlib/zstd/brotli.

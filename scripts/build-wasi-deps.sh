@@ -189,6 +189,18 @@ fi
   && echo "[deps] libpq source -> $PG_SRC15 (wasi-cross-configured PG $PG_VER)" >&2 \
   || echo "[deps] WARNING: PG $PG_VER configure failed" >&2
 
+# Build libpq.a (frontend OBJS + curated libpgport/libpgcommon). postgres_scanner
+# 1.5.4 find_package(PostgreSQL)s a prebuilt libpq instead of compiling it inline;
+# cmake/postgres-deps.cmake points PostgreSQL::PostgreSQL at this archive. The
+# -fwasm-exceptions COPT gives setjmp the wasm exception support pg's own CFLAGS
+# lack; the missing-on-wasi shims (CLK_TCK/umask/sys-wait/termios) come from the
+# force-included shim + cmake/postgres-wasi.
+if [[ -f "$PG_SRC15/src/include/pg_config.h" && ! -f "$PG_SRC15/src/interfaces/libpq/libpq.a" ]]; then
+  make -C "$PG_SRC15/src/interfaces/libpq" COPT="-fwasm-exceptions" libpq.a >/dev/null 2>&1 \
+    && echo "[deps] libpq.a -> $PG_SRC15/src/interfaces/libpq/libpq.a" >&2 \
+    || echo "[deps] WARNING: libpq.a build failed" >&2
+fi
+
 # --- mariadb-connector-c (mysql_scanner: MySQL/MariaDB client) --------------
 # Prebuilt client (libmariadbclient.a) linked by the mysql extension. CMake
 # cross-build with the *clean* deps toolchain (no duckdb netdb override -> real
