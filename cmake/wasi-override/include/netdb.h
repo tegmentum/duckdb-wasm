@@ -47,5 +47,14 @@ static inline const char *gai_strerror(int) {
     return "getaddrinfo unsupported";
 }
 
+// httpfs's bundled httplib references getnameinfo (numeric host formatting). It
+// uses curl for actual networking on wasi, but the call must still compile +
+// link; the symbol comes from the wasip2 socket graft merged into the archive.
+#ifdef __cplusplus
+extern "C"
+#endif
+int getnameinfo(const struct sockaddr *, socklen_t, char *, socklen_t,
+                char *, socklen_t, int);
+
 #endif // PG_WASI_REAL_NETDB
 #endif // __wasi__

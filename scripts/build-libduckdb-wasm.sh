@@ -117,6 +117,26 @@ print('patched httpfs_curl_client.cpp for embedded CA bundle')
 PY
   echo "Embedded CA bundle into httpfs curl client ($(grep -c 'BEGIN CERTIFICATE' "$CA_BUNDLE") certs)" >&2
 
+  # DuckDB's bundled httplib (compiled only when httpfs is embedded) has an
+  # AF_UNIX path using sockaddr_un::sun_path, which wasi's <sys/un.h> omits. wasi
+  # uses curl + TCP, never unix sockets, so exclude the AF_UNIX block on wasi.
+  HTTPLIB_HPP="$DUCKDB_SOURCE_DIR/third_party/httplib/httplib.hpp"
+  if [[ -f "$HTTPLIB_HPP" ]]; then
+    python3 - "$HTTPLIB_HPP" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '#if !defined(_WIN32) || defined(CPPHTTPLIB_HAVE_AFUNIX_H)'
+new = '#if (!defined(_WIN32) || defined(CPPHTTPLIB_HAVE_AFUNIX_H)) && !defined(__wasi__)'
+if new in s:
+    sys.exit(0)
+if old not in s:
+    sys.exit('httplib.hpp: AF_UNIX guard anchor not found')
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print('patched httplib.hpp: AF_UNIX excluded on wasi (no sun_path)')
+PY
+  fi
+
   # Make curl the default HTTP client on wasi: the vendored httplib client
   # compiles but its non-blocking connect (select/poll) doesn't work on wasi, so
   # `read_csv('https://...')` must use curl. Remap the default -> curl and seed
@@ -912,6 +932,25 @@ for old, new in subs:
     s = s.replace(old, new, 1)
 open(p, 'w').write(s)
 print('patched icu putilimp.h: wasi U_TZSET/U_TIMEZONE')
+PY
+fi
+
+# icu's bundled double-conversion errors out on unrecognised architectures; add
+# wasm32 to the supported list (it is a standard IEEE-754 little-endian target).
+ICU_DC="$DUCKDB_SOURCE_DIR/extension/icu/third_party/icu/i18n/double-conversion-utils.h"
+if [[ -f "$ICU_DC" ]]; then
+  python3 - "$ICU_DC" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if '__wasm__' in s:
+    sys.exit(0)
+old = '#if defined(_M_X64) || defined(__x86_64__) || \\'
+new = '#if defined(__wasm__) || defined(__wasm32__) || defined(_M_X64) || defined(__x86_64__) || \\'
+if old not in s:
+    sys.exit('double-conversion-utils.h: arch anchor not found')
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+print('patched icu double-conversion-utils.h: wasm32 supported arch')
 PY
 fi
 
