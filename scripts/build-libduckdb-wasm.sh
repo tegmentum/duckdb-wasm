@@ -1043,6 +1043,16 @@ PY
       continue
     fi
     cp "$EXT_A" "$TMPDIR/libext_${ext}.a"
+    # sqlite_scanner vendors a full sqlite3 (sqlite3.c.obj) that collides with
+    # spatial's shared sqlite3 amalgamation (merged as libsqlite3uri, carrying the
+    # memvfs + wasi VFS that the core's database open relies on). Two sqlite3
+    # copies corrupt VFS registration -> "Could not open sqlite3 memvfs database".
+    # When both are embedded, drop sqlite_scanner's copy so all sqlite3 calls
+    # resolve to the single shared amalgamation.
+    if [[ "$ext" == "sqlite_scanner" ]] && ext_selected spatial; then
+      "$WASI_SDK_PREFIX/bin/llvm-ar" d "$TMPDIR/libext_${ext}.a" sqlite3.c.obj 2>/dev/null \
+        && echo "  dropped sqlite_scanner's vendored sqlite3.c.obj (uses shared sqlite3)" >&2
+    fi
     ADDLIBS="$ADDLIBS"$'\n'"ADDLIB libext_${ext}.a"
     echo "Merging ${ext} extension (full static lib) into libduckdb-wasi.a" >&2
   done
