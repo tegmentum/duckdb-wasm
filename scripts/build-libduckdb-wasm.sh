@@ -871,6 +871,24 @@ PY
   "$WASI_SDK_PREFIX/bin/llvm-ar" rcs "$TMPDIR/libgenextloader.a" "$TMPDIR/genextloader.o"
   ADDLIBS="$ADDLIBS"$'\n'"ADDLIB libgenextloader.a"
   echo "Merging generated extension loader into libduckdb-wasi.a" >&2
+
+  # The loader calls LoadStaticExtension<XxxExtension> for each linked extension,
+  # but 1.5.4 builds each extension as its own static-lib target
+  # (extension/<name>/lib<name>_extension.a) that is NOT linked into duckdb_static
+  # for the wasm build -- so neither the extension class nor its implementation is
+  # in the archive. Build each linked extension's target and merge its whole
+  # archive. The set comes from the loader's `extension=="NAME"` dispatch.
+  for ext in $(grep -oE 'extension=="[a-z_0-9]+"' "$GEN_LOADER" | sed -E 's/.*"([a-z_0-9]+)".*/\1/' | sort -u); do
+    cmake --build "$BUILD_DIR" --target "${ext}_extension" >/dev/null 2>&1 || true
+    EXT_A="$(find "$BUILD_DIR/extension/$ext" -name "lib${ext}_extension.a" 2>/dev/null | head -1)"
+    if [[ -z "$EXT_A" || ! -f "$EXT_A" ]]; then
+      echo "warning: lib${ext}_extension.a not found; ${ext} symbols may be unresolved" >&2
+      continue
+    fi
+    cp "$EXT_A" "$TMPDIR/libext_${ext}.a"
+    ADDLIBS="$ADDLIBS"$'\n'"ADDLIB libext_${ext}.a"
+    echo "Merging ${ext} extension (full static lib) into libduckdb-wasi.a" >&2
+  done
 fi
 
 if [[ -n "$WASIVFS_LIB" && -f "$WASIVFS_LIB" ]]; then
