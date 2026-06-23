@@ -396,6 +396,40 @@ PY
     git -C "$PG_SRC" submodule update --init database-connector 2>/dev/null \
       && echo "initialized postgres_scanner database-connector submodule" >&2
   fi
+  # postgres_scanner 1.5.4's postgres_oauth.cpp uses the PG18 libpq OAuth API,
+  # absent from the staged PG-15.13 libpq. Back-port the decls into libpq-fe.h so
+  # it compiles; the hook never fires on wasi (no OAuth backend) and
+  # PQsetAuthDataHook/PQgetAuthDataHook are no-op stubs in postgres-wasi/stubs.c.
+  PG_FE_H="$PG_STAGED/src/interfaces/libpq/libpq-fe.h"
+  if [[ -f "$PG_FE_H" ]]; then
+    python3 - "$PG_FE_H" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if 'PQAUTHDATA_OAUTH_BEARER_TOKEN' in s:
+    sys.exit(0)
+oauth = (
+    '\n/* wasi back-port of the PG18 libpq OAuth API (no-op; see postgres-wasi). */\n'
+    'typedef enum { PQAUTHDATA_PROMPT_OAUTH_DEVICE, PQAUTHDATA_OAUTH_BEARER_TOKEN } PGauthData;\n'
+    'typedef struct _PGoauthBearerRequest {\n'
+    '\tconst char *openid_configuration;\n'
+    '\tconst char *scope;\n'
+    '\tPostgresPollingStatusType (*async)(PGconn *conn, struct _PGoauthBearerRequest *req, int *altsock);\n'
+    '\tvoid (*cleanup)(PGconn *conn, struct _PGoauthBearerRequest *req);\n'
+    '\tchar *token;\n'
+    '\tvoid *user;\n'
+    '} PGoauthBearerRequest;\n'
+    'typedef int (*PQauthDataHook_type)(PGauthData type, PGconn *conn, void *data);\n'
+    'extern void PQsetAuthDataHook(PQauthDataHook_type hook);\n'
+    'extern PQauthDataHook_type PQgetAuthDataHook(void);\n'
+)
+anchor = '#ifdef __cplusplus\n}\n#endif\n\n#endif'
+if anchor not in s:
+    sys.stderr.write('libpq-fe.h: end anchor not found\n'); sys.exit(1)
+s = s.replace(anchor, oauth + anchor, 1)
+open(p, 'w').write(s)
+print('patched libpq-fe.h: PG18 OAuth API decls (no-op on wasi)')
+PY
+  fi
 fi
 
 # mysql_scanner: like postgres but links a PREBUILT MariaDB Connector/C

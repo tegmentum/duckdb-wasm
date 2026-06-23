@@ -27,6 +27,12 @@ WEAK mode_t umask(mode_t m) { (void)m; return 0; }
 /* terminal control: sprompt.c (password echo toggle) never runs on wasi */
 WEAK int tcgetattr(int fd, void *t) { (void)fd; (void)t; return -1; }
 WEAK int tcsetattr(int fd, int a, const void *t) { (void)fd; (void)a; (void)t; return -1; }
+/* PG18 libpq OAuth hooks: postgres_scanner registers one but it never fires on
+   wasi (no OAuth backend). ABI-compatible no-op (enum->int, PGconn*->void*). */
+typedef int (*pg_authdata_hook_t)(int, void *, void *);
+static pg_authdata_hook_t pg_authdata_hook = 0;
+WEAK void PQsetAuthDataHook(pg_authdata_hook_t h) { pg_authdata_hook = h; }
+WEAK pg_authdata_hook_t PQgetAuthDataHook(void) { return pg_authdata_hook; }
 /* unix-socket peer creds; never reached for TCP connections */
 WEAK int getpeereid(int fd, uid_t *u, gid_t *g) { (void)fd; if(u)*u=0; if(g)*g=0; return -1; }
 WEAK void *popen(const char *c, const char *m) { (void)c;(void)m; return NULL; }
