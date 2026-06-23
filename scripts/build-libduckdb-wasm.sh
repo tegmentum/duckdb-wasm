@@ -782,6 +782,24 @@ open(p, 'w').write(s)
 print('patched task_scheduler.cpp: wasi has no sched_getcpu (estimated cpu id = 0)')
 PY
 
+# DuckDB 1.5.4's block_allocator.cpp calls madvise(MADV_FREE_REUSABLE/DONTNEED)
+# to release physical pages on alloc/dealloc; the wasi sysroot has no madvise.
+# z/OS (__MVS__) already treats "madvise unavailable" as a no-op success -- join
+# __wasi__ to that branch instead of the madvise-calling #else.
+python3 - "$DUCKDB_SOURCE_DIR/src/storage/block_allocator.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '#elif defined(__MVS__)'
+new = '#elif defined(__MVS__) || defined(__wasi__)'
+if new in s:
+    sys.exit(0)
+if old not in s:
+    sys.exit('block_allocator.cpp: __MVS__ madvise guard not found')
+s = s.replace(old, new)  # OnAllocation + OnDeallocation
+open(p, 'w').write(s)
+print('patched block_allocator.cpp: wasi has no madvise (no-op success, like __MVS__)')
+PY
+
 echo "Building libduckdb static archive" >&2
 cmake --build "$BUILD_DIR" --target duckdb_static
 
@@ -822,6 +840,39 @@ cp "$SYSROOT_LIBDIR/libc++abi.a" "$TMPDIR/libc++abi.a"
 cp "$SYSROOT_LIBDIR/libc++.a" "$TMPDIR/libc++.a"
 cp "$SYSROOT_LIBDIR/libunwind.a" "$TMPDIR/libunwind.a"
 ADDLIBS=$'ADDLIB libduckdb_base.a\nADDLIB libc++abi.a\nADDLIB libc++.a\nADDLIB libunwind.a'
+
+# DuckDB 1.5.4 emits ExtensionHelper::LoadAllExtensions (called from
+# database.cpp) in $BUILD_DIR/codegen/src/generated_extension_loader.cpp, but its
+# codegen target is not linked into duckdb_static for the wasm build, leaving the
+# symbol undefined at component link. Compile it with the exact flags of a
+# sibling duckdb object (from compile_commands.json) and merge it in. Guarded on
+# the file existing, so older DuckDB (which defined it elsewhere) is unaffected.
+GEN_LOADER="$BUILD_DIR/codegen/src/generated_extension_loader.cpp"
+if [[ -f "$GEN_LOADER" && -f "$BUILD_DIR/compile_commands.json" ]]; then
+  GEN_CMD="$(python3 - "$BUILD_DIR/compile_commands.json" "$GEN_LOADER" "$TMPDIR/genextloader.o" "$BUILD_DIR" "$DUCKDB_SOURCE_DIR" <<'PY'
+import glob, json, os, re, shlex, sys
+cc = json.load(open(sys.argv[1]))
+src, out, bdir, sdir = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+ref = next(e for e in cc if e["file"].endswith("ub_duckdb_main.cpp"))
+cmd = ref["command"].replace(ref["file"], src)
+cmd = re.sub(r'-o\s+\S+', '-o ' + shlex.quote(out), cmd)
+# The loader resolves each linked extension's class (CoreFunctionsExtension, ...)
+# through generated_extension_headers.hpp, gated on GENERATED_EXTENSION_HEADERS;
+# the borrowed core-TU flags lack that define + the codegen / per-extension
+# include dirs. Add them (every extension/*/include is harmless when unused).
+extra = ['-DGENERATED_EXTENSION_HEADERS', '-I' + os.path.join(bdir, 'codegen', 'include')]
+for inc in sorted(glob.glob(os.path.join(sdir, 'extension', '*', 'include'))):
+    extra.append('-I' + inc)
+print(cmd + ' ' + ' '.join(shlex.quote(x) for x in extra))
+PY
+)"
+  echo "Compiling generated_extension_loader.cpp (LoadAllExtensions) for the archive" >&2
+  eval "$GEN_CMD"
+  "$WASI_SDK_PREFIX/bin/llvm-ar" rcs "$TMPDIR/libgenextloader.a" "$TMPDIR/genextloader.o"
+  ADDLIBS="$ADDLIBS"$'\n'"ADDLIB libgenextloader.a"
+  echo "Merging generated extension loader into libduckdb-wasi.a" >&2
+fi
+
 if [[ -n "$WASIVFS_LIB" && -f "$WASIVFS_LIB" ]]; then
   cp "$WASIVFS_LIB" "$TMPDIR/libsqlite_wasivfs.a"
   ADDLIBS="$ADDLIBS"$'\nADDLIB libsqlite_wasivfs.a'
