@@ -1,6 +1,8 @@
+diff --git a/src/include/http_server.hpp b/src/include/http_server.hpp
+index 78371fe..c1ae858 100644
 --- a/src/include/http_server.hpp
 +++ b/src/include/http_server.hpp
-@@ -38,6 +38,23 @@
+@@ -38,6 +38,23 @@ public:
  
    std::string LocalUrl() const;
  

@@ -1,7 +1,9 @@
---- a/CMakeLists.txt	2026-06-20 13:30:19
-+++ b/CMakeLists.txt	2026-06-20 13:31:11
-@@ -20,37 +20,47 @@
-     src/azure_dfs_filesystem.cpp
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6f2c291..c59609d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,37 +21,47 @@ set(EXTENSION_SOURCES
+     src/http_logging_policy.cpp
      src/http_state_policy.cpp
      src/azure_parsed_url.cpp)
 -add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
@@ -45,14 +47,7 @@
 -target_include_directories(
 -  ${EXTENSION_NAME} PRIVATE Azure::azure-identity Azure::azure-storage-blobs
 -                            Azure::azure-storage-files-datalake)
-+  # Static lib
-+  target_link_libraries(
-+    ${EXTENSION_NAME} Azure::azure-identity Azure::azure-storage-blobs
-+    Azure::azure-storage-files-datalake)
-+  target_include_directories(
-+    ${EXTENSION_NAME} PRIVATE Azure::azure-identity Azure::azure-storage-blobs
-+                              Azure::azure-storage-files-datalake)
- 
+-
 -# Loadable binary
 -target_link_libraries(
 -  ${TARGET_NAME}_loadable_extension Azure::azure-identity
@@ -61,6 +56,14 @@
 -  ${TARGET_NAME}_loadable_extension
 -  PRIVATE Azure::azure-identity Azure::azure-storage-blobs
 -          Azure::azure-storage-files-datalake)
++  # Static lib
++  target_link_libraries(
++    ${EXTENSION_NAME} Azure::azure-identity Azure::azure-storage-blobs
++    Azure::azure-storage-files-datalake)
++  target_include_directories(
++    ${EXTENSION_NAME} PRIVATE Azure::azure-identity Azure::azure-storage-blobs
++                              Azure::azure-storage-files-datalake)
++
 +  # Loadable binary
 +  target_link_libraries(
 +    ${TARGET_NAME}_loadable_extension Azure::azure-identity

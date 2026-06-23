@@ -31,18 +31,28 @@ azure-sdk-for-cpp commit `e9f2fa3`.
   `<spawn.h>` / `<sys/wait.h>` + `azure_subprocess_stubs.c` (all ENOSYS) let it
   link; that credential is unavailable at runtime, while env / connection-string
   / SAS / managed-identity credentials work.
-- **`azure-5e458fcc-CMakeLists.txt.patch`** — the extension's CMakeLists, patched
+- **`azure-563589b2-CMakeLists.txt.patch`** — the extension's CMakeLists, patched
   for wasm: use `build_static_extension` (a bare `add_library` leaves the
   extension out of the static link), and on wasm add the prebuilt SDK headers
   (`AZURE_SDK_WASM_DIR`, set by cmake/wasm-extension-config.cmake) instead of the
   vcpkg `find_package(...)` / `Azure::*` targets.
+- **`azure-563589b2-ca-bundle-blob.patch`** — the curl transport carries an
+  embedded CA bundle (`CURLOPT_CAINFO_BLOB` via
+  `SslOptions.PemEncodedExpectedRootCertificates`), since openssl-wasm can't read a
+  CA file through the component's wrapped FS; on wasm always use that CurlTransport.
+
+The extension is DuckDB 1.5.4's canonical `duckdb-azure @ 563589b2` (from
+`.github/config/extensions/azure.cmake`), vendored to `build/duckdb-azure`.
 
 ## Wiring
 
 `scripts/build-libduckdb-wasm.sh`: `stage_azure_extension()` builds the SDK +
 vendors/patches the extension before configure; the merge step adds the 5 Azure
 libs + libxml2 into libduckdb-wasi.a (curl-wasm/openssl-wasm already merged for
-httpfs). `cmake/wasm-extension-config.cmake` enables it (guarded on the built libs).
+httpfs), plus a `gai_strerror` stub (openssl's bio_addr.c references it and azure
+pulls more of openssl's BIO/socket code than httpfs; no wasi libc impl).
+`cmake/wasm-extension-config.cmake` enables it (guarded on the built libs +
+vendored source).
 
 ## Scope
 

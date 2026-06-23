@@ -1,6 +1,8 @@
---- a/third_party/httplib/httplib.hpp	2025-09-16 22:33:57
-+++ b/third_party/httplib/httplib.hpp	2026-06-20 16:18:09
-@@ -3075,7 +3075,7 @@
+diff --git a/third_party/httplib/httplib.hpp b/third_party/httplib/httplib.hpp
+index f12a80d..145c75a 100644
+--- a/third_party/httplib/httplib.hpp
++++ b/third_party/httplib/httplib.hpp
+@@ -3075,7 +3075,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
      hints.ai_flags = socket_flags;
    }
  
@@ -9,7 +11,7 @@
    if (hints.ai_family == AF_UNIX) {
      const auto addrlen = host.length();
      if (addrlen > sizeof(sockaddr_un::sun_path)) { return INVALID_SOCKET; }
-@@ -3386,7 +3386,7 @@
+@@ -3386,7 +3386,7 @@ inline void get_remote_ip_and_port(socket_t sock, std::string &ip, int &port) {
  
    if (!getpeername(sock, reinterpret_cast<struct sockaddr *>(&addr),
                     &addr_len)) {

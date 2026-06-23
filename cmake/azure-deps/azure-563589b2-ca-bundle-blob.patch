@@ -1,6 +1,8 @@
---- a/src/azure_storage_account_client.cpp	2026-06-20 13:30:19
-+++ b/src/azure_storage_account_client.cpp	2026-06-20 13:59:38
-@@ -245,6 +245,20 @@
+diff --git a/src/azure_storage_account_client.cpp b/src/azure_storage_account_client.cpp
+index 00dfed6..62dd0b0 100644
+--- a/src/azure_storage_account_client.cpp
++++ b/src/azure_storage_account_client.cpp
+@@ -317,6 +317,20 @@ CreateCurlTransport(const std::string &proxy, const std::string &proxy_username,
  		curl_transport_options.ProxyPassword = proxy_password;
  	}
  
@@ -21,7 +23,7 @@
  	const char *ca_info = std::getenv("CURL_CA_INFO");
  #if !defined(_WIN32) && !defined(__APPLE__)
  	if (!ca_info) {
-@@ -274,6 +288,7 @@
+@@ -346,6 +360,7 @@ CreateCurlTransport(const std::string &proxy, const std::string &proxy_username,
  	if (ca_path) {
  		curl_transport_options.CAPath = ca_path;
  	}
@@ -29,7 +31,7 @@
  
  	return std::make_shared<Azure::Core::Http::CurlTransport>(curl_transport_options);
  }
-@@ -283,6 +298,13 @@
+@@ -355,6 +370,13 @@ static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(const s
                                                                           const std::string &proxy_username,
                                                                           const std::string &proxy_password) {
  	Azure::Core::Http::Policies::TransportOptions transport_options;
@@ -43,7 +45,7 @@
  	if (transport_option_type == "default") {
  		if (!proxy.empty()) {
  			transport_options.HttpProxy = proxy;
-@@ -300,6 +322,7 @@
+@@ -372,6 +394,7 @@ static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(const s
  	} else {
  		throw InvalidInputException("transport_option_type cannot take value '%s'", transport_option_type);
  	}

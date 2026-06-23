@@ -24,8 +24,9 @@ requests are served by the host (captured files, or proxied); `/ddb/*`, `/info`,
 
 ## Phase 1 — compile duckdb-ui for wasm
 
-Vendored duckdb-ui @ `ded075b` (DuckDB 1.4.0) at `external/duckdb/extension/ui`.
-Compiles for wasm32-wasip2 with `_WASI_EMULATED_MMAN/_SIGNAL`, `-include sys/un.h`,
+Vendored duckdb-ui @ `a135471` (the "duckdb 1.5.4 and 1.4.5" release, #61) at
+`build/duckdb-ui`. Compiles for wasm32-wasip2 with `_WASI_EMULATED_MMAN/_SIGNAL`,
+`-include sys/un.h`,
 `-DDUCKDB_CPP_EXTENSION_ENTRY` (selects the new loader API, no removed
 `ExtensionUtil`), openssl-wasm headers, and the `wasm-stubs/net/if.h` shim
 (declares `if_nametoindex`/`getnameinfo` + `NI_*`, which httplib needs but wasi's
@@ -33,14 +34,20 @@ headers don't surface in every TU).
 
 ## Phase 2 — the bridge + the rest
 
-Patches (`ui-ded075b-*.patch`, applied by `stage_ui_extension`):
+Patches (`ui-a135471-*.patch`, applied by `stage_ui_extension`). Re-anchored from
+the older `ded075b` set; the only non-trivial drift was `http_server.cpp` (1.5.4's
+bundled httplib renamed `MultipartContentHeader` -> `FormData`, so the bridge's
+`ContentReader` uses the FormData callback) and `CMakeLists.txt` (the loadable
+target's `OpenSSL::*` link is now inside the native-only branch). The set:
 - `httplib.hpp`: guard the AF_UNIX blocks on `__wasi__` (wasi's `sockaddr_un` has
   no `sun_path`).
 - `watcher.cpp`: the catalog-watcher `std::thread` becomes a no-op on wasm
   (single-threaded; also sidesteps a DuckDB catalog-API drift).
 - `http_server.cpp`/`.hpp`: skip the listen thread on wasm; `Started()` reflects
   bridge mode; add `HandleRequest` (dispatches to the private `Handle*` like the
-  route table) + the `duckdb_ui_handle_request`/`duckdb_ui_free` C entry.
+  route table) + the `duckdb_ui_handle_request`/`duckdb_ui_free` C entry. Requires
+  httpfs in the core (httplib's `CPPHTTPLIB_OPENSSL_SUPPORT` pulls openssl-wasm,
+  merged by httpfs).
 - `ui_extension.cpp`: guard the `system()` browser-launch (the host opens the
   browser).
 - `CMakeLists.txt`: `build_static_extension`; on wasm skip `find_package(OpenSSL)`

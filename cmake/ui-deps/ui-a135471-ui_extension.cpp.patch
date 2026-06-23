@@ -1,0 +1,36 @@
+diff --git a/src/ui_extension.cpp b/src/ui_extension.cpp
+index 62a7b74..23b3919 100644
+--- a/src/ui_extension.cpp
++++ b/src/ui_extension.cpp
+@@ -31,11 +31,17 @@ std::string StartUIFunction(ClientContext &context) {
+   const auto &server = ui::HttpServer::Start(context);
+   const auto local_url = server.LocalUrl();
+ 
++#ifdef __wasi__
++  // wasm: no subprocess (system()); the native host (duckdb-host ui) owns the
++  // listening socket and opens the browser.
++  return StringUtil::Format("UI started at %s", local_url);
++#else
+   const auto command = StringUtil::Format("%s %s", OPEN_COMMAND, local_url);
+   return system(command.c_str())
+              ? StringUtil::Format("Navigate browser to %s",
+                                   local_url) // open command failed
+              : StringUtil::Format("UI started at %s", local_url);
++#endif
+ }
+ 
+ std::string StartUIServerFunction(ClientContext &context) {
+@@ -102,9 +108,13 @@ static void LoadInternal(DatabaseInstance &instance) {
+   // a new database)
+   ui::HttpServer::UpdateDatabaseInstanceIfRunning(instance.shared_from_this());
+ 
++#ifndef __wasi__
++  // wasm: there is no writable ~/.duckdb home dir, and the host (duckdb-host ui)
++  // serves the SPA assets that this cache directory would hold -- so skip it.
+   auto &fs = FileSystem::GetFileSystem(instance);
+   fs.CreateDirectory(fs.ExpandPath("~/.duckdb/extension_data"));
+   fs.CreateDirectory(fs.ExpandPath("~/.duckdb/extension_data/ui"));
++#endif
+ 
+   auto &config = DBConfig::GetConfig(instance);
+   {

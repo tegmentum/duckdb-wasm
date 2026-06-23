@@ -178,56 +178,13 @@ print('patched httpfs_extension.cpp: curl is the default client on wasi')
 PY
 fi
 
-# uc_catalog: the v1.4.0 extension talks to the Unity Catalog REST API with raw
-# libcurl and sets CURLOPT_CAINFO to a host CA *file* path -- which openssl-wasm
-# can't read through the wrapped FS. Embed the CA bundle and load it from memory
-# via CURLOPT_CAINFO_BLOB on wasi (same fix as httpfs/azure). Idempotent.
-UC_SRC="$BUILD_DIR/_deps/uc_catalog_extension_fc-src"
-if ext_selected uc_catalog \
-   && [[ -d "$UC_SRC" && -f "$CA_BUNDLE" ]]; then
-  { printf '{'; xxd -i < "$CA_BUNDLE"; printf '}'; } > "$UC_SRC/src/uc_catalog_ca_bundle.inc"
-  python3 - "$UC_SRC/src/uc_api.cpp" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-if 'duckdb_wasi_ca_bundle' in s:
-    sys.exit(0)
-anchor = 'static bool SetCurlCAFileInfo(CURL* curl) {\n'
-if anchor not in s:
-    sys.stderr.write('SetCurlCAFileInfo anchor not found in uc_api.cpp\n'); sys.exit(1)
-inject = anchor + '''#ifdef __wasi__
-\t// wasi: openssl can't read a CA file through the wrapped FS; use an embedded
-\t// bundle from memory (CURLOPT_CAINFO_BLOB, no file I/O).
-\t{
-\t\tstatic const unsigned char duckdb_wasi_ca_bundle[] =
-#include "uc_catalog_ca_bundle.inc"
-\t\t;
-\t\tstruct curl_blob ca_blob;
-\t\tca_blob.data = (void *)duckdb_wasi_ca_bundle;
-\t\tca_blob.len = sizeof(duckdb_wasi_ca_bundle);
-\t\tca_blob.flags = CURL_BLOB_COPY;
-\t\tcurl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca_blob);
-\t\treturn true;
-\t}
-#endif
-'''
-s = s.replace(anchor, inject, 1)
-open(p, 'w').write(s)
-print('patched uc_api.cpp for embedded CA bundle (CURLOPT_CAINFO_BLOB)')
-PY
-  echo "Embedded CA bundle into uc_catalog curl client" >&2
-  # uc_table_entry.cpp has a stray (unused) include of the catch test header via a
-  # broken relative path that doesn't resolve in the FetchContent layout. Strip it.
-  python3 - "$UC_SRC/src/storage/uc_table_entry.cpp" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-needle = '#include "../../duckdb/third_party/catch/catch.hpp"\n'
-if needle in s:
-    open(p, 'w').write(s.replace(needle, ''))
-    print('stripped stray catch.hpp include from uc_table_entry.cpp')
-PY
-fi
+# unity_catalog (DuckDB 1.5.4 renamed uc_catalog -> unity_catalog @ d52a7ee): no
+# source patch needed for wasm. Unlike the old v1.4.0 (raw libcurl + CURLOPT_CAINFO
+# file), d52a7ee issues its Unity Catalog REST calls through DuckDB's HTTPUtil
+# (curl from httpfs, which carries the embedded CA bundle), already uses
+# build_static_extension + the new ExtensionLoader API, and AutoLoadExtension's
+# httpfs. It depends on delta (uc_delta_ccv2_commit) at runtime. So just embed it
+# (with httpfs + delta) -- the config enables it; nothing to patch here.
 
 # duckdb-avro: our wasi avro-c is deflate-only (no lzma/snappy), so drop those
 # REQUIRED find_library() calls + their use in ALL_AVRO_LIBRARIES. Idempotent.
@@ -253,52 +210,54 @@ PY
 fi
 
 # iceberg: upstream finds the AWS C++ SDK + CURL behind `NOT Emscripten` guards.
-# On WASI we (1) skip those in CMake, (2) skip the AWS-SDK includes/decls in
-# aws.hpp, and (3) replace aws.cpp's AWS-SDK request path with a self-contained
-# SigV4 signer (cmake/iceberg-wasi/aws_wasi.inc) that issues signed requests via
-# HTTPUtil (curl) -- so AWS-native Iceberg catalogs (Glue/S3 Tables) work without
-# the AWS SDK. EMSCRIPTEN keeps the upstream stub.
+# The AWS SDK doesn't build for wasm, but iceberg's DEFAULT request path
+# (AWSInput::ExecuteRequest, with the iceberg_via_aws_sdk_for_catalog_interactions
+# setting off -- the default) already signs SigV4 by hand (mbedtls) and issues the
+# request through DuckDB's own HTTPUtil (curl) -- no AWS SDK. So on WASI we
+# (1) skip the AWS/CURL find_package in CMake (curl comes from httpfs),
+# (2) put a minimal AWS-type stub tree (cmake/iceberg-wasi/aws-stubs) on the
+#     include path so the pervasively-AWS-typed headers (e6fe0a4b moved them to
+#     src/catalog/rest/storage/aws.{cpp,hpp}) compile, and
+# (3) compile out the opt-in AWS-SDK legacy path (CreateSignedRequest /
+#     ExecuteRequestLegacy -- the only spots with heavy AWS-SDK calls) under
+#     __wasi__; their existing EMSCRIPTEN #else branches are the wasm fallback.
+# EMSCRIPTEN keeps upstream's vcpkg AWS path. So AWS-native Iceberg REST catalogs
+# (Glue/S3 Tables) sign + fetch via curl, and local iceberg_scan needs none of it.
 ICE_SRC="$BUILD_DIR/_deps/iceberg_extension_fc-src"
-AWS_WASI_INC="$(pwd)/cmake/iceberg-wasi/aws_wasi.inc"
-if ext_selected iceberg \
-   && [[ -d "$ICE_SRC" ]]; then
-  # CMake: skip AWS/CURL find_package on WASI as well as Emscripten
-  if ! grep -q 'STREQUAL "WASI"' "$ICE_SRC/CMakeLists.txt"; then
-    perl -0pi -e 's/NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten"/NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI"/g' "$ICE_SRC/CMakeLists.txt"
+AWS_STUBS="$(pwd)/cmake/iceberg-wasi/aws-stubs"
+if ext_selected iceberg && [[ -d "$ICE_SRC" ]]; then
+  ICE_CML="$ICE_SRC/CMakeLists.txt"
+  # CMake: skip AWS/CURL find_package on WASI as well as Emscripten.
+  if ! grep -q 'STREQUAL "WASI"' "$ICE_CML"; then
+    perl -0pi -e 's/NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten"/NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI"/g' "$ICE_CML"
   fi
-  # aws.hpp: skip the AWS-SDK includes + AWS-typed method decls on wasi too.
-  [[ -f "$ICE_SRC/src/include/aws.hpp" ]] && \
-    perl -0pi -e 's/#ifdef EMSCRIPTEN/#if defined(EMSCRIPTEN) || defined(__wasi__)/g' "$ICE_SRC/src/include/aws.hpp"
-  # aws.cpp: inject the real SigV4 impl for __wasi__ (keep EMSCRIPTEN stub + AWS SDK).
-  if [[ -f "$ICE_SRC/src/aws.cpp" ]]; then
-    python3 - "$ICE_SRC/src/aws.cpp" "$AWS_WASI_INC" <<'PY'
+  # CMake: put the AWS-type stub tree on the include path (WASI only). The
+  # pervasively-AWS-typed headers then resolve <aws/core/...> to the stubs.
+  if ! grep -q 'DUCKLINK_AWS_STUBS' "$ICE_CML"; then
+    python3 - "$ICE_CML" "$AWS_STUBS" <<'PY'
 import sys
-p, inc = sys.argv[1], sys.argv[2]
+p, stubs = sys.argv[1], sys.argv[2]
 s = open(p).read()
-if 'aws_wasi.inc' in s:
-    sys.exit(0)
-# (1) includes guard: wasi pulls <time.h>/<algorithm>, not the AWS SDK headers
-inc_old = '#ifdef EMSCRIPTEN\n#else\n#include <aws/core/auth/AWSCredentialsProviderChain.h>'
-inc_new = ('#if defined(__wasi__)\n#include <time.h>\n#include <algorithm>\n'
-           '#include "duckdb/main/database.hpp"\n'
-           '#elif defined(EMSCRIPTEN)\n#else\n#include <aws/core/auth/AWSCredentialsProviderChain.h>')
-# (2) impl guard: wasi includes the SigV4 impl; EMSCRIPTEN keeps the GET stub
-impl_old = ('#ifdef EMSCRIPTEN\n\n'
-            'unique_ptr<HTTPResponse> AWSInput::GetRequest(ClientContext &context) {\n'
-            '\tthrow NotImplementedException("GET on WASM not implemented yet");\n}\n\n#else')
-impl_new = ('#if defined(__wasi__)\n#include "%s"\n#elif defined(EMSCRIPTEN)\n\n'
-            'unique_ptr<HTTPResponse> AWSInput::GetRequest(ClientContext &context) {\n'
-            '\tthrow NotImplementedException("GET on WASM not implemented yet");\n}\n\n#else') % inc
-for old, new, what in ((inc_old, inc_new, 'aws.cpp includes guard'),
-                       (impl_old, impl_new, 'aws.cpp impl guard')):
-    if old not in s:
-        sys.stderr.write('anchor not found: %s\n' % what); sys.exit(1)
-    s = s.replace(old, new, 1)
+anchor = 'include_directories(src/include)'
+add = (anchor + '\n# DUCKLINK_AWS_STUBS: minimal AWS SDK type stubs (no AWS SDK on wasm)\n'
+       'if(CMAKE_SYSTEM_NAME STREQUAL "WASI")\n  include_directories("%s")\nendif()' % stubs)
+s = s.replace(anchor, add, 1)
 open(p, 'w').write(s)
-print('patched iceberg aws.cpp: wasi SigV4 signer injected')
+print("patched iceberg CMakeLists: AWS stubs on include path (WASI)", file=sys.stderr)
 PY
   fi
-  echo "patched iceberg: AWS SDK/CURL skipped on wasi; SigV4 signer wired" >&2
+  # aws.cpp: compile out the AWS-SDK legacy path on __wasi__. The two #ifndef
+  # EMSCRIPTEN blocks (CreateSignedRequest + ExecuteRequestLegacy) are the only
+  # spots with heavy AWS-SDK calls (CreateHttpRequest/AWSAuthV4Signer/HttpClient);
+  # extend the guard so wasi takes their existing #else fallback. Everything else
+  # (the default ExecuteRequest path + the type-only helpers) compiles against the
+  # stubs.
+  AWS_CPP="$ICE_SRC/src/catalog/rest/storage/aws.cpp"
+  if [[ -f "$AWS_CPP" ]] && ! grep -q 'DUCKLINK_WASI_NO_AWS_SDK' "$AWS_CPP"; then
+    perl -0pi -e 's/#ifndef EMSCRIPTEN/#if !defined(EMSCRIPTEN) && !defined(__wasi__) \/\/ DUCKLINK_WASI_NO_AWS_SDK/g' "$AWS_CPP"
+    echo "patched iceberg aws.cpp: AWS-SDK legacy path compiled out on wasi" >&2
+  fi
+  echo "patched iceberg: AWS SDK skipped on wasi (stubs + inline SigV4 via HTTPUtil)" >&2
 fi
 
 # spatial: replace its find_package(GDAL/PROJ/EXPAT/sqlite/ZLIB/GEOS) with our
@@ -542,15 +501,19 @@ PY
 fi
 }
 
-# delta: the `delta` extension (duckdb-delta @ fa847248, vendored at
-# external/duckdb/extension/delta, matching this DuckDB) wraps delta-kernel-rs.
-# On wasm it uses the kernel's SYNC engine only (local std::fs; no tokio/reqwest/
-# object_store). The kernel is prebuilt for wasm32-wasip2 (sync engine, zstd/brotli
-# codecs dropped) by scripts/build-delta-kernel-wasm.sh; the vendored extension
-# source + CMakeLists are already patched for wasm (get_sync_engine, DEFINE_SYNC_ENGINE,
-# no-op kernel ExternalProject) -- see cmake/delta-wasi/. This just stages the
-# prebuilt .a where the patched CMakeLists' DELTA_KERNEL_LIBPATH expects it.
-# Runs before configure because the delta CMakeLists is read at configure time.
+# delta: DuckDB 1.5.4's canonical `delta` extension is the out-of-tree
+# duckdb-delta @ 45c40878 (from .github/config/extensions/delta.cmake), wrapping
+# delta-kernel-rs v0.21.0. We vendor it to build/duckdb-delta. On wasm it uses the
+# kernel's SYNC engine only (local std::fs; no tokio/reqwest/object_store). The
+# kernel is prebuilt for wasm32-wasip2 (sync engine, zstd/brotli/flate2 codecs
+# dropped, a get_sync_engine FFI constructor added) by build-delta-kernel-wasm.sh.
+# This: (1) vendors 45c40878, (2) patches its CMakeLists -- forces
+# RUST_PLATFORM_TARGET=wasm32-wasip2 (its OS detect FATAL_ERRORs on wasm) and no-ops
+# the kernel ExternalProject's git-clone + cargo builds while KEEPING the cbindgen
+# header-gen step (it post-processes the staged FFI header into codegen/include),
+# (3) swaps the extension's default-engine builder construction to get_sync_engine
+# under __wasi__, then (4) stages the prebuilt .a + headers where the CMakeLists
+# expects them. Marker-guarded/idempotent. Runs before configure.
 stage_delta_kernel() {
   ext_selected delta || return 0
   local OUT_DIR="$(pwd)/build/delta-kernel/out"
@@ -559,28 +522,140 @@ stage_delta_kernel() {
     OUT_DIR="$OUT_DIR" WASI_SDK_PREFIX="$WASI_SDK_PREFIX" \
       "$(pwd)/scripts/build-delta-kernel-wasm.sh"
   fi
-  # Apply the wasm C++ patches to the vendored duckdb-delta (fa847248) source
-  # (idempotent; guarded on the engine-swap marker). Lets a freshly re-vendored
-  # pristine fa847248 be made wasm-ready without manual edits.
-  local DELTA_DIR="$DUCKDB_SOURCE_DIR/extension/delta"
-  # delta is vendored in-tree (not FetchContent). Clone the kernel-matched
-  # duckdb-delta @ fa847248 if the tree is absent (e.g. after a clean checkout).
-  if [[ ! -d "$DELTA_DIR/src" ]]; then
-    echo "delta: vendoring duckdb-delta @ fa847248 into $DELTA_DIR" >&2
+
+  # (1) vendor duckdb-delta @ 45c40878 (the 1.5.4 canonical delta) if absent.
+  local DELTA_DIR="$(pwd)/build/duckdb-delta"
+  local DELTA_TAG="45c40878601b54b4188b09e08732fe0d576ad222"
+  if [[ "$(git -C "$DELTA_DIR" rev-parse HEAD 2>/dev/null)" != "$DELTA_TAG" ]]; then
+    echo "delta: vendoring duckdb-delta @ ${DELTA_TAG:0:8} into $DELTA_DIR" >&2
     rm -rf "$DELTA_DIR"
-    git clone --quiet https://github.com/duckdb/duckdb-delta "$DELTA_DIR" \
-      && ( cd "$DELTA_DIR" && git checkout --quiet fa847248 )
+    git clone --quiet --filter=blob:none --no-checkout \
+      https://github.com/duckdb/duckdb-delta "$DELTA_DIR"
+    git -C "$DELTA_DIR" fetch --quiet --depth 1 origin "$DELTA_TAG"
+    git -C "$DELTA_DIR" checkout --quiet "$DELTA_TAG"
   fi
-  if [[ -f "$DELTA_DIR/src/functions/delta_scan/delta_multi_file_list.cpp" ]] \
-     && ! grep -q 'get_sync_engine' "$DELTA_DIR/src/functions/delta_scan/delta_multi_file_list.cpp"; then
-    for p in "$(pwd)"/cmake/delta-wasi/delta-fa847248-*.patch; do
-      ( cd "$DELTA_DIR" && git apply "$p" 2>/dev/null ) \
-        || patch -p1 -d "$DELTA_DIR" < "$p"
-    done
-    echo "delta: applied fa847248 wasm C++ patches" >&2
+  local CML="$DELTA_DIR/CMakeLists.txt"
+  local MFL="$DELTA_DIR/src/functions/delta_scan/delta_multi_file_list.cpp"
+
+  # (2) patch the CMakeLists: wasm platform target + no-op (but keep header-gen).
+  if [[ -f "$CML" ]] && ! grep -q 'DUCKLINK_WASI_KERNEL_NOOP' "$CML"; then
+    python3 - "$CML" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+# 2a) the CMakeLists FATAL_ERRORs when it can't map the OS to a rust triple (wasm).
+# Force the wasip2 triple so DELTA_KERNEL_LIBPATH = target/wasm32-wasip2/<cfg>/...
+s = s.replace(
+    'message(FATAL_ERROR "Failed to detect the correct platform")',
+    'set(RUST_PLATFORM_TARGET "wasm32-wasip2")  # DUCKLINK_WASI: prebuilt kernel triple')
+# 2b) no-op the ExternalProject's download + cargo builds, but KEEP the cbindgen
+# header-gen sh step (it reads the staged FFI hpp and writes the patched header to
+# codegen/include, which the extension #includes). Replace the whole block.
+start = s.index('ExternalProject_Add(')
+i = s.index('(', start); depth = 0; j = i
+while j < len(s):
+    if s[j] == '(': depth += 1
+    elif s[j] == ')':
+        depth -= 1
+        if depth == 0: break
+    j += 1
+noop = (
+'ExternalProject_Add(\n'
+'  ${KERNEL_NAME}\n'
+'  # DUCKLINK_WASI_KERNEL_NOOP: prebuilt wasm sync-engine FFI is staged by\n'
+'  # build-libduckdb-wasm.sh; skip git-clone + cargo, keep only the header-gen.\n'
+'  DOWNLOAD_COMMAND ""\n'
+'  CONFIGURE_COMMAND ""\n'
+'  UPDATE_COMMAND ""\n'
+'  BUILD_IN_SOURCE 1\n'
+'  BUILD_COMMAND\n'
+'    sh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ffi/generate_delta_kernel_ffi_header\n'
+'      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ffi\n'
+'      ${DELTA_KERNEL_FFI_HEADER_CXX}\n'
+'      ${CMAKE_BINARY_DIR}/codegen/include\n'
+'  INSTALL_COMMAND ""\n'
+'  BUILD_BYPRODUCTS "${DELTA_KERNEL_LIBPATH}"\n'
+'  BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_C}"\n'
+'  BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}")\n'
+'# DUCKLINK_WASI: the kernel FFI types use uintptr_t (32-bit on wasm32) where the\n'
+'# extension passes idx_t (64-bit); the 64->32 braced-init narrowing is a hard\n'
+'# error on wasm32 but harmless here (slice sizes never approach 4 GiB).\n'
+'add_compile_options(-Wno-c++11-narrowing -Wno-narrowing)'
+)
+open(p, 'w').write(s[:start] + noop + s[j+1:])
+print("delta: patched CMakeLists -> wasm triple + no-op kernel (header-gen kept)", file=sys.stderr)
+PY
   fi
 
-  # Pre-place the kernel .a (release; copied to debug too for the byproduct decl).
+  # (3) swap the engine construction in delta_multi_file_list.cpp: the default
+  #     engine (get_engine_builder + builder_build -> object_store/tokio) is gated
+  #     out of the sync-only kernel; use get_sync_engine under __wasi__ instead, and
+  #     compile out CreateBuilder (references the absent default-engine builder FFI).
+  if [[ -f "$MFL" ]] && ! grep -q 'DUCKLINK_WASI_SYNC_ENGINE' "$MFL"; then
+    python3 - "$MFL" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+# 3a) compile out CreateBuilder (default-engine-only FFI)
+needle = 'static ffi::EngineBuilder *CreateBuilder('
+k = s.index(needle)
+s = (s[:k]
+     + '// DUCKLINK_WASI_SYNC_ENGINE: CreateBuilder uses the default-engine builder\n'
+       '// FFI (get_engine_builder/set_builder_option), gated out of the wasm\n'
+       '// sync-only kernel. Compiled out on wasm; the sync engine is used instead.\n'
+       '#ifndef __wasi__\n'
+     + s[k:])
+end = s.index('\n}\n', s.index(needle)) + len('\n}\n')
+s = s[:end] + '#endif // __wasi__\n' + s[end:]
+# 3b) swap the engine build (builder_build -> get_sync_engine) on wasm
+old = ('\tauto interface_builder = CreateBuilder(*client_ctx_shared, paths[0].path);\n'
+       '\textern_engine = TryUnpackKernelResult(ffi::builder_build(interface_builder));')
+new = ('#ifdef __wasi__\n'
+       '\t// wasm: link only the kernel\'s local-filesystem SYNC engine.\n'
+       '\textern_engine = TryUnpackKernelResult(ffi::get_sync_engine(DuckDBEngineError::AllocateError));\n'
+       '#else\n'
+       '\tauto interface_builder = CreateBuilder(*client_ctx_shared, paths[0].path);\n'
+       '\textern_engine = TryUnpackKernelResult(ffi::builder_build(interface_builder));\n'
+       '#endif')
+assert old in s, "delta_multi_file_list engine-build anchor not found"
+s = s.replace(old, new)
+open(p, 'w').write(s)
+print("delta: patched delta_multi_file_list.cpp -> get_sync_engine on wasm", file=sys.stderr)
+PY
+  fi
+
+  # (3c) guard the Unity Catalog commit branch in delta_transaction.cpp. UC commits
+  #      go through get_uc_commit_client/get_uc_committer, which live in the kernel's
+  #      delta-kernel-unity-catalog feature -- and that feature pulls tokio (no wasm
+  #      build). UC over the network is unusable on wasm anyway, so compile the UC
+  #      branch out under __wasi__ and always take the plain local transaction.
+  local TXN="$DELTA_DIR/src/storage/delta_transaction.cpp"
+  if [[ -f "$TXN" ]] && ! grep -q 'DUCKLINK_WASI_NO_UC' "$TXN"; then
+    python3 - "$TXN" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open_if = '\t\tif (parent_commit) {'
+assert open_if in s, "delta_transaction UC if-branch not found"
+s = s.replace(open_if,
+    '#ifndef __wasi__  // DUCKLINK_WASI_NO_UC: UC commit needs tokio/network; use plain txn\n'
+    + open_if, 1)
+else_brace = ('\t\t} else {\n'
+              '\t\t\tnew_kernel_transaction = table_entry->snapshot->TryUnpackKernelResult(\n'
+              '\t\t\t    ffi::transaction(path_slice, table_entry->snapshot->extern_engine.get()));')
+assert else_brace in s, "delta_transaction else-branch anchor not found"
+s = s.replace(else_brace,
+    '\t\t} else\n#endif // __wasi__\n\t\t{\n'
+    '\t\t\tnew_kernel_transaction = table_entry->snapshot->TryUnpackKernelResult(\n'
+    '\t\t\t    ffi::transaction(path_slice, table_entry->snapshot->extern_engine.get()));', 1)
+open(p, 'w').write(s)
+print("delta: patched delta_transaction.cpp -> no UC commit on wasm", file=sys.stderr)
+PY
+  fi
+
+  # (4) pre-place the kernel .a + headers where the (now no-op) ExternalProject +
+  #     target_link_libraries expect them: target/wasm32-wasip2/{release,debug}/ +
+  #     target/ffi-headers/ (the header-gen sh reads the .hpp from there).
   local KDIR="$BUILD_DIR/rust/src/delta_kernel/target"
   mkdir -p "$KDIR/wasm32-wasip2/release" "$KDIR/wasm32-wasip2/debug" "$KDIR/ffi-headers"
   cp "$OUT_DIR/libdelta_kernel_ffi.a" "$KDIR/wasm32-wasip2/release/"
@@ -619,37 +694,41 @@ stage_aws_extension() {
 }
 
 # azure: build the Azure SDK for wasm (if needed) + vendor/patch the extension.
-# Wraps the Azure SDK for C++; the SDK is prebuilt for wasm32-wasip2 (libcurl
-# transport over curl-wasm) and merged into libduckdb-wasi.a below.
+# DuckDB 1.5.4's canonical azure is duckdb-azure @ 563589b2 (out-of-tree, from
+# .github/config/extensions/azure.cmake); we vendor it to build/duckdb-azure. The
+# Azure SDK for C++ doesn't build under vcpkg for wasm, so it's prebuilt for
+# wasm32-wasip2 (libcurl transport over curl-wasm) and merged into libduckdb-wasi.a
+# below; the CMakeLists is patched to use the prebuilt SDK headers + register a
+# static extension, and the curl transport carries an embedded CA bundle
+# (CURLOPT_CAINFO_BLOB) since openssl-wasm can't read a CA file via the wrapped FS.
 stage_azure_extension() {
   ext_selected azure || return 0
   if [[ ! -f "$(pwd)/build/azure-sdk/out/lib/libazure-storage-blobs.a" ]]; then
     echo "azure: building Azure SDK for wasm" >&2
     WASI_SDK_PREFIX="$WASI_SDK_PREFIX" "$(pwd)/scripts/build-azure-sdk-wasm.sh"
   fi
-  local AZ_DIR="$DUCKDB_SOURCE_DIR/extension/azure"
-  local PIN="5e458fcc466d2bc421922b11f4316564e3017800"
-  if [[ ! -f "$AZ_DIR/CMakeLists.txt" ]]; then
-    echo "azure: vendoring duckdb-azure @ $PIN" >&2
-    local tmp="$BUILD_DIR/duckdb-azure-src"
-    if [[ ! -d "$tmp/.git" ]]; then
-      git clone --quiet https://github.com/duckdb/duckdb-azure "$tmp"
-      git -C "$tmp" checkout --quiet "$PIN"
-    fi
-    mkdir -p "$AZ_DIR"
-    ( cd "$tmp" && git archive "$PIN" CMakeLists.txt src ) | tar -x -C "$AZ_DIR"
+  local AZ_DIR="$(pwd)/build/duckdb-azure"
+  local PIN="563589b2f24290a4dcdd4247eaedf2b544f9dbcd"
+  if [[ "$(git -C "$AZ_DIR" rev-parse HEAD 2>/dev/null)" != "$PIN" ]]; then
+    echo "azure: vendoring duckdb-azure @ ${PIN:0:8} into $AZ_DIR" >&2
+    rm -rf "$AZ_DIR"
+    git clone --quiet --filter=blob:none --no-checkout \
+      https://github.com/duckdb/duckdb-azure "$AZ_DIR"
+    git -C "$AZ_DIR" fetch --quiet --depth 1 origin "$PIN"
+    git -C "$AZ_DIR" checkout --quiet "$PIN"
   fi
-  # Patch the CMakeLists (prebuilt SDK headers + build_static_extension) + the
-  # curl transport (embedded CA bundle via CURLOPT_CAINFO_BLOB) for wasm. Idempotent.
+  # Patch the CMakeLists (prebuilt SDK headers + build_static_extension) + the curl
+  # transport (embedded CA bundle via CURLOPT_CAINFO_BLOB) for wasm. git apply, with
+  # a fuzzy `patch` fallback (the source list drifts between azure versions).
   if ! grep -q 'AZURE_SDK_WASM_DIR' "$AZ_DIR/CMakeLists.txt" 2>/dev/null; then
-    for p in "$(pwd)"/cmake/azure-deps/azure-5e458fcc-CMakeLists.txt.patch \
-             "$(pwd)"/cmake/azure-deps/azure-5e458fcc-ca-bundle-blob.patch; do
-      ( cd "$AZ_DIR" && git apply "$p" 2>/dev/null ) || patch -p1 -d "$AZ_DIR" < "$p"
+    for p in "$(pwd)"/cmake/azure-deps/azure-563589b2-CMakeLists.txt.patch \
+             "$(pwd)"/cmake/azure-deps/azure-563589b2-ca-bundle-blob.patch; do
+      ( cd "$AZ_DIR" && git apply "$p" 2>/dev/null ) \
+        || patch -p1 --fuzz=3 -d "$AZ_DIR" < "$p"
     done
     echo "azure: applied wasm CMakeLists + CA-bundle patches" >&2
   fi
-  # Embed the CA bundle (httpfs's) for CURLOPT_CAINFO_BLOB -- openssl-wasm can't
-  # load a CA file through the wrapped FS. Regenerate if missing/stale.
+  # Embed the CA bundle (httpfs's) for CURLOPT_CAINFO_BLOB. Regenerate if missing.
   local CA_BUNDLE="$(pwd)/cmake/ca-bundle/cacert.pem"
   if [[ -f "$CA_BUNDLE" && ! -f "$AZ_DIR/src/azure_ca_bundle.inc" ]]; then
     { printf '{'; xxd -i < "$CA_BUNDLE"; printf '}'; } > "$AZ_DIR/src/azure_ca_bundle.inc"
@@ -663,23 +742,26 @@ stage_azure_extension() {
 # Vendor duckdb-ui @ ded075b (DuckDB 1.4.0) + apply the wasm patches (cmake/ui-deps/).
 stage_ui_extension() {
   ext_selected ui || return 0
-  local UI_DIR="$DUCKDB_SOURCE_DIR/extension/ui"
-  local PIN="ded075b"
-  if [[ ! -f "$UI_DIR/CMakeLists.txt" ]]; then
-    echo "ui: vendoring duckdb-ui @ $PIN" >&2
-    local tmp="$BUILD_DIR/duckdb-ui-src"
-    if [[ ! -d "$tmp/.git" ]]; then
-      git clone --quiet https://github.com/duckdb/duckdb-ui "$tmp"
-    fi
-    git -C "$tmp" checkout --quiet "$PIN"
-    mkdir -p "$UI_DIR"
-    ( cd "$tmp" && git archive "$PIN" CMakeLists.txt src third_party ) | tar -x -C "$UI_DIR"
+  # DuckDB 1.5.4's matching UI is duckdb-ui @ a135471 (the "duckdb 1.5.4 and 1.4.5"
+  # release, #61; not pinned in .github/config -- ui autoloads via start_ui()).
+  # Vendor it to build/duckdb-ui (the 1.4-era ded075b uses the removed ExtensionUtil
+  # API). The native host owns the listening socket; the wasm patches bridge each
+  # request to duckdb_ui_handle_request (httplib can't listen() in wasip2).
+  local UI_DIR="$(pwd)/build/duckdb-ui"
+  local PIN="a135471122605f528d3f3c058ad420c30c8ef235"
+  if [[ "$(git -C "$UI_DIR" rev-parse HEAD 2>/dev/null)" != "$PIN" ]]; then
+    echo "ui: vendoring duckdb-ui @ ${PIN:0:8} into $UI_DIR" >&2
+    rm -rf "$UI_DIR"
+    git clone --quiet --filter=blob:none --no-checkout \
+      https://github.com/duckdb/duckdb-ui "$UI_DIR"
+    git -C "$UI_DIR" fetch --quiet --depth 1 origin "$PIN"
+    git -C "$UI_DIR" checkout --quiet "$PIN"
   fi
   # Apply the wasm patches (httplib AF_UNIX/getnameinfo, watcher no-op, the request
   # bridge, system()-guard, CMakeLists). Idempotent (guard on the bridge marker).
   if ! grep -q 'duckdb_ui_handle_request' "$UI_DIR/src/http_server.cpp" 2>/dev/null; then
-    for p in "$(pwd)"/cmake/ui-deps/ui-ded075b-*.patch; do
-      ( cd "$UI_DIR" && git apply "$p" 2>/dev/null ) || patch -p1 -d "$UI_DIR" < "$p"
+    for p in "$(pwd)"/cmake/ui-deps/ui-a135471-*.patch; do
+      ( cd "$UI_DIR" && git apply "$p" 2>/dev/null ) || patch -p1 --fuzz=3 -d "$UI_DIR" < "$p"
     done
     echo "ui: applied wasm patches" >&2
   fi
@@ -1011,6 +1093,29 @@ ADDLIBS=$'ADDLIB libduckdb_base.a\nADDLIB libc++abi.a\nADDLIB libc++.a\nADDLIB l
 # sibling duckdb object (from compile_commands.json) and merge it in. Guarded on
 # the file existing, so older DuckDB (which defined it elsewhere) is unaffected.
 GEN_LOADER="$BUILD_DIR/codegen/src/generated_extension_loader.cpp"
+# LoadAllExtensions iterates LinkedExtensions() in order; an extension whose Load()
+# grabs another's functions (delta -> parquet_scan) fails if its dependency hasn't
+# loaded yet (autoload is disabled in wasm). Reorder so the foundational extensions
+# (core_functions, parquet) come first. Idempotent / no-op if already first.
+if [[ -f "$GEN_LOADER" ]] && ! grep -q 'DUCKLINK_LOADER_REORDER' "$GEN_LOADER"; then
+  python3 - "$GEN_LOADER" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+m = re.search(r'(vector<string>\s+VEC\s*=\s*\{)(.*?)(\};)', s, re.S)
+if m:
+    names = re.findall(r'"([a-z_0-9]+)"', m.group(2))
+    first = [n for n in ('core_functions', 'parquet') if n in names]
+    rest = [n for n in names if n not in first]
+    ordered = first + rest
+    body = '\n' + ''.join('\t"%s",\n' % n for n in ordered)
+    body = body.rstrip(',\n') + '\n    '
+    s = s[:m.start()] + '// DUCKLINK_LOADER_REORDER: deps (core_functions, parquet) first\n    ' \
+        + m.group(1) + body + m.group(3) + s[m.end():]
+    open(p, 'w').write(s)
+    print("loader: reordered LinkedExtensions -> %s" % ', '.join(ordered), file=sys.stderr)
+PY
+fi
 if [[ -f "$GEN_LOADER" && -f "$BUILD_DIR/compile_commands.json" ]]; then
   GEN_CMD="$(python3 - "$BUILD_DIR/compile_commands.json" "$GEN_LOADER" "$TMPDIR/genextloader.o" "$BUILD_DIR" "$DUCKDB_SOURCE_DIR" <<'PY'
 import json, os, re, shlex, sys
@@ -1160,7 +1265,15 @@ if ext_selected httpfs; then
   # openssl-wasm seeds its RNG with getpid(); wasi libc has no getpid. Provide a
   # fixed-value stub (getpid is only mixed into entropy, not a security source on
   # a single-process wasm sandbox). Compiled for the same target as the archive.
+  # openssl's bio_addr.c also references gai_strerror (no wasi libc impl) -- needed
+  # by azure (it pulls more of openssl's BIO/socket code than httpfs). pg/mysql
+  # already provide gai_strerror via pg_stubs.c, so only add it here otherwise (to
+  # avoid a duplicate definition in the final link).
   printf 'int getpid(void){return 42;}\n' > "$TMPDIR/wasi_getpid.c"
+  if ! ext_selected postgres_scanner && ! ext_selected mysql_scanner; then
+    printf 'const char *gai_strerror(int e){(void)e;return "getaddrinfo error";}\n' \
+      >> "$TMPDIR/wasi_getpid.c"
+  fi
   "$WASI_SDK_PREFIX/bin/clang" --target="${WASI_TARGET_TRIPLE:-wasm32-wasip2}" \
     -O2 -c "$TMPDIR/wasi_getpid.c" -o "$TMPDIR/wasi_getpid.o"
   "$WASI_SDK_PREFIX/bin/llvm-ar" rcs "$TMPDIR/libwasigetpid.a" "$TMPDIR/wasi_getpid.o"

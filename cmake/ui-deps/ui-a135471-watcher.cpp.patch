@@ -1,6 +1,8 @@
---- a/src/watcher.cpp	2025-09-16 22:33:57
-+++ b/src/watcher.cpp	2026-06-20 16:20:09
-@@ -13,6 +13,17 @@
+diff --git a/src/watcher.cpp b/src/watcher.cpp
+index 91dfb11..2db3f89 100644
+--- a/src/watcher.cpp
++++ b/src/watcher.cpp
+@@ -13,6 +13,17 @@ namespace ui {
  Watcher::Watcher(HttpServer &_server)
      : should_run(false), server(_server), watched_database(nullptr) {}
  
@@ -18,7 +20,7 @@
  bool WasCatalogUpdated(DatabaseInstance &db, Connection &connection,
                         CatalogState &last_state) {
    bool has_change = false;
-@@ -130,3 +141,4 @@
+@@ -131,3 +142,4 @@ void Watcher::Stop() {
  
  } // namespace ui
  } // namespace duckdb

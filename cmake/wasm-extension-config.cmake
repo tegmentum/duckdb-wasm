@@ -87,19 +87,21 @@ embed_ext(encodings       # decode legacy text encodings (CSV in non-UTF8); pure
   INCLUDE_DIR src/include
 )
 
-# delta: read local Delta Lake tables (delta_scan). The in-tree extension wraps
-# delta-kernel-rs; on wasm we use the kernel's SYNC engine (local std::fs only --
-# no s3:// / object_store, which needs tokio+reqwest with no wasip2 transport).
-# The kernel is prebuilt for wasm32-wasip2 by scripts/build-delta-kernel-wasm.sh
-# (sync-engine, zstd+brotli codecs dropped to avoid C-symbol collisions) and
-# staged + wired by scripts/build-libduckdb-wasm.sh (stage_delta_kernel). See
-# cmake/delta-wasi/README.md.
-if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/delta-kernel/out/libdelta_kernel_ffi.a")
-  # SOURCE_DIR (not the bare in-tree form) so the include path defaults to
-  # <src>/src/include -- the bare form hardcodes extension/delta/include, where
-  # delta_extension.hpp does not live, breaking the generated loader.
+# delta: read local Delta Lake tables (delta_scan). DuckDB 1.5.4's canonical delta
+# is the out-of-tree duckdb-delta @ 45c40878 (from .github/config/extensions/
+# delta.cmake), which wraps delta-kernel-rs v0.21.0. (The minimal in-tree
+# external/duckdb/extension/delta is a stale pre-1.5.4 skeleton that does not
+# compile against 1.5.4's MultiFileReader API -- do not use it.) On wasm we use the
+# kernel's SYNC engine (local std::fs only -- no s3:// / object_store, which needs
+# tokio+reqwest with no wasip2 transport). The kernel is prebuilt for wasm32-wasip2
+# by scripts/build-delta-kernel-wasm.sh (sync-engine, zstd/brotli/flate2 codecs
+# dropped to avoid C-symbol collisions); the 45c40878 source is vendored to
+# build/duckdb-delta + staged + wired by scripts/build-libduckdb-wasm.sh
+# (stage_delta_kernel). See cmake/delta-wasi/README.md.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/delta-kernel/out/libdelta_kernel_ffi.a"
+   AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-delta/src")
   embed_ext(delta          # delta_scan('<local path>') over the sync engine
-    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../external/duckdb/extension/delta
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-delta
   )
 endif()
 
@@ -119,9 +121,13 @@ embed_ext(aws              # AWS credential resolution -> S3 secret for httpfs
 # curl-wasm, like httpfs) + merged into libduckdb-wasi.a. AzureCliCredential is
 # unavailable (no subprocess); env / connection-string / SAS credentials work.
 set(AZURE_SDK_WASM_DIR "${CMAKE_CURRENT_LIST_DIR}/../build/azure-sdk/out" CACHE PATH "" FORCE)
-if(EXISTS "${AZURE_SDK_WASM_DIR}/lib/libazure-storage-blobs.a")
+# DuckDB 1.5.4's canonical azure is duckdb-azure @ 563589b2 (from
+# .github/config/extensions/azure.cmake), vendored to build/duckdb-azure + patched
+# for wasm by stage_azure_extension (build-libduckdb-wasm.sh).
+if(EXISTS "${AZURE_SDK_WASM_DIR}/lib/libazure-storage-blobs.a"
+   AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-azure/src")
   embed_ext(azure          # az:// + abfss:// blob/datalake filesystem
-    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../external/duckdb/extension/azure
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-azure
   )
 endif()
 
@@ -210,19 +216,19 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/mariadb/lib/mariadb/libm
   )
 endif()
 
-# httpfs / ui / uc_catalog all need CURL + OpenSSL from ~/git/curl-wasm +
+# httpfs / ui / unity_catalog all need CURL + OpenSSL from ~/git/curl-wasm +
 # ~/git/openssl-wasm. The var-setup below only runs if at least one of them is
 # selected (so a lean build doesn't re-enable the http module or wire curl).
 #   - httpfs: HTTP/S3 filesystem over wasi:sockets (curl client; embedded CA
 #     bundle via CURLOPT_CAINFO_BLOB). BSD sockets are grafted from the wasip2
 #     libc into the wasip1 core module by scripts/build-libduckdb-wasm.sh.
 #   - ui: the real DuckDB UI, bridged through the native host (duckdb-host ui).
-#   - uc_catalog: ATTACH a Unity Catalog (raw libcurl + CA-bundle-blob patch).
+#   - unity_catalog: ATTACH a Unity Catalog (REST over DuckDB's HTTPUtil/curl).
 want(httpfs)
 set(_w_httpfs ${WANT})
 want(ui)
 set(_w_ui ${WANT})
-want(uc_catalog)
+want(unity_catalog)
 set(_w_uc ${WANT})
 set(OPENSSL_WASM_DIR "$ENV{HOME}/git/openssl-wasm/build/openssl")
 set(CURL_WASM_DIR "$ENV{HOME}/git/curl-wasm/build")
@@ -253,20 +259,25 @@ if((_w_httpfs OR _w_ui OR _w_uc)
     INCLUDE_DIR extension/httpfs/include
   )
 
+  # ui: duckdb-ui @ a135471 (the "duckdb 1.5.4" release, #61), vendored to
+  # build/duckdb-ui + patched for wasm by stage_ui_extension (the host owns the
+  # listening socket and bridges requests to duckdb_ui_handle_request).
   set(UI_WASM_STUB_DIR "${CMAKE_CURRENT_LIST_DIR}/ui-deps/wasm-stubs" CACHE PATH "" FORCE)
-  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../external/duckdb/extension/ui/src/http_server.cpp")
+  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-ui/src/http_server.cpp")
     embed_ext(ui            # DuckDB UI, bridged through the host (duckdb-host ui)
-      SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../external/duckdb/extension/ui
+      SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../build/duckdb-ui
     )
   endif()
 
-  # uc_catalog v1.4.0 (@4638e9b): raw libcurl; find_package(CURL REQUIRED) is
-  # satisfied by the vars above; apply_extension_patches swaps CURLOPT_CAINFO for
-  # an embedded CURLOPT_CAINFO_BLOB and strips a stray catch.hpp include. Needs
-  # httpfs + delta at runtime. Caveat: local-sync delta only (no remote s3:// data).
-  embed_ext(uc_catalog      # ATTACH Unity Catalog (TYPE uc_catalog) -> delta tables
-    GIT_URL https://github.com/duckdb/uc_catalog
-    GIT_TAG 4638e9b86903ca3bfda03df9f396186e32c8d762   # "bump to v1.4.0" -- exact ABI match
+  # unity_catalog: DuckDB 1.5.4 renamed uc_catalog -> unity_catalog (new repo +
+  # extension name) @ d52a7ee. It issues REST calls via DuckDB's HTTPUtil (curl
+  # from httpfs) -- no raw libcurl, so no CA-bundle patch -- already uses
+  # build_static_extension + the new ExtensionLoader API, and AutoLoadExtension's
+  # httpfs. Needs httpfs + delta at runtime (it manages delta tables). Caveat:
+  # local-sync delta only (no remote s3:// data).
+  embed_ext(unity_catalog   # ATTACH Unity Catalog (TYPE unity_catalog) -> delta tables
+    GIT_URL https://github.com/duckdb/unity_catalog
+    GIT_TAG d52a7ee8678a23a8e0f950e955b9ffa1df0c3395   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/include
   )
 endif()

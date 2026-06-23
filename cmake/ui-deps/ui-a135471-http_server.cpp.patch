@@ -1,3 +1,5 @@
+diff --git a/src/http_server.cpp b/src/http_server.cpp
+index c9dd167..4c935b1 100644
 --- a/src/http_server.cpp
 +++ b/src/http_server.cpp
 @@ -1,5 +1,11 @@
@@ -12,21 +14,22 @@
  #include "event_dispatcher.hpp"
  #include "settings.hpp"
  #include "state.hpp"
-@@ -74,7 +80,13 @@
+@@ -80,7 +86,14 @@ bool HttpServer::IsRunningOnMachine(ClientContext &context) {
  }
  
  bool HttpServer::Started() {
 +#ifdef __wasi__
-+  // wasm runs in bridge mode (no listening thread); the singleton existing means
-+  // it's initialized and ready to handle bridged requests.
-+  return server_instance != nullptr;
++  // wasm runs in bridge mode (no listening thread). DoStart sets event_dispatcher
++  // (and DoStop clears it), so use it as the "started" marker -- it is null between
++  // GetInstance() and DoStart(), so DoStart's own Started() guard still passes.
++  return server_instance && server_instance->event_dispatcher != nullptr;
 +#else
    return server_instance && server_instance->main_thread;
 +#endif
  }
  
  void HttpServer::StopInstance() {
-@@ -120,7 +132,9 @@
+@@ -126,7 +139,9 @@ void HttpServer::DoStart(const uint16_t _local_port,
        StringUtil::Format("duckdb-ui/%s-%s(%s)", DuckDB::LibraryVersion(),
                           UI_EXTENSION_VERSION, DuckDB::Platform());
    event_dispatcher = make_uniq<EventDispatcher>();
@@ -36,8 +39,8 @@
    watcher = make_uniq<Watcher>(*this);
    watcher->Start();
  }
-@@ -681,5 +695,142 @@
-   SetResponseContent(res, response_content);
+@@ -733,5 +748,144 @@ void HttpServer::CopyAndSlice(duckdb::DataChunk &source,
+   target.Slice(0, row_count);
  }
  
 +#ifdef __wasi__
@@ -77,9 +80,11 @@
 +      [&](httplib::ContentReceiver receiver) -> bool {
 +        return body.empty() ? true : receiver(body.data(), body.size());
 +      },
-+      [&](httplib::MultipartContentHeader, httplib::ContentReceiver) -> bool {
-+        return true;
-+      });
++      // newer httplib: the multipart reader takes a FormData callback, not the
++      // old MultipartContentHeader. We never feed multipart bodies through the
++      // bridge, so this is a no-op.
++      [&](std::function<bool(const httplib::FormData &)>,
++          httplib::ContentReceiver) -> bool { return true; });
 +
 +  if (method == "POST" && path == "/ddb/run") {
 +    HandleRun(req, res, content_reader);
