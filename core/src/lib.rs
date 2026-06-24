@@ -67,6 +67,445 @@ static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::
 /// Databases that already have the global replacement-scan callback installed.
 static REPLACEMENT_SCAN_DATABASES: OnceLock<Mutex<Vec<DatabaseHandle>>> = OnceLock::new();
 
+// M1: implemented in core/cpp/wasm_storage.cpp. Registers a stub
+// StorageExtension for a given ATTACH `TYPE` (currently hardcoded "sqlitewasm")
+// on the freshly-opened database. Defined in C++ so it can subclass DuckDB's
+// internal StorageExtension and link against the prebuilt libduckdb-wasi.a.
+extern "C" {
+    fn wasm_register_storage_extension(db: duckdb::duckdb_database, type_name: *const c_char);
+}
+
+// M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
+// WasmTableEntry call these extern-C fns; each routes to the host-provided
+// `duckdb:extension/storage-host` import, which the host forwards to the
+// sqlitewasm component's `storage-dispatch` export (mirroring how call-table is
+// routed via callback-dispatch).
+//
+// C ABI choices (kept simple + leak-free; wasm is single-threaded):
+//   * attach returns a u32 component-side catalog handle (0 == error).
+//   * list-tables / table-columns return a malloc'd, NUL-terminated string the
+//     caller MUST free with `wasm_storage_free`. Tables are '\n'-joined names.
+//     Columns are '\n'-joined `name\t<duckdb_type_code>` lines (the type code is
+//     a `duckdb_type` enum value: BOOLEAN=1, BIGINT=5, UBIGINT=9, DOUBLE=11,
+//     VARCHAR=17, BLOB=18). A NULL return signals an error.
+//   * on error, the C++ side reads `wasm_storage_last_error()` for a message.
+
+static STORAGE_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+
+fn storage_set_last_error(msg: String) {
+    let cell = STORAGE_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = CString::new(msg).ok();
+    }
+}
+
+/// Maps a storage-host `Duckerror` into a single human-readable string.
+fn storage_format_error(err: &bindings::duckdb::extension::storage_host::Duckerror) -> String {
+    use bindings::duckdb::extension::storage_host::Duckerror as E;
+    match err {
+        E::Invalidargument(m) => format!("invalid argument: {m}"),
+        E::Unsupported(m) => format!("unsupported: {m}"),
+        E::Invalidstate(m) => format!("invalid state: {m}"),
+        E::Io(m) => format!("io error: {m}"),
+        E::Internal(m) => format!("internal error: {m}"),
+    }
+}
+
+/// Maps a `types::Logicaltype` to the corresponding `duckdb_type` enum code that
+/// the C++ side turns back into a `LogicalType`.
+fn storage_logicaltype_to_code(ty: Logicaltype) -> u32 {
+    match ty {
+        Logicaltype::Boolean => 1,  // DUCKDB_TYPE_BOOLEAN
+        Logicaltype::Int64 => 5,    // DUCKDB_TYPE_BIGINT
+        Logicaltype::Uint64 => 9,   // DUCKDB_TYPE_UBIGINT
+        Logicaltype::Float64 => 11, // DUCKDB_TYPE_DOUBLE
+        Logicaltype::Text => 17,    // DUCKDB_TYPE_VARCHAR
+        Logicaltype::Blob => 18,    // DUCKDB_TYPE_BLOB
+    }
+}
+
+/// Returns the most recent storage-bridge error message (or an empty C string),
+/// owned by the core; the pointer stays valid until the next bridge call.
+#[no_mangle]
+pub extern "C" fn wasm_storage_last_error() -> *const c_char {
+    let cell = STORAGE_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(s) => s.as_ptr(),
+            None => b"\0".as_ptr() as *const c_char,
+        },
+        Err(_) => b"\0".as_ptr() as *const c_char,
+    }
+}
+
+/// Frees a string previously returned by a `wasm_storage_*` enumeration fn.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(CString::from_raw(ptr));
+    }
+}
+
+/// Opens the foreign catalog named by `dsn` (an ATTACH path). Returns a
+/// component-side catalog handle, or 0 on error (message in `wasm_storage_last_error`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_attach(dsn: *const c_char) -> u32 {
+    if dsn.is_null() {
+        storage_set_last_error("wasm_storage_attach: null dsn".to_string());
+        return 0;
+    }
+    let dsn_str = match CStr::from_ptr(dsn).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            storage_set_last_error("wasm_storage_attach: dsn is not valid UTF-8".to_string());
+            return 0;
+        }
+    };
+    match bindings::duckdb::extension::storage_host::storage_attach(dsn_str) {
+        Ok(handle) => handle,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            0
+        }
+    }
+}
+
+/// Enumerates `catalog`'s base tables as a '\n'-joined, NUL-terminated string.
+/// Caller frees with `wasm_storage_free`. NULL on error.
+#[no_mangle]
+pub extern "C" fn wasm_storage_list_tables(catalog: u32) -> *mut c_char {
+    match bindings::duckdb::extension::storage_host::storage_list_tables(catalog) {
+        Ok(tables) => {
+            let joined = tables.join("\n");
+            match CString::new(joined) {
+                Ok(c) => c.into_raw(),
+                Err(_) => {
+                    storage_set_last_error(
+                        "wasm_storage_list_tables: table name contains NUL".to_string(),
+                    );
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Enumerates `table`'s columns as '\n'-joined `name\t<typecode>` lines.
+/// Caller frees with `wasm_storage_free`. NULL on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_table_columns(
+    catalog: u32,
+    table: *const c_char,
+) -> *mut c_char {
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_table_columns: null table".to_string());
+        return ptr::null_mut();
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            storage_set_last_error(
+                "wasm_storage_table_columns: table name is not valid UTF-8".to_string(),
+            );
+            return ptr::null_mut();
+        }
+    };
+    match bindings::duckdb::extension::storage_host::storage_table_columns(catalog, table_str) {
+        Ok(columns) => {
+            let mut lines: Vec<String> = Vec::with_capacity(columns.len());
+            for col in columns {
+                if col.name.contains('\n') || col.name.contains('\t') {
+                    storage_set_last_error(
+                        "wasm_storage_table_columns: column name contains separator".to_string(),
+                    );
+                    return ptr::null_mut();
+                }
+                lines.push(format!("{}\t{}", col.name, storage_logicaltype_to_code(col.logical)));
+            }
+            let joined = lines.join("\n");
+            match CString::new(joined) {
+                Ok(c) => c.into_raw(),
+                Err(_) => {
+                    storage_set_last_error(
+                        "wasm_storage_table_columns: column name contains NUL".to_string(),
+                    );
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            ptr::null_mut()
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// M2b scan bridge: projection + filter pushdown.
+//
+// The C++ TableFunction owns a scan handle (returned by `wasm_storage_scan_open`)
+// and pulls rows with `wasm_storage_scan_fill` into a DataChunk until EOF. The
+// component returns rows in PROJECTION order (each row = one Duckvalue per
+// projected column); to write them into the output vectors we need the projected
+// columns' logical types, which we capture at open by re-enumerating the table's
+// columns and selecting the projected indices.
+//===----------------------------------------------------------------------===//
+
+/// Per-scan state: the projected columns' logical types (emit order), used to
+/// drive `write_duckvalue_to_vector` for each output column.
+struct WasmScanState {
+    column_types: Vec<Logicaltype>,
+}
+
+static STORAGE_SCANS: OnceLock<Mutex<HashMap<u32, WasmScanState>>> = OnceLock::new();
+
+fn storage_scans() -> &'static Mutex<HashMap<u32, WasmScanState>> {
+    STORAGE_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Maps a C-ABI compare-op code (WASM_SCAN_OP_*) to the storage-host CompareOp.
+fn storage_scan_op_from_code(
+    op: u8,
+) -> Option<bindings::duckdb::extension::storage_host::CompareOp> {
+    use bindings::duckdb::extension::storage_host::CompareOp as Op;
+    Some(match op {
+        0 => Op::Eq,
+        1 => Op::Ne,
+        2 => Op::Lt,
+        3 => Op::Le,
+        4 => Op::Gt,
+        5 => Op::Ge,
+        6 => Op::IsNull,
+        7 => Op::IsNotNull,
+        _ => return None,
+    })
+}
+
+/// Builds a storage-host Duckvalue from the tagged C-ABI filter fields.
+unsafe fn storage_scan_value_from_filter(
+    value_type: u8,
+    i64v: i64,
+    f64v: f64,
+    text: *const c_char,
+) -> Duckvalue {
+    match value_type {
+        1 => Duckvalue::Boolean(i64v != 0), // WASM_SCAN_VAL_BOOLEAN
+        2 => Duckvalue::Int64(i64v),        // WASM_SCAN_VAL_INT64
+        3 => Duckvalue::Float64(f64v),      // WASM_SCAN_VAL_FLOAT64
+        4 => {
+            // WASM_SCAN_VAL_TEXT
+            if text.is_null() {
+                Duckvalue::Text(String::new())
+            } else {
+                Duckvalue::Text(CStr::from_ptr(text).to_string_lossy().into_owned())
+            }
+        }
+        _ => Duckvalue::Null, // WASM_SCAN_VAL_NONE (is-null / is-not-null)
+    }
+}
+
+/// C-ABI mirror of `WasmScanFilter` in wasm_storage_bridge.h.
+#[repr(C)]
+pub struct WasmScanFilter {
+    column: u32,
+    op: u8,
+    value_type: u8,
+    i64: i64,
+    f64: f64,
+    text: *const c_char,
+}
+
+/// Open a scan cursor honoring `projection` (real table column indices, emit
+/// order; nproj==0 => all) and `filters`. Returns a scan handle, 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_scan_open(
+    catalog: u32,
+    table: *const c_char,
+    projection: *const u32,
+    nproj: u32,
+    filters: *const WasmScanFilter,
+    nfilt: u32,
+    limit: i64,
+) -> u32 {
+    use bindings::duckdb::extension::storage_host as sh;
+
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_scan_open: null table".to_string());
+        return 0;
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            storage_set_last_error("wasm_storage_scan_open: table not UTF-8".to_string());
+            return 0;
+        }
+    };
+
+    // Enumerate the full column list so we can (a) record the projected column
+    // types for scan-fill and (b) validate indices.
+    let all_cols = match sh::storage_table_columns(catalog, &table_str) {
+        Ok(cols) => cols,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            return 0;
+        }
+    };
+
+    let projection_slice: &[u32] = if projection.is_null() || nproj == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(projection, nproj as usize)
+    };
+
+    // Projected column types in emit order (empty projection => natural order).
+    let column_types: Vec<Logicaltype> = if projection_slice.is_empty() {
+        all_cols.iter().map(|c| c.logical).collect()
+    } else {
+        let mut out = Vec::with_capacity(projection_slice.len());
+        for &idx in projection_slice {
+            match all_cols.get(idx as usize) {
+                Some(c) => out.push(c.logical),
+                None => {
+                    storage_set_last_error(format!(
+                        "wasm_storage_scan_open: projection index {idx} out of range ({} columns)",
+                        all_cols.len()
+                    ));
+                    return 0;
+                }
+            }
+        }
+        out
+    };
+
+    let filters_slice: &[WasmScanFilter] = if filters.is_null() || nfilt == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(filters, nfilt as usize)
+    };
+
+    let mut scan_filters: Vec<sh::ScanFilter> = Vec::with_capacity(filters_slice.len());
+    for f in filters_slice {
+        let op = match storage_scan_op_from_code(f.op) {
+            Some(op) => op,
+            None => continue, // unknown op: skip (best-effort)
+        };
+        let value = storage_scan_value_from_filter(f.value_type, f.i64, f.f64, f.text);
+        scan_filters.push(sh::ScanFilter {
+            column: f.column,
+            op,
+            value,
+        });
+    }
+
+    let request = sh::ScanRequest {
+        table: table_str,
+        projection: projection_slice.to_vec(),
+        filters: scan_filters,
+        limit: if limit < 0 { None } else { Some(limit as u64) },
+    };
+
+    clog!(
+        "[storage-scan] core scan-open catalog={} projection={:?} nfilt={}",
+        catalog,
+        request.projection,
+        request.filters.len()
+    );
+
+    match sh::storage_scan_open(catalog, &request) {
+        Ok(scan) => {
+            storage_scans()
+                .lock()
+                .map(|mut m| m.insert(scan, WasmScanState { column_types }))
+                .ok();
+            scan
+        }
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            0
+        }
+    }
+}
+
+/// Pull the next batch into `chunk` (a `duckdb_data_chunk` raw handle). Returns
+/// true if rows were written, false at EOF (or on error, with last-error set).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -> bool {
+    use bindings::duckdb::extension::storage_host as sh;
+
+    let output = chunk as duckdb::duckdb_data_chunk;
+    if output.is_null() {
+        storage_set_last_error("wasm_storage_scan_fill: null chunk".to_string());
+        return false;
+    }
+
+    // Snapshot the projected column types (avoid holding the lock across the
+    // host call + vector writes).
+    let column_types: Vec<Logicaltype> = match storage_scans().lock() {
+        Ok(m) => match m.get(&scan) {
+            Some(state) => state.column_types.clone(),
+            None => {
+                storage_set_last_error(format!("wasm_storage_scan_fill: unknown scan {scan}"));
+                return false;
+            }
+        },
+        Err(_) => {
+            storage_set_last_error("wasm_storage_scan_fill: scan map poisoned".to_string());
+            return false;
+        }
+    };
+
+    // Pull up to one standard vector worth of rows.
+    let rows = match sh::storage_scan_next(scan, 2048) {
+        Ok(rows) => rows,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            return false;
+        }
+    };
+
+    if rows.is_empty() {
+        duckdb::duckdb_data_chunk_set_size(output, 0);
+        return false;
+    }
+
+    duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
+    let ncols = column_types.len();
+    for col_idx in 0..ncols {
+        let vector = duckdb::duckdb_data_chunk_get_vector(output, col_idx as duckdb::idx_t);
+        let logical = column_types[col_idx];
+        for (row, row_values) in rows.iter().enumerate() {
+            if row_values.len() != ncols {
+                storage_set_last_error(format!(
+                    "wasm_storage_scan_fill: row {row} has {} cols, expected {ncols}",
+                    row_values.len()
+                ));
+                return false;
+            }
+            let value = row_values[col_idx].clone();
+            if let Err(err) = write_duckvalue_to_vector(vector, &logical, row as duckdb::idx_t, value)
+            {
+                storage_set_last_error(format_duckerror(&err));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Close + free a scan cursor.
+#[no_mangle]
+pub extern "C" fn wasm_storage_scan_close(scan: u32) {
+    use bindings::duckdb::extension::storage_host as sh;
+    let _ = sh::storage_scan_close(scan);
+    if let Ok(mut m) = storage_scans().lock() {
+        m.remove(&scan);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ConnectionHandle(duckdb::duckdb_connection, duckdb::duckdb_database);
 
@@ -2247,6 +2686,11 @@ impl ConnectionState {
                 }
                 return Err(DuckDbError::message(message));
             }
+
+            // M1: register the wasm StorageExtension stub for TYPE "sqlitewasm"
+            // before any ATTACH can dispatch to it. Reaching this stub proves the
+            // build/link/register/dispatch chain (see core/cpp/wasm_storage.cpp).
+            wasm_register_storage_extension(database, b"sqlitewasm\0".as_ptr() as *const c_char);
 
             let mut handle: duckdb::duckdb_connection = ptr::null_mut();
             let state = duckdb::duckdb_connect(database, &mut handle);
