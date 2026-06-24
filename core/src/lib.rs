@@ -62,6 +62,12 @@ static TABLE_FUNCTION_DEFINITIONS: OnceLock<Mutex<Vec<Arc<TableFunctionDefinitio
 static NEXT_AGGREGATE_FUNCTION_ID: AtomicU32 = AtomicU32::new(1);
 static AGGREGATE_FUNCTION_DEFINITIONS: OnceLock<Mutex<Vec<Arc<AggregateFunctionDefinition>>>> =
     OnceLock::new();
+/// ATTACH `TYPE` names for which a wasm StorageExtension has already been
+/// registered on a given database (avoids re-registering on every query). Keyed
+/// loosely by type-name across all databases; the C++ side also guards via
+/// `StorageExtension::Find`, so a stale entry is harmless.
+static STORAGE_REGISTERED_TYPES: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
 /// Registered replacement scans (file extension -> table function name).
 static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::new();
 /// Databases that already have the global replacement-scan callback installed.
@@ -2687,10 +2693,13 @@ impl ConnectionState {
                 return Err(DuckDbError::message(message));
             }
 
-            // M1: register the wasm StorageExtension stub for TYPE "sqlitewasm"
-            // before any ATTACH can dispatch to it. Reaching this stub proves the
-            // build/link/register/dispatch chain (see core/cpp/wasm_storage.cpp).
-            wasm_register_storage_extension(database, b"sqlitewasm\0".as_ptr() as *const c_char);
+            // M2: storage StorageExtensions are now registered DYNAMICALLY at
+            // query time (see ConnectionState::sync_storage_extensions), based on
+            // the ATTACH `TYPE` names that components declare via the host's
+            // `register-storage` WIT call. The old hardcoded "sqlitewasm"
+            // registration here is intentionally removed; the dynamic path
+            // (storage-host.storage-list-types -> wasm_register_storage_extension)
+            // covers sqlitewasm and any other backend (mysql, postgres, ...).
 
             let mut handle: duckdb::duckdb_connection = ptr::null_mut();
             let state = duckdb::duckdb_connect(database, &mut handle);
@@ -2717,6 +2726,41 @@ impl ConnectionState {
         }
     }
 
+    /// Pulls the set of ATTACH `TYPE` names that storage components have
+    /// registered with the host (via the `register-storage` WIT call) and
+    /// registers a wasm StorageExtension for each one not yet registered. This
+    /// is the DYNAMIC replacement for the old hardcoded "sqlitewasm" call at
+    /// DB-open: register-storage happens at LOAD time (mid-session), and
+    /// `StorageExtension::Register` just inserts into the DBConfig callback
+    /// registry (lock-guarded, copy-on-write), which ATTACH reads at bind time
+    /// -- so mid-session registration is safe. Called lazily before each query
+    /// so any `ATTACH ... (TYPE x)` sees the backend its component declared.
+    ///
+    /// The C++ side guards against double-registration via StorageExtension::Find,
+    /// and we additionally short-circuit already-seen types here.
+    fn sync_storage_extensions(&self) {
+        let types = bindings::duckdb::extension::storage_host::storage_list_types();
+        if types.is_empty() {
+            return;
+        }
+        let seen = STORAGE_REGISTERED_TYPES.get_or_init(|| Mutex::new(Default::default()));
+        let mut guard = match seen.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for type_name in types {
+            if guard.contains(&type_name) {
+                continue;
+            }
+            if let Ok(c_type) = CString::new(type_name.as_str()) {
+                unsafe {
+                    wasm_register_storage_extension(self.database, c_type.as_ptr());
+                }
+                guard.insert(type_name);
+            }
+        }
+    }
+
     fn execute(&self, sql: &str) -> Result<QueryResult, DuckDbError> {
         let (columns, rows) = self.collect_rows(sql)?;
         Ok(QueryResult { columns, rows })
@@ -2725,6 +2769,7 @@ impl ConnectionState {
     /// Runs `sql` and serializes the entire result to an Arrow IPC stream, using
     /// DuckDB's (non-deprecated) result + data-chunk to Arrow conversion API.
     fn query_arrow_ipc(&self, sql: &str) -> Result<Vec<u8>, DuckDbError> {
+        self.sync_storage_extensions();
         use arrow_array::{ffi::from_ffi, RecordBatch, StructArray};
         use arrow_data::ffi::FFI_ArrowArray;
         use arrow_ipc::writer::StreamWriter;
@@ -2834,6 +2879,7 @@ impl ConnectionState {
     }
 
     fn collect_rows(&self, sql: &str) -> Result<(Vec<Columndef>, Vec<Row>), DuckDbError> {
+        self.sync_storage_extensions();
         let c_sql = CString::new(sql).map_err(|_| DuckDbError::EmbeddedNull)?;
 
         unsafe {

@@ -38,6 +38,13 @@ interface storage-host {
     limit: option<u64>,      // best-effort row cap
   }
 
+  // Enumerate the ATTACH `TYPE` names that components have registered (via
+  // `register-storage`) so far this session. The core calls this lazily (before
+  // running queries) and registers a wasm StorageExtension for each type it has
+  // not yet seen, so `ATTACH ... (TYPE <name>)` can dispatch to that component.
+  // This replaces the previous hardcoded "sqlitewasm" registration at DB-open.
+  storage-list-types: func() -> list<string>;
+
   // Open the foreign catalog named by an ATTACH DSN (a host file path for the
   // native host). The host stages the file bytes into the backing component and
   // returns the component-side catalog handle.
