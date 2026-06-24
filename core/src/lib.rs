@@ -81,6 +81,16 @@ extern "C" {
     fn wasm_register_storage_extension(db: duckdb::duckdb_database, type_name: *const c_char);
 }
 
+// httpfs M1 (de-risk): implemented in core/cpp/wasm_files.cpp. Registers a stub
+// FileSystem subsystem on the database's VirtualFileSystem that claims
+// http:// / https:// paths and throws a recognizable IOException from OpenFile.
+// Idempotent on the C++ side (process-wide once-guard + dup-name try/catch), so
+// always-register per query is safe; this M1 path proves the mechanism. A
+// dynamic gate on a files-capable component is M2.
+extern "C" {
+    fn wasm_register_file_system(db: duckdb::duckdb_database);
+}
+
 // M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
 // WasmTableEntry call these extern-C fns; each routes to the host-provided
 // `duckdb:extension/storage-host` import, which the host forwards to the
@@ -510,6 +520,108 @@ pub extern "C" fn wasm_storage_scan_close(scan: u32) {
     if let Ok(mut m) = storage_scans().lock() {
         m.remove(&scan);
     }
+}
+
+//===----------------------------------------------------------------------===//
+// httpfs M2 files bridge.
+//
+// The C++ WasmFileSystem (cpp/wasm_files.cpp) calls these extern-C fns; each
+// routes to the host-provided `duckdb:extension/files-host` import, which the
+// host forwards to the registered files component's `file-dispatch` export
+// (webfs fetches the resource over wasi:sockets, caches it, serves ranges).
+// Mirrors the wasm_storage_* bridge. The files-host error channel is plain
+// strings (not Duckerror), so we surface them directly.
+//===----------------------------------------------------------------------===//
+
+static FILE_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+
+fn file_set_last_error(msg: String) {
+    let cell = FILE_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = CString::new(msg).ok();
+    }
+}
+
+/// Returns the most recent files-bridge error message (or an empty C string),
+/// owned by the core; the pointer stays valid until the next bridge call.
+#[no_mangle]
+pub extern "C" fn wasm_file_last_error() -> *const c_char {
+    let cell = FILE_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(s) => s.as_ptr(),
+            None => b"\0".as_ptr() as *const c_char,
+        },
+        Err(_) => b"\0".as_ptr() as *const c_char,
+    }
+}
+
+/// Fetch + cache the resource at `url` via the files backend. On success writes
+/// the component-side handle + total size and returns true; on error returns
+/// false (message in `wasm_file_last_error`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_file_open(
+    url: *const c_char,
+    out_handle: *mut u32,
+    out_size: *mut u64,
+) -> bool {
+    if url.is_null() || out_handle.is_null() || out_size.is_null() {
+        file_set_last_error("wasm_file_open: null argument".to_string());
+        return false;
+    }
+    let url_str = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            file_set_last_error("wasm_file_open: url is not valid UTF-8".to_string());
+            return false;
+        }
+    };
+    match bindings::duckdb::extension::files_host::file_open(url_str) {
+        Ok(res) => {
+            *out_handle = res.handle;
+            *out_size = res.size;
+            true
+        }
+        Err(msg) => {
+            file_set_last_error(msg);
+            false
+        }
+    }
+}
+
+/// Copy up to `len` bytes from the cached resource at `offset` into `buf`.
+/// Returns the count copied (<= len; may be short at EOF), or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_file_read(
+    handle: u32,
+    offset: u64,
+    len: u32,
+    buf: *mut u8,
+) -> i64 {
+    if buf.is_null() {
+        file_set_last_error("wasm_file_read: null buffer".to_string());
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    match bindings::duckdb::extension::files_host::file_read(handle, offset, len) {
+        Ok(bytes) => {
+            let n = std::cmp::min(bytes.len(), len as usize);
+            copy_nonoverlapping(bytes.as_ptr(), buf, n);
+            n as i64
+        }
+        Err(msg) => {
+            file_set_last_error(msg);
+            -1
+        }
+    }
+}
+
+/// Drop the component-side cache entry for `handle` (best-effort).
+#[no_mangle]
+pub extern "C" fn wasm_file_close(handle: u32) {
+    let _ = bindings::duckdb::extension::files_host::file_close(handle);
 }
 
 #[derive(Clone, Copy)]
@@ -2739,6 +2851,14 @@ impl ConnectionState {
     /// The C++ side guards against double-registration via StorageExtension::Find,
     /// and we additionally short-circuit already-seen types here.
     fn sync_storage_extensions(&self) {
+        // httpfs M1: register the stub FileSystem subsystem (http:// / https://)
+        // on this database. The C++ side is idempotent (process-wide once-guard +
+        // dup-name try/catch), so calling it before every query is cheap and
+        // proves the mechanism without dynamic gating (that is M2).
+        unsafe {
+            wasm_register_file_system(self.database);
+        }
+
         let types = bindings::duckdb::extension::storage_host::storage_list_types();
         if types.is_empty() {
             return;

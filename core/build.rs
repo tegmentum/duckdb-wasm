@@ -4,7 +4,10 @@ fn main() {
         return;
     }
 
-    build_wasm_storage();
+    build_wasm_cpp("wasm_storage.cpp");
+    // httpfs M1: the stub FileSystem subsystem (cpp/wasm_files.cpp). Compiled +
+    // linked the same way as wasm_storage.cpp.
+    build_wasm_cpp("wasm_files.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
@@ -90,31 +93,32 @@ fn main() {
     }
 }
 
-/// Compiles cpp/wasm_storage.cpp (the M1 StorageExtension stub) with the EXACT
+/// Compiles a single cpp/<name> in-core (DUCKDB_BUILD_LIBRARY) with the EXACT
 /// wasi-sdk clang++ flags extracted from sqlite_scanner's sqlite_storage.cpp
 /// build, so the resulting object's C++ ABI / exception model matches the
 /// prebuilt libduckdb-wasi.a it links against. The object is linked into the
-/// core component via `cargo:rustc-link-arg`.
-fn build_wasm_storage() {
+/// core component via `cargo:rustc-link-arg`. Used for wasm_storage.cpp (the
+/// StorageExtension stub) and wasm_files.cpp (the httpfs M1 FileSystem stub).
+fn build_wasm_cpp(file_name: &str) {
     use std::path::PathBuf;
     use std::process::Command;
 
     let wasi_sdk = std::env::var("WASI_SDK_PREFIX")
-        .expect("Set WASI_SDK_PREFIX (source scripts/setup-env.sh) to build wasm_storage.cpp");
+        .unwrap_or_else(|_| panic!("Set WASI_SDK_PREFIX (source scripts/setup-env.sh) to build {file_name}"));
     let duckdb_src = std::env::var("DUCKDB_SOURCE_DIR")
-        .expect("Set DUCKDB_SOURCE_DIR (source scripts/setup-env.sh) to build wasm_storage.cpp");
+        .unwrap_or_else(|_| panic!("Set DUCKDB_SOURCE_DIR (source scripts/setup-env.sh) to build {file_name}"));
 
     let clangxx = format!("{wasi_sdk}/bin/clang++");
     let sysroot = format!("{wasi_sdk}/share/wasi-sysroot");
 
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let src = PathBuf::from(&manifest).join("cpp/wasm_storage.cpp");
+    let src = PathBuf::from(&manifest).join("cpp").join(file_name);
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-env-changed=WASI_SDK_PREFIX");
     println!("cargo:rerun-if-env-changed=DUCKDB_SOURCE_DIR");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let obj = PathBuf::from(&out_dir).join("wasm_storage.cpp.obj");
+    let obj = PathBuf::from(&out_dir).join(format!("{file_name}.obj"));
 
     // Force-include shim path: relative to this crate, mirroring the CMake build.
     let shim = PathBuf::from(&manifest).join("../cmake/toolchains/wasi-shim.hpp");
@@ -173,7 +177,7 @@ fn build_wasm_storage() {
 
     let status = cmd.status().expect("failed to spawn wasi-sdk clang++");
     if !status.success() {
-        panic!("clang++ failed to compile wasm_storage.cpp: {status}");
+        panic!("clang++ failed to compile {file_name}: {status}");
     }
 
     // Link the object directly into the core component.
