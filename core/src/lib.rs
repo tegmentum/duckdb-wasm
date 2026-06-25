@@ -2960,6 +2960,243 @@ mod config_tests {
     }
 }
 
+/// Connection-free unit coverage for the dispatch + `complex` value-marshalling
+/// helpers. These run on the host with NO live DuckDB (the unsafe vector
+/// readers/writers need a connection and are exercised by the ducklink smoke
+/// suite + integration tests), but every pure decision the marshalling makes --
+/// the statement splitter, the LOAD detector, and the `complex` trust-boundary
+/// caps (depth / list length / JSON-shape-vs-type) -- is the single source of
+/// truth the unsafe paths call into, so testing them here covers the real logic.
+#[cfg(test)]
+mod marshalling_tests {
+    use super::{
+        complex_depth_within_cap, complex_list_len_within_cap, contains_load_keyword_ascii_ci,
+        json_matches_complex_kind, split_sql_statements, statement_is_load, ComplexKind,
+        COMPLEX_MAX_DEPTH, COMPLEX_MAX_LIST_LEN,
+    };
+    use serde_json::json;
+
+    // ----- statement splitter (#73 LOAD-aware split) -----
+
+    #[test]
+    fn split_single_statement() {
+        assert_eq!(split_sql_statements("SELECT 1"), vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn split_multiple_statements() {
+        let stmts = split_sql_statements("SELECT 1; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 1");
+        assert_eq!(stmts[1].trim(), "SELECT 2");
+    }
+
+    #[test]
+    fn split_empty_sql_is_empty() {
+        assert!(split_sql_statements("").is_empty());
+        // whitespace-only trailing buffer is dropped, not panicked on.
+        assert!(split_sql_statements("   ").is_empty());
+    }
+
+    #[test]
+    fn split_bare_semicolons_yield_blank_stmts_not_panic() {
+        // `;;;` produces empty statements (one per separator); the callers skip
+        // blanks via `stmt.trim().is_empty()`. The point here is no panic and
+        // each produced statement is blank.
+        let stmts = split_sql_statements(";;;");
+        assert!(stmts.iter().all(|s| s.trim().is_empty()));
+    }
+
+    #[test]
+    fn split_semicolon_inside_single_quote_is_not_a_boundary() {
+        let stmts = split_sql_statements("SELECT ';'; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT ';'");
+    }
+
+    #[test]
+    fn split_semicolon_inside_double_quote_is_not_a_boundary() {
+        let stmts = split_sql_statements("SELECT \"a;b\"; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT \"a;b\"");
+    }
+
+    #[test]
+    fn split_escaped_quote_doubling_stays_in_string() {
+        // '' inside a single-quoted string is an escaped quote, not a close.
+        let stmts = split_sql_statements("SELECT 'it''s; fine'");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "SELECT 'it''s; fine'");
+    }
+
+    #[test]
+    fn split_unbalanced_quote_does_not_panic() {
+        // A dangling open quote must not loop forever or panic; the trailing
+        // buffer is flushed as a single (malformed) statement.
+        let stmts = split_sql_statements("SELECT 'unterminated");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "SELECT 'unterminated");
+    }
+
+    // ----- LOAD detection -----
+
+    #[test]
+    fn statement_is_load_detects_load_case_insensitive() {
+        assert!(statement_is_load("LOAD spatial"));
+        assert!(statement_is_load("  load httpfs"));
+        assert!(statement_is_load("LoAd json"));
+    }
+
+    #[test]
+    fn statement_is_load_rejects_non_load() {
+        assert!(!statement_is_load("SELECT 1"));
+        assert!(!statement_is_load("INSTALL spatial"));
+        assert!(!statement_is_load("")); // empty -> not load, no panic
+        assert!(!statement_is_load("   "));
+        // a word that merely starts with "load" must not match.
+        assert!(!statement_is_load("loader()"));
+    }
+
+    // ----- LOAD keyword pre-filter (split fast-path guard) -----
+
+    #[test]
+    fn load_prefilter_matches_whole_word_ci() {
+        assert!(contains_load_keyword_ascii_ci("LOAD spatial"));
+        assert!(contains_load_keyword_ascii_ci("install x; load httpfs"));
+        assert!(contains_load_keyword_ascii_ci("  LoAd  json  "));
+        assert!(contains_load_keyword_ascii_ci("SELECT 1; LOAD y"));
+    }
+
+    #[test]
+    fn load_prefilter_rejects_substrings_and_absence() {
+        // The common hot path: a plain query has no LOAD -> prefilter bails,
+        // skipping the allocating split entirely.
+        assert!(!contains_load_keyword_ascii_ci("SELECT 1"));
+        assert!(!contains_load_keyword_ascii_ci("SELECT load_factor FROM t"));
+        assert!(!contains_load_keyword_ascii_ci("preload"));
+        assert!(!contains_load_keyword_ascii_ci("reloaded"));
+        assert!(!contains_load_keyword_ascii_ci(""));
+    }
+
+    // ----- complex depth cap (deeply-nested JSON guard) -----
+
+    #[test]
+    fn depth_cap_accepts_shallow() {
+        assert!(complex_depth_within_cap(&json!(5), COMPLEX_MAX_DEPTH));
+        assert!(complex_depth_within_cap(&json!([1, 2, 3]), COMPLEX_MAX_DEPTH));
+        assert!(complex_depth_within_cap(
+            &json!({"a": [1, {"b": 2}]}),
+            COMPLEX_MAX_DEPTH
+        ));
+        assert!(complex_depth_within_cap(&json!(null), COMPLEX_MAX_DEPTH));
+    }
+
+    #[test]
+    fn depth_cap_rejects_overdeep_array() {
+        // Build [[[...]]] one level past the cap.
+        let mut v = json!(0);
+        for _ in 0..(COMPLEX_MAX_DEPTH + 2) {
+            v = serde_json::Value::Array(vec![v]);
+        }
+        assert!(!complex_depth_within_cap(&v, COMPLEX_MAX_DEPTH));
+    }
+
+    #[test]
+    fn depth_cap_rejects_overdeep_object() {
+        let mut v = json!(0);
+        for _ in 0..(COMPLEX_MAX_DEPTH + 2) {
+            let mut m = serde_json::Map::new();
+            m.insert("f".to_string(), v);
+            v = serde_json::Value::Object(m);
+        }
+        assert!(!complex_depth_within_cap(&v, COMPLEX_MAX_DEPTH));
+    }
+
+    #[test]
+    fn depth_cap_boundary_is_exact() {
+        // Exactly `max_depth` levels of array nesting (a scalar wrapped N times)
+        // is accepted; N+1 is rejected.
+        let build = |levels: u32| {
+            let mut v = json!(0);
+            for _ in 0..levels {
+                v = serde_json::Value::Array(vec![v]);
+            }
+            v
+        };
+        assert!(complex_depth_within_cap(&build(COMPLEX_MAX_DEPTH), COMPLEX_MAX_DEPTH));
+        assert!(!complex_depth_within_cap(
+            &build(COMPLEX_MAX_DEPTH + 1),
+            COMPLEX_MAX_DEPTH
+        ));
+    }
+
+    // ----- list length cap (oversized array guard) -----
+
+    #[test]
+    fn list_len_cap() {
+        assert!(complex_list_len_within_cap(0, COMPLEX_MAX_LIST_LEN));
+        assert!(complex_list_len_within_cap(COMPLEX_MAX_LIST_LEN, COMPLEX_MAX_LIST_LEN));
+        assert!(!complex_list_len_within_cap(
+            COMPLEX_MAX_LIST_LEN + 1,
+            COMPLEX_MAX_LIST_LEN
+        ));
+    }
+
+    // ----- JSON-shape-vs-type mismatch guard -----
+
+    #[test]
+    fn shape_list_requires_array() {
+        assert!(json_matches_complex_kind(&json!([1, 2]), ComplexKind::List));
+        // type says LIST but JSON is a number / object -> mismatch (must error).
+        assert!(!json_matches_complex_kind(&json!(7), ComplexKind::List));
+        assert!(!json_matches_complex_kind(&json!({"a": 1}), ComplexKind::List));
+    }
+
+    #[test]
+    fn shape_struct_requires_object() {
+        assert!(json_matches_complex_kind(&json!({"a": 1}), ComplexKind::Struct));
+        assert!(!json_matches_complex_kind(&json!([1, 2]), ComplexKind::Struct));
+        assert!(!json_matches_complex_kind(&json!(7), ComplexKind::Struct));
+    }
+
+    #[test]
+    fn shape_scalar_rejects_containers() {
+        assert!(json_matches_complex_kind(&json!(7), ComplexKind::Scalar));
+        assert!(json_matches_complex_kind(&json!("s"), ComplexKind::Scalar));
+        assert!(!json_matches_complex_kind(&json!([1]), ComplexKind::Scalar));
+        assert!(!json_matches_complex_kind(&json!({"a": 1}), ComplexKind::Scalar));
+    }
+
+    #[test]
+    fn shape_null_always_allowed() {
+        // A JSON null marks the row invalid regardless of declared kind.
+        assert!(json_matches_complex_kind(&json!(null), ComplexKind::List));
+        assert!(json_matches_complex_kind(&json!(null), ComplexKind::Struct));
+        assert!(json_matches_complex_kind(&json!(null), ComplexKind::Scalar));
+    }
+
+    // ----- malformed JSON: serde returns Err, never panics -----
+
+    #[test]
+    fn malformed_json_is_err_not_panic() {
+        // This mirrors the parse step in write_duckvalue_to_vector's Complex arm:
+        // a malformed component payload must surface as an Err, not a panic.
+        assert!(serde_json::from_str::<serde_json::Value>("{not json").is_err());
+        assert!(serde_json::from_str::<serde_json::Value>("[1, 2,").is_err());
+        assert!(serde_json::from_str::<serde_json::Value>("").is_err());
+    }
+
+    #[test]
+    fn pathologically_deep_json_string_parses_to_err() {
+        // serde_json caps parse recursion (default 128) and returns Err rather
+        // than overflowing the stack; confirm an adversarial deep string is
+        // rejected at the parse boundary.
+        let deep = "[".repeat(5000) + &"]".repeat(5000);
+        let parsed = serde_json::from_str::<serde_json::Value>(&deep);
+        assert!(parsed.is_err());
+    }
+}
+
 impl ConnectionState {
     fn open(path: Option<&str>) -> Result<Self, DuckDbError> {
         Self::open_with_config(path, &[])
@@ -3411,6 +3648,15 @@ impl ConnectionState {
     /// time with a storage-type re-sync before each. Returns `None` for a single
     /// statement or a batch with no LOAD (the common, fast single-query path).
     fn split_for_load_sync(&self, sql: &str) -> Option<(Vec<String>, String)> {
+        // Fast-path bail BEFORE the allocating statement split: the split only
+        // matters for a multi-statement batch that contains a LOAD. A single
+        // statement has no `;` separating two statements, and a batch with no
+        // LOAD never needs the per-statement re-sync. Both are cheap byte scans
+        // (no allocation) and skip building the Vec<String> for the common
+        // single-statement / non-LOAD query -- the hot path.
+        if !sql.contains(';') || !contains_load_keyword_ascii_ci(sql) {
+            return None;
+        }
         let stmts = split_sql_statements(sql);
         if stmts.len() < 2 {
             return None;
@@ -5057,6 +5303,98 @@ fn statement_is_load(stmt: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reject component-supplied `complex` JSON whose recursion depth would overflow
+/// the wasm stack when walked by `write_json_to_vector`. Pure + connection-free
+/// so it is unit-testable; the unsafe writer enforces the same cap inline (the
+/// `depth >` check), this mirrors it for the up-front validation + the tests.
+fn complex_depth_within_cap(value: &serde_json::Value, max_depth: u32) -> bool {
+    fn depth_ok(value: &serde_json::Value, remaining: u32) -> bool {
+        match value {
+            serde_json::Value::Array(items) => {
+                if remaining == 0 {
+                    return false;
+                }
+                items.iter().all(|v| depth_ok(v, remaining - 1))
+            }
+            serde_json::Value::Object(fields) => {
+                if remaining == 0 {
+                    return false;
+                }
+                fields.values().all(|v| depth_ok(v, remaining - 1))
+            }
+            _ => true,
+        }
+    }
+    depth_ok(value, max_depth)
+}
+
+/// True when the JSON value's shape is compatible with the requested DuckDB
+/// physical kind (LIST<->array, STRUCT<->object). A JSON null is always allowed
+/// (it marks the row invalid). Pure mirror of the `as_array()/as_object()`
+/// checks in `write_json_to_vector`, exposed for unit testing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComplexKind {
+    List,
+    Struct,
+    Scalar,
+}
+
+fn json_matches_complex_kind(value: &serde_json::Value, kind: ComplexKind) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    match kind {
+        ComplexKind::List => value.is_array(),
+        ComplexKind::Struct => value.is_object(),
+        ComplexKind::Scalar => !value.is_array() && !value.is_object(),
+    }
+}
+
+/// True when the per-row LIST element count is within the reserve cap that
+/// guards `duckdb_list_vector_reserve` from an adversarial huge allocation.
+fn complex_list_len_within_cap(len: usize, max_len: usize) -> bool {
+    len <= max_len
+}
+
+/// A short, allocation-free label for a JSON value's kind, for type-mismatch
+/// error messages on the `complex` boundary.
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Cheap, allocation-free pre-filter: does `sql` contain the ASCII keyword
+/// "load" as a whole word (case-insensitive)? Used to skip the allocating
+/// statement split on the common non-LOAD query path. A false positive only
+/// costs one extra `split_sql_statements` pass (still correct); it is
+/// intentionally conservative (substring "preload" does NOT match, since the
+/// preceding char is alphanumeric).
+fn contains_load_keyword_ascii_ci(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let needle = b"load";
+    if bytes.len() < needle.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for i in 0..=bytes.len() - needle.len() {
+        if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            let before_ok = i == 0 || !is_word(bytes[i - 1]);
+            let after_idx = i + needle.len();
+            let after_ok = after_idx == bytes.len() || !is_word(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn split_sql_statements(script: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut buf = String::new();
@@ -5699,6 +6037,22 @@ fn duckdb_type_for_logical(logical: &Logicaltype) -> duckdb::duckdb_type {
 /// `write_duckvalue_to_vector` writes for `Duckvalue::Decimal`.
 const DEFAULT_DECIMAL_WIDTH: u8 = 38;
 const DEFAULT_DECIMAL_SCALE: u8 = 4;
+
+/// Recursion cap for the `complex` JSON<->vector escape hatch. The JSON arrives
+/// from a COMPONENT (a trust boundary): a `[[[[...]]]]` payload, or a recursive
+/// `complex` type-expr, would otherwise recurse `write_json_to_vector` /
+/// `read_vector_to_json` once per nesting level and overflow the wasm stack ->
+/// an abort that takes down the whole instance / the host. Real nested types
+/// (LIST<STRUCT<LIST<...>>>) are shallow; this cap is generous but bounded. Same
+/// fix the WKB fuzz pass applied to the parser components' never-panic contract.
+const COMPLEX_MAX_DEPTH: u32 = 64;
+
+/// Per-row element cap for the `complex` LIST writer. A component-supplied JSON
+/// array length feeds `duckdb_list_vector_reserve`; an adversarial huge length
+/// would request an enormous allocation. The serde parse already bounds the
+/// array to what actually fit in the JSON string, but cap the per-row reserve so
+/// a pathological (but parseable) payload errors instead of OOM-aborting.
+const COMPLEX_MAX_LIST_LEN: usize = 16 * 1024 * 1024;
 
 unsafe fn create_duckdb_logical_type(
     connection: duckdb::duckdb_connection,
@@ -6576,7 +6930,22 @@ unsafe fn read_vector_to_json(
     col_type: duckdb::duckdb_logical_type,
     row: duckdb::idx_t,
 ) -> serde_json::Value {
+    read_vector_to_json_depth(vector, col_type, row, 0)
+}
+
+unsafe fn read_vector_to_json_depth(
+    vector: duckdb::duckdb_vector,
+    col_type: duckdb::duckdb_logical_type,
+    row: duckdb::idx_t,
+    depth: u32,
+) -> serde_json::Value {
     use serde_json::Value as J;
+    // Trust boundary: a component can declare an arbitrarily deep `complex`
+    // type-expr. Cap the recursion so reading the vector cannot overflow the
+    // wasm stack; past the cap we truncate to null rather than panic.
+    if depth > COMPLEX_MAX_DEPTH {
+        return J::Null;
+    }
     let validity = duckdb::duckdb_vector_get_validity(vector);
     if !validity.is_null() && !duckdb::duckdb_validity_row_is_valid(validity, row) {
         return J::Null;
@@ -6590,10 +6959,11 @@ unsafe fn read_vector_to_json(
             let child_type = duckdb::duckdb_list_type_child_type(col_type);
             let mut out = Vec::with_capacity(entry.length as usize);
             for i in 0..entry.length {
-                out.push(read_vector_to_json(
+                out.push(read_vector_to_json_depth(
                     child,
                     child_type,
                     (entry.offset + i) as duckdb::idx_t,
+                    depth + 1,
                 ));
             }
             let mut ct = child_type;
@@ -6609,7 +6979,10 @@ unsafe fn read_vector_to_json(
                 duckdb::duckdb_free(name_ptr as *mut c_void);
                 let field_child = duckdb::duckdb_struct_vector_get_child(vector, i);
                 let field_type = duckdb::duckdb_struct_type_child_type(col_type, i);
-                map.insert(field_name, read_vector_to_json(field_child, field_type, row));
+                map.insert(
+                    field_name,
+                    read_vector_to_json_depth(field_child, field_type, row, depth + 1),
+                );
                 let mut ft = field_type;
                 duckdb::duckdb_destroy_logical_type(&mut ft);
             }
@@ -6954,6 +7327,15 @@ unsafe fn write_duckvalue_to_vector(
                     c.type_expr
                 ))
             })?;
+            // Up-front depth gate (the recursive writer also enforces this, but
+            // reject an over-deep payload BEFORE touching the vector so a
+            // pathological component input never half-writes a row).
+            if !complex_depth_within_cap(&json, COMPLEX_MAX_DEPTH) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "complex value json for '{}' exceeds max nesting depth {COMPLEX_MAX_DEPTH}",
+                    c.type_expr
+                )));
+            }
             let col_type = duckdb::duckdb_vector_get_column_type(vector);
             let res = write_json_to_vector(vector, col_type, row, &json);
             let mut col_type_mut = col_type;
@@ -6975,6 +7357,24 @@ unsafe fn write_json_to_vector(
     row: duckdb::idx_t,
     json: &serde_json::Value,
 ) -> Result<(), Duckerror> {
+    write_json_to_vector_depth(vector, col_type, row, json, 0)
+}
+
+unsafe fn write_json_to_vector_depth(
+    vector: duckdb::duckdb_vector,
+    col_type: duckdb::duckdb_logical_type,
+    row: duckdb::idx_t,
+    json: &serde_json::Value,
+    depth: u32,
+) -> Result<(), Duckerror> {
+    // Trust boundary: a component-supplied JSON / type-expr can be arbitrarily
+    // deeply nested. Cap the recursion so a `[[[[...]]]]` payload errors instead
+    // of overflowing the wasm stack (which aborts the whole instance).
+    if depth > COMPLEX_MAX_DEPTH {
+        return Err(Duckerror::Invalidargument(format!(
+            "complex JSON nesting exceeds max depth {COMPLEX_MAX_DEPTH}"
+        )));
+    }
     let type_id = duckdb::duckdb_get_type_id(col_type);
 
     // JSON null -> mark the row invalid.
@@ -6987,9 +7387,28 @@ unsafe fn write_json_to_vector(
 
     match type_id {
         duckdb::DUCKDB_TYPE_LIST => {
+            // Type-vs-JSON mismatch guard: the resolved type says LIST, so the
+            // component's JSON for this row must be an array (or null, handled
+            // above). A number/object/string here is an adversarial/buggy
+            // payload -> error, never an out-of-shape access.
+            if !json_matches_complex_kind(json, ComplexKind::List) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "complex type is LIST but JSON value is {}",
+                    json_value_kind(json)
+                )));
+            }
             let arr = json.as_array().ok_or_else(|| {
                 Duckerror::Invalidargument("expected JSON array for LIST".to_string())
             })?;
+            // Cap the per-row element count before it reaches
+            // duckdb_list_vector_reserve (a giant length would request a huge
+            // allocation and could OOM-abort the instance).
+            if !complex_list_len_within_cap(arr.len(), COMPLEX_MAX_LIST_LEN) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "complex LIST row length {} exceeds max {COMPLEX_MAX_LIST_LEN}",
+                    arr.len()
+                )));
+            }
             let child_type = duckdb::duckdb_list_type_child_type(col_type);
             // Append this row's elements to the child vector at the running tail.
             // Reserve/grow BEFORE fetching the child pointer, since a reserve can
@@ -7001,7 +7420,7 @@ unsafe fn write_json_to_vector(
             let child = duckdb::duckdb_list_vector_get_child(vector);
             for (i, elem) in arr.iter().enumerate() {
                 let child_row = start + i as duckdb::idx_t;
-                let r = write_json_to_vector(child, child_type, child_row, elem);
+                let r = write_json_to_vector_depth(child, child_type, child_row, elem, depth + 1);
                 if r.is_err() {
                     let mut ct = child_type;
                     duckdb::duckdb_destroy_logical_type(&mut ct);
@@ -7023,6 +7442,15 @@ unsafe fn write_json_to_vector(
             Ok(())
         }
         duckdb::DUCKDB_TYPE_STRUCT => {
+            // Type-vs-JSON mismatch guard (see the LIST arm): a STRUCT type
+            // requires a JSON object. Missing fields are tolerated below
+            // (defaulted to null); a non-object value is rejected here.
+            if !json_matches_complex_kind(json, ComplexKind::Struct) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "complex type is STRUCT but JSON value is {}",
+                    json_value_kind(json)
+                )));
+            }
             let obj = json.as_object().ok_or_else(|| {
                 Duckerror::Invalidargument("expected JSON object for STRUCT".to_string())
             })?;
@@ -7034,7 +7462,8 @@ unsafe fn write_json_to_vector(
                 let field_child = duckdb::duckdb_struct_vector_get_child(vector, i);
                 let field_type = duckdb::duckdb_struct_type_child_type(col_type, i);
                 let field_json = obj.get(&field_name).cloned().unwrap_or(serde_json::Value::Null);
-                let r = write_json_to_vector(field_child, field_type, row, &field_json);
+                let r =
+                    write_json_to_vector_depth(field_child, field_type, row, &field_json, depth + 1);
                 let mut ft = field_type;
                 duckdb::duckdb_destroy_logical_type(&mut ft);
                 r?;
