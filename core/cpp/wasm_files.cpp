@@ -74,7 +74,9 @@ public:
 class WasmFileSystem : public FileSystem {
 public:
 	bool CanHandleFile(const string &fpath) override {
-		return StringUtil::StartsWith(fpath, "http://") || StringUtil::StartsWith(fpath, "https://");
+		return StringUtil::StartsWith(fpath, "http://") || StringUtil::StartsWith(fpath, "https://") ||
+		       StringUtil::StartsWith(fpath, "s3://") || StringUtil::StartsWith(fpath, "az://") ||
+		       StringUtil::StartsWith(fpath, "azure://") || StringUtil::StartsWith(fpath, "gcs://") || StringUtil::StartsWith(fpath, "gs://");
 	}
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
