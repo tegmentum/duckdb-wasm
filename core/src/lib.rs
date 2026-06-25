@@ -68,6 +68,10 @@ static AGGREGATE_FUNCTION_DEFINITIONS: OnceLock<Mutex<Vec<Arc<AggregateFunctionD
 /// `StorageExtension::Find`, so a stale entry is harmless.
 static STORAGE_REGISTERED_TYPES: OnceLock<Mutex<std::collections::HashSet<String>>> =
     OnceLock::new();
+/// Collation names for which a wasm collation has already been registered (avoids
+/// re-registering on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
+static COLLATION_REGISTERED_NAMES: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
 /// Registered replacement scans (file extension -> table function name).
 static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::new();
 /// Databases that already have the global replacement-scan callback installed.
@@ -89,6 +93,21 @@ extern "C" {
 // dynamic gate on a files-capable component is M2.
 extern "C" {
     fn wasm_register_file_system(db: duckdb::duckdb_database);
+}
+
+// Item 2: implemented in core/cpp/wasm_collation.cpp. Wraps an already-registered
+// sort-key scalar (`transform_scalar`, text -> sort-key text) in a DuckDB
+// collation named `name`, so `ORDER BY x COLLATE name` resolves to it. The C++
+// side is idempotent (CreateCollation with IGNORE_ON_CONFLICT), and we also
+// dedup-guard already-registered collations here. Registration is mid-session
+// safe: the binder reads collations from the system catalog at bind time.
+extern "C" {
+    fn wasm_register_collation(
+        db: duckdb::duckdb_database,
+        name: *const c_char,
+        transform_scalar: *const c_char,
+        combinable: bool,
+    );
 }
 
 // M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
@@ -2870,6 +2889,9 @@ impl ConnectionState {
             wasm_register_file_system(self.database);
         }
 
+        // Item 2: register any collations components have declared (mid-session).
+        self.sync_collations();
+
         let types = bindings::duckdb::extension::storage_host::storage_list_types();
         if types.is_empty() {
             return;
@@ -2889,6 +2911,49 @@ impl ConnectionState {
                 }
                 guard.insert(type_name);
             }
+        }
+    }
+
+    /// Item 2: pulls the collations components have declared (via the
+    /// `register-collation` WIT call, surfaced through `collation-host.collation-list`)
+    /// and registers a DuckDB collation for each one not yet registered. A
+    /// collation reuses an already-registered sort-key scalar as its transform;
+    /// the C++ shim looks the scalar up in the catalog and wraps it in a
+    /// CreateCollationInfo. Mid-session safe: the binder reads collations from the
+    /// system catalog at bind time, and CreateCollation uses IGNORE_ON_CONFLICT.
+    /// Called lazily before each query (after the scalar-registration drain that
+    /// happens at LOAD time, so the transform scalar already exists).
+    fn sync_collations(&self) {
+        let collations = bindings::duckdb::extension::collation_host::collation_list();
+        if collations.is_empty() {
+            return;
+        }
+        let seen = COLLATION_REGISTERED_NAMES.get_or_init(|| Mutex::new(Default::default()));
+        let mut guard = match seen.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for spec in collations {
+            if guard.contains(&spec.name) {
+                continue;
+            }
+            let c_name = match CString::new(spec.name.as_str()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let c_scalar = match CString::new(spec.transform_scalar.as_str()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            unsafe {
+                wasm_register_collation(
+                    self.database,
+                    c_name.as_ptr(),
+                    c_scalar.as_ptr(),
+                    spec.combinable,
+                );
+            }
+            guard.insert(spec.name);
         }
     }
 

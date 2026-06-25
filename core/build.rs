@@ -8,6 +8,9 @@ fn main() {
     // httpfs M1: the stub FileSystem subsystem (cpp/wasm_files.cpp). Compiled +
     // linked the same way as wasm_storage.cpp.
     build_wasm_cpp("wasm_files.cpp");
+    // Item 2: collation registration (cpp/wasm_collation.cpp). Wraps an
+    // already-registered sort-key scalar in a DuckDB collation. Same flags.
+    build_wasm_cpp("wasm_collation.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
