@@ -28,6 +28,7 @@ mod tvm_spill;
 
 use bindings::duckdb::component::extension_loader_hooks;
 use bindings::duckdb::extension::callback_dispatch;
+use bindings::duckdb::extension::pragma_host;
 use bindings::duckdb::extension::types::{
     Configerror, Duckvalue, Funcflags, Logfield, Logicaltype, Loglevel,
 };
@@ -72,6 +73,14 @@ static STORAGE_REGISTERED_TYPES: OnceLock<Mutex<std::collections::HashSet<String
 /// re-registering on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
 static COLLATION_REGISTERED_NAMES: OnceLock<Mutex<std::collections::HashSet<String>>> =
     OnceLock::new();
+/// Item 4: pragmas components have declared (via `runtime.pragma-registry.register-call`),
+/// pulled through the `pragma-host.pragma-list` import. Maps the PRAGMA name the
+/// user types to the callback-dispatch handle for `callback-dispatch.call-pragma`.
+/// The DuckDB C API has no pragma-creation function, so the core intercepts
+/// `PRAGMA <name>(...)` in its query path: it dispatches the pragma (the component
+/// RETURNS a SQL script as text -- no mid-callback re-entry into SQL) and then runs
+/// that script on the same connection.
+static DECLARED_PRAGMAS: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
 /// Registered replacement scans (file extension -> table function name).
 static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::new();
 /// Databases that already have the global replacement-scan callback installed.
@@ -2892,6 +2901,10 @@ impl ConnectionState {
         // Item 2: register any collations components have declared (mid-session).
         self.sync_collations();
 
+        // Item 4: pull any pragmas components have declared (mid-session) into the
+        // process-wide registry, so `PRAGMA <name>(...)` can be intercepted.
+        sync_pragmas();
+
         let types = bindings::duckdb::extension::storage_host::storage_list_types();
         if types.is_empty() {
             return;
@@ -2958,8 +2971,70 @@ impl ConnectionState {
     }
 
     fn execute(&self, sql: &str) -> Result<QueryResult, DuckDbError> {
+        // Item 4: intercept `PRAGMA <name>(...)` for component-declared pragmas.
+        if let Some(result) = self.run_intercepted_pragma(sql)? {
+            return Ok(result);
+        }
         let (columns, rows) = self.collect_rows(sql)?;
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Item 4: if `sql` is `PRAGMA <name>(...)` for a component-declared pragma,
+    /// dispatch it (the component RETURNS a SQL script as text -- it does NOT
+    /// re-enter SQL during the callback), run that script on this connection, and
+    /// return an empty result. Returns `Ok(None)` if `sql` is not such a pragma.
+    fn run_intercepted_pragma(&self, sql: &str) -> Result<Option<QueryResult>, DuckDbError> {
+        let parsed = match parse_pragma_call(sql) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        // Ensure the pragma registry is populated (pragmas are declared at LOAD;
+        // the pull is otherwise lazy inside collect_rows).
+        sync_pragmas();
+        let handle = {
+            let guard = declared_pragmas()
+                .lock()
+                .expect("declared pragmas mutex poisoned");
+            match guard.get(&parsed.name.to_ascii_lowercase()) {
+                Some(h) => *h,
+                None => return Ok(None),
+            }
+        };
+
+        // Dispatch the pragma to the owning component, passing the parsed args as
+        // text values. The component returns the generated SQL script as a text
+        // value (Some) or none.
+        let args: Vec<Duckvalue> = parsed.args.into_iter().map(Duckvalue::Text).collect();
+        let returned = callback_dispatch::call_pragma(handle, &args)
+            .map_err(|err| DuckDbError::message(format_duckerror(&err)))?;
+
+        let script = match returned {
+            Some(Duckvalue::Text(s)) => s,
+            Some(_) => {
+                return Err(DuckDbError::message(format!(
+                    "pragma '{}' must return a SQL script (text)",
+                    parsed.name
+                )))
+            }
+            None => String::new(),
+        };
+
+        // Run the returned script on this same connection. Multiple statements are
+        // separated by ';'; duckdb_query runs the last statement's result, so we
+        // execute each non-empty statement individually for robustness.
+        for statement in split_sql_statements(&script) {
+            let trimmed = statement.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let _ = self.collect_rows(trimmed)?;
+        }
+
+        Ok(QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+        .map(Some)
     }
 
     /// Runs `sql` and serializes the entire result to an Arrow IPC stream, using
@@ -4513,6 +4588,148 @@ struct AggregateFunctionEntry {
 
 struct AggregateState {
     rows: Vec<Vec<Duckvalue>>,
+}
+
+// ---- Item 4: component-declared pragmas (PRAGMA -> generated SQL) ----
+
+fn declared_pragmas() -> &'static Mutex<std::collections::HashMap<String, u32>> {
+    DECLARED_PRAGMAS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pull the pragmas components have declared (via the `pragma-host.pragma-list`
+/// import) into the process-wide registry. Idempotent: names are keyed
+/// lower-case so interception is case-insensitive. Mirrors `sync_collations`.
+fn sync_pragmas() {
+    let specs = pragma_host::pragma_list();
+    if specs.is_empty() {
+        return;
+    }
+    let mut guard = match declared_pragmas().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    for spec in specs {
+        guard.insert(spec.name.to_ascii_lowercase(), spec.callback_handle);
+    }
+}
+
+/// A parsed `PRAGMA <name>(<arg>, ...)` call.
+struct ParsedPragma {
+    name: String,
+    args: Vec<String>,
+}
+
+/// Parse `PRAGMA <name>(<arg>, ...)` (also accepting `CALL <name>(...)`),
+/// returning the pragma name and its arguments as strings. Single/double-quoted
+/// args are unquoted; bare identifiers/numbers are taken verbatim. Returns None
+/// if `sql` is not a pragma/call form. Only a single statement is considered.
+fn parse_pragma_call(sql: &str) -> Option<ParsedPragma> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("pragma") {
+        if !r.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        &trimmed[6..]
+    } else if let Some(r) = lower.strip_prefix("call") {
+        if !r.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        &trimmed[4..]
+    } else {
+        return None;
+    };
+    let rest = rest.trim_start();
+    let open = rest.find('(')?;
+    let name = rest[..open].trim().to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let close = rest.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let inner = &rest[open + 1..close];
+    let args = split_pragma_args(inner);
+    Some(ParsedPragma { name, args })
+}
+
+/// Split a pragma argument list on top-level commas, honoring single/double
+/// quotes (with doubled-quote escapes), and unquote each argument.
+fn split_pragma_args(inner: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut buf = String::new();
+    let mut chars = inner.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    if chars.peek() == Some(&q) {
+                        buf.push(q);
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                } else {
+                    buf.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                ',' => {
+                    args.push(buf.trim().to_string());
+                    buf.clear();
+                }
+                _ => buf.push(c),
+            },
+        }
+    }
+    let last = buf.trim().to_string();
+    if !last.is_empty() || !args.is_empty() {
+        args.push(last);
+    }
+    args
+}
+
+/// Split a SQL script into statements on top-level semicolons, honoring
+/// single/double-quoted strings (with doubled-quote escapes). Good enough for
+/// the generated FTS index DDL (no semicolons inside string literals there, but
+/// the quote handling keeps it robust).
+fn split_sql_statements(script: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut buf = String::new();
+    let mut chars = script.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                buf.push(c);
+                if c == q {
+                    if chars.peek() == Some(&q) {
+                        buf.push(q);
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    buf.push(c);
+                }
+                ';' => {
+                    stmts.push(std::mem::take(&mut buf));
+                }
+                _ => buf.push(c),
+            },
+        }
+    }
+    if !buf.trim().is_empty() {
+        stmts.push(buf);
+    }
+    stmts
 }
 
 fn scalar_function_definitions() -> &'static Mutex<Vec<Arc<ScalarFunctionDefinition>>> {
