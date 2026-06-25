@@ -11,6 +11,10 @@ fn main() {
     // Item 2: collation registration (cpp/wasm_collation.cpp). Wraps an
     // already-registered sort-key scalar in a DuckDB collation. Same flags.
     build_wasm_cpp("wasm_collation.cpp");
+    // Item 3 / M1: custom-index de-risk (cpp/wasm_index.cpp). A BoundIndex
+    // subclass registered as a custom INDEX TYPE so `CREATE INDEX ... USING
+    // wasm_hnsw` routes to it. Same flags.
+    build_wasm_cpp("wasm_index.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register

@@ -104,6 +104,16 @@ extern "C" {
     fn wasm_register_file_system(db: duckdb::duckdb_database);
 }
 
+// Item 3 / M1 (custom-index de-risk): implemented in core/cpp/wasm_index.cpp.
+// Registers a custom INDEX TYPE on the database's index-type set so
+// `CREATE INDEX ... USING <type>` routes to a WasmBoundIndex stub. Idempotent on
+// the C++ side (process-wide once-guard + FindByName dup-check), so always-
+// registering per query before any CREATE INDEX binds is safe. M1 fixes the type
+// name to "wasm_hnsw"; the dynamic per-component pull is M2.
+extern "C" {
+    fn wasm_register_index_type(db: duckdb::duckdb_database, type_name: *const c_char);
+}
+
 // Item 2: implemented in core/cpp/wasm_collation.cpp. Wraps an already-registered
 // sort-key scalar (`transform_scalar`, text -> sort-key text) in a DuckDB
 // collation named `name`, so `ORDER BY x COLLATE name` resolves to it. The C++
@@ -2896,6 +2906,17 @@ impl ConnectionState {
         // proves the mechanism without dynamic gating (that is M2).
         unsafe {
             wasm_register_file_system(self.database);
+        }
+
+        // Item 3 / M1: register the fixed custom index type "wasm_hnsw" so
+        // `CREATE INDEX ... USING wasm_hnsw` routes to WasmBoundIndex. The C++
+        // side is idempotent (process-wide once-guard + FindByName dup-check), so
+        // calling before every query is cheap and guarantees the type is present
+        // before any CREATE INDEX binds. Dynamic per-component pull is M2.
+        if let Ok(c_type) = CString::new("wasm_hnsw") {
+            unsafe {
+                wasm_register_index_type(self.database, c_type.as_ptr());
+            }
         }
 
         // Item 2: register any collations components have declared (mid-session).
