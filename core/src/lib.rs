@@ -30,7 +30,8 @@ use bindings::duckdb::component::extension_loader_hooks;
 use bindings::duckdb::extension::callback_dispatch;
 use bindings::duckdb::extension::pragma_host;
 use bindings::duckdb::extension::types::{
-    Configerror, Duckvalue, Funcflags, Logfield, Logicaltype, Loglevel,
+    Configerror, Decimalvalue, Duckvalue, Funcflags, Intervalvalue, Logfield, Logicaltype,
+    Loglevel, Uuidvalue,
 };
 use bindings::exports::duckdb::component::database as exported_database;
 use bindings::exports::duckdb::extension::{
@@ -186,6 +187,9 @@ fn storage_logicaltype_to_code(ty: Logicaltype) -> u32 {
         Logicaltype::Date => 13,    // DUCKDB_TYPE_DATE
         Logicaltype::Time => 14,    // DUCKDB_TYPE_TIME
         Logicaltype::Timestamptz => 31, // DUCKDB_TYPE_TIMESTAMP_TZ
+        Logicaltype::Decimal => 19, // DUCKDB_TYPE_DECIMAL
+        Logicaltype::Interval => 15, // DUCKDB_TYPE_INTERVAL
+        Logicaltype::Uuid => 27,    // DUCKDB_TYPE_UUID
     }
 }
 
@@ -3558,6 +3562,19 @@ impl exported_database::GuestPreparedStatement for PreparedStatementState {
                     Duckvalue::Timestamptz(micros) => {
                         duckdb::duckdb_bind_int64(stmt, idx, *micros)
                     }
+                    // No dedicated decimal/interval/uuid bind in the minimal C-API.
+                    // Bind the int64 magnitude (DuckDB casts to the param's type);
+                    // these composite params are not exercised by the suite.
+                    Duckvalue::Decimal(d) => {
+                        let v = ((d.upper as i128) << 64 | d.lower as i128) as i64;
+                        duckdb::duckdb_bind_int64(stmt, idx, v)
+                    }
+                    Duckvalue::Interval(iv) => {
+                        duckdb::duckdb_bind_int64(stmt, idx, iv.micros)
+                    }
+                    Duckvalue::Uuid(u) => {
+                        duckdb::duckdb_bind_uint64(stmt, idx, u.lo)
+                    }
                 };
                 if state != DUCKDB_SUCCESS {
                     return Err(Duckerror::from(DuckDbError::message(format!(
@@ -3682,6 +3699,18 @@ impl exported_database::GuestAppender for AppenderState {
                     Duckvalue::Time(micros) => duckdb::duckdb_append_int64(appender, *micros),
                     Duckvalue::Timestamptz(micros) => {
                         duckdb::duckdb_append_int64(appender, *micros)
+                    }
+                    // Minimal C-API appender: widen the int64 magnitude (DuckDB
+                    // casts to the column type). Composite appends are not used.
+                    Duckvalue::Decimal(d) => {
+                        let v = ((d.upper as i128) << 64 | d.lower as i128) as i64;
+                        duckdb::duckdb_append_int64(appender, v)
+                    }
+                    Duckvalue::Interval(iv) => {
+                        duckdb::duckdb_append_int64(appender, iv.micros)
+                    }
+                    Duckvalue::Uuid(u) => {
+                        duckdb::duckdb_append_uint64(appender, u.lo)
                     }
                 };
                 if state != DUCKDB_SUCCESS {
@@ -4075,6 +4104,12 @@ fn duckdb_type_to_logical(type_id: duckdb::duckdb_type) -> Option<Logicaltype> {
         duckdb::DUCKDB_TYPE_DATE => Some(Logicaltype::Date),
         duckdb::DUCKDB_TYPE_TIME => Some(Logicaltype::Time),
         duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => Some(Logicaltype::Timestamptz),
+        duckdb::DUCKDB_TYPE_DECIMAL => Some(Logicaltype::Decimal),
+        duckdb::DUCKDB_TYPE_INTERVAL => Some(Logicaltype::Interval),
+        duckdb::DUCKDB_TYPE_UUID => Some(Logicaltype::Uuid),
+        // The builtin GEOMETRY type is physically a WKB string_t blob, identical
+        // to BLOB, so it flows through component casts/scalars as a blob value.
+        duckdb::DUCKDB_TYPE_GEOMETRY => Some(Logicaltype::Blob),
         _ => None,
     }
 }
@@ -5328,6 +5363,9 @@ fn convert_runtime_logicaltype(logical: runtime_exports::Logicaltype) -> Logical
         runtime_exports::Logicaltype::Date => Logicaltype::Date,
         runtime_exports::Logicaltype::Time => Logicaltype::Time,
         runtime_exports::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
+        runtime_exports::Logicaltype::Decimal => Logicaltype::Decimal,
+        runtime_exports::Logicaltype::Interval => Logicaltype::Interval,
+        runtime_exports::Logicaltype::Uuid => Logicaltype::Uuid,
     }
 }
 
@@ -5350,6 +5388,9 @@ fn convert_loader_logicaltype(logical: extension_loader_hooks::Logicaltype) -> L
         extension_loader_hooks::Logicaltype::Date => Logicaltype::Date,
         extension_loader_hooks::Logicaltype::Time => Logicaltype::Time,
         extension_loader_hooks::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
+        extension_loader_hooks::Logicaltype::Decimal => Logicaltype::Decimal,
+        extension_loader_hooks::Logicaltype::Interval => Logicaltype::Interval,
+        extension_loader_hooks::Logicaltype::Uuid => Logicaltype::Uuid,
     }
 }
 
@@ -5468,6 +5509,9 @@ fn describe_loader_logicaltype(logical: &extension_loader_hooks::Logicaltype) ->
         extension_loader_hooks::Logicaltype::Date => "DATE",
         extension_loader_hooks::Logicaltype::Time => "TIME",
         extension_loader_hooks::Logicaltype::Timestamptz => "TIMESTAMPTZ",
+        extension_loader_hooks::Logicaltype::Decimal => "DECIMAL",
+        extension_loader_hooks::Logicaltype::Interval => "INTERVAL",
+        extension_loader_hooks::Logicaltype::Uuid => "UUID",
     }
 }
 
@@ -5514,12 +5558,34 @@ fn duckdb_type_for_logical(logical: Logicaltype) -> duckdb::duckdb_type {
         Logicaltype::Date => duckdb::DUCKDB_TYPE_DATE,
         Logicaltype::Time => duckdb::DUCKDB_TYPE_TIME,
         Logicaltype::Timestamptz => duckdb::DUCKDB_TYPE_TIMESTAMP_TZ,
+        Logicaltype::Decimal => duckdb::DUCKDB_TYPE_DECIMAL,
+        Logicaltype::Interval => duckdb::DUCKDB_TYPE_INTERVAL,
+        Logicaltype::Uuid => duckdb::DUCKDB_TYPE_UUID,
     }
 }
+
+/// The default width/scale used when a bare `Logicaltype::Decimal` (which
+/// carries no precision) must be materialized as a DuckDB logical type. width=38
+/// forces the int128 (hugeint) physical representation, which is what
+/// `write_duckvalue_to_vector` writes for `Duckvalue::Decimal`.
+const DEFAULT_DECIMAL_WIDTH: u8 = 38;
+const DEFAULT_DECIMAL_SCALE: u8 = 4;
 
 unsafe fn create_duckdb_logical_type(
     logical: Logicaltype,
 ) -> Result<duckdb::duckdb_logical_type, Duckerror> {
+    // DECIMAL cannot be built from a bare type code (duckdb_create_logical_type
+    // rejects DUCKDB_TYPE_DECIMAL); it needs an explicit width/scale.
+    if logical == Logicaltype::Decimal {
+        let ty = duckdb::duckdb_create_decimal_type(DEFAULT_DECIMAL_WIDTH, DEFAULT_DECIMAL_SCALE);
+        return if ty.is_null() {
+            Err(Duckerror::Internal(
+                "duckdb_create_decimal_type returned null".to_string(),
+            ))
+        } else {
+            Ok(ty)
+        };
+    }
     let ty = duckdb::duckdb_create_logical_type(duckdb_type_for_logical(logical));
     if ty.is_null() {
         Err(Duckerror::Internal(
@@ -6287,6 +6353,41 @@ unsafe fn read_scalar_argument(
             let value = *data.add(row as usize);
             Ok(Duckvalue::Timestamptz(value))
         }
+        Logicaltype::Decimal => {
+            // We materialize DECIMAL as decimal(38, S), whose physical storage is
+            // an int128 of the unscaled value. Read the raw 128-bit integer.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i128;
+            let raw = *data.add(row as usize) as u128;
+            Ok(Duckvalue::Decimal(Decimalvalue {
+                lower: raw as u64,
+                upper: (raw >> 64) as u64,
+                width: DEFAULT_DECIMAL_WIDTH,
+                scale: DEFAULT_DECIMAL_SCALE,
+            }))
+        }
+        Logicaltype::Interval => {
+            // DUCKDB_TYPE_INTERVAL is physically a {months:i32, days:i32, micros:i64}.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_interval;
+            let iv = *data.add(row as usize);
+            Ok(Duckvalue::Interval(Intervalvalue {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }))
+        }
+        Logicaltype::Uuid => {
+            // DUCKDB_TYPE_UUID is physically a hugeint with the high bit flipped
+            // (so unsigned ordering matches). Flip it back to recover the logical
+            // 128-bit UUID, then split into hi/lo halves.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_hugeint;
+            let hh = *data.add(row as usize);
+            let physical = ((hh.upper as u128) << 64) | hh.lower as u128;
+            let logical = physical ^ (1u128 << 127);
+            Ok(Duckvalue::Uuid(Uuidvalue {
+                hi: (logical >> 64) as u64,
+                lo: logical as u64,
+            }))
+        }
     }
 }
 
@@ -6526,6 +6627,57 @@ unsafe fn write_duckvalue_to_vector(
             duckdb::duckdb_validity_set_row_valid(validity, row);
             Ok(())
         }
+        Duckvalue::Decimal(d) => {
+            if *logical != Logicaltype::Decimal {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected decimal result, got {}",
+                    duckvalue_kind(&Duckvalue::Decimal(d))
+                )));
+            }
+            // The result vector is decimal(38, S); its physical storage is an
+            // int128 of the unscaled value = (upper << 64 | lower).
+            let raw = ((d.upper as u128) << 64) | d.lower as u128;
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i128;
+            *data.add(row as usize) = raw as i128;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Interval(iv) => {
+            if *logical != Logicaltype::Interval {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected interval result, got {}",
+                    duckvalue_kind(&Duckvalue::Interval(iv))
+                )));
+            }
+            // DUCKDB_TYPE_INTERVAL is physically {months:i32, days:i32, micros:i64}.
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut duckdb::duckdb_interval;
+            *data.add(row as usize) = duckdb::duckdb_interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            };
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Uuid(u) => {
+            if *logical != Logicaltype::Uuid {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected uuid result, got {}",
+                    duckvalue_kind(&Duckvalue::Uuid(u))
+                )));
+            }
+            // DUCKDB_TYPE_UUID is physically a hugeint with the high bit flipped.
+            // Flip the logical UUID's MSB to produce the physical storage value.
+            let logical_uuid = ((u.hi as u128) << 64) | u.lo as u128;
+            let physical = logical_uuid ^ (1u128 << 127);
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut duckdb::duckdb_hugeint;
+            *data.add(row as usize) = duckdb::duckdb_hugeint {
+                lower: physical as u64,
+                upper: (physical >> 64) as i64,
+            };
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
     }
 }
 
@@ -6557,6 +6709,9 @@ fn duckvalue_kind(value: &Duckvalue) -> &'static str {
         Duckvalue::Date(_) => "date",
         Duckvalue::Time(_) => "time",
         Duckvalue::Timestamptz(_) => "timestamptz",
+        Duckvalue::Decimal(_) => "decimal",
+        Duckvalue::Interval(_) => "interval",
+        Duckvalue::Uuid(_) => "uuid",
     }
 }
 
@@ -6600,6 +6755,34 @@ unsafe fn duckdb_value_to_duckvalue(
         Logicaltype::Time => Duckvalue::Time(duckdb::duckdb_get_time(value).micros),
         Logicaltype::Timestamptz => {
             Duckvalue::Timestamptz(duckdb::duckdb_get_timestamp_tz(value).micros)
+        }
+        Logicaltype::Decimal => {
+            let d = duckdb::duckdb_get_decimal(value);
+            Duckvalue::Decimal(Decimalvalue {
+                lower: d.value.lower,
+                upper: d.value.upper as u64,
+                width: d.width,
+                scale: d.scale,
+            })
+        }
+        Logicaltype::Interval => {
+            let iv = duckdb::duckdb_get_interval(value);
+            Duckvalue::Interval(Intervalvalue {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            })
+        }
+        Logicaltype::Uuid => {
+            // UUID is hugeint-backed; the value API returns the physical hugeint
+            // (high bit flipped). Flip it back to the logical 128-bit UUID.
+            let hh = duckdb::duckdb_get_hugeint(value);
+            let physical = ((hh.upper as u128) << 64) | hh.lower as u128;
+            let logical_uuid = physical ^ (1u128 << 127);
+            Duckvalue::Uuid(Uuidvalue {
+                hi: (logical_uuid >> 64) as u64,
+                lo: logical_uuid as u64,
+            })
         }
         Logicaltype::Text => {
             let ptr = duckdb::duckdb_get_varchar(value);

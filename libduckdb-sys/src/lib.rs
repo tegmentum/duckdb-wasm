@@ -119,9 +119,14 @@ pub const DUCKDB_TYPE_DOUBLE: duckdb_type = 11;
 pub const DUCKDB_TYPE_TIMESTAMP: duckdb_type = 12;
 pub const DUCKDB_TYPE_DATE: duckdb_type = 13;
 pub const DUCKDB_TYPE_TIME: duckdb_type = 14;
+pub const DUCKDB_TYPE_INTERVAL: duckdb_type = 15;
+pub const DUCKDB_TYPE_HUGEINT: duckdb_type = 16;
 pub const DUCKDB_TYPE_VARCHAR: duckdb_type = 17;
 pub const DUCKDB_TYPE_BLOB: duckdb_type = 18;
+pub const DUCKDB_TYPE_DECIMAL: duckdb_type = 19;
+pub const DUCKDB_TYPE_UUID: duckdb_type = 27;
 pub const DUCKDB_TYPE_TIMESTAMP_TZ: duckdb_type = 31;
+pub const DUCKDB_TYPE_GEOMETRY: duckdb_type = 40;
 
 /// DuckDB's TIMESTAMP representation: microseconds since 1970-01-01.
 #[repr(C)]
@@ -140,6 +145,31 @@ pub struct duckdb_date {
 #[derive(Debug, Copy, Clone)]
 pub struct duckdb_time {
     pub micros: i64,
+}
+/// DuckDB's HUGEINT representation: value = (upper as i128) << 64 | lower.
+/// Also used as the physical backing of UUID (with the high bit flipped).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_hugeint {
+    pub lower: u64,
+    pub upper: i64,
+}
+/// DuckDB's INTERVAL representation: months + days + microseconds.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_interval {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+/// DuckDB's DECIMAL representation: a HUGEINT-backed scaled integer with a
+/// `width` (total digits) and `scale` (fractional digits).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_decimal {
+    pub width: u8,
+    pub scale: u8,
+    pub value: duckdb_hugeint,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -370,6 +400,9 @@ extern "C" {
     pub fn duckdb_get_date(val: duckdb_value) -> duckdb_date;
     pub fn duckdb_get_time(val: duckdb_value) -> duckdb_time;
     pub fn duckdb_get_uint64(val: duckdb_value) -> u64;
+    pub fn duckdb_get_hugeint(val: duckdb_value) -> duckdb_hugeint;
+    pub fn duckdb_get_decimal(val: duckdb_value) -> duckdb_decimal;
+    pub fn duckdb_get_interval(val: duckdb_value) -> duckdb_interval;
     pub fn duckdb_get_float(val: duckdb_value) -> f32;
     pub fn duckdb_get_double(val: duckdb_value) -> f64;
     pub fn duckdb_get_varchar(val: duckdb_value) -> *mut c_char;
@@ -534,6 +567,7 @@ extern "C" {
     pub fn duckdb_validity_set_row_invalid(validity: *mut u64, row: idx_t);
     pub fn duckdb_validity_set_row_valid(validity: *mut u64, row: idx_t);
     pub fn duckdb_create_logical_type(kind: duckdb_type) -> duckdb_logical_type;
+    pub fn duckdb_create_decimal_type(width: u8, scale: u8) -> duckdb_logical_type;
     pub fn duckdb_destroy_logical_type(logical_type: *mut duckdb_logical_type);
     pub fn duckdb_get_type_id(logical_type: duckdb_logical_type) -> duckdb_type;
     pub fn duckdb_validity_row_is_valid(validity: *mut u64, row: idx_t) -> bool;
