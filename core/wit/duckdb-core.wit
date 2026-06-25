@@ -6,6 +6,7 @@ use duckdb:extension/runtime;
 use duckdb:extension/types;
 use duckdb:extension/callback-dispatch;
 use duckdb:extension/storage-host;
+use duckdb:extension/index-host;
 use duckdb:extension/collation-host;
 use duckdb:extension/pragma-host;
 use duckdb:extension/files-host;
@@ -248,6 +249,7 @@ world libduckdb {
     import extension-loader-hooks;
     import duckdb:extension/callback-dispatch;
     import duckdb:extension/storage-host;
+    import duckdb:extension/index-host;
     import duckdb:extension/collation-host;
     import duckdb:extension/pragma-host;
     import duckdb:extension/files-host;

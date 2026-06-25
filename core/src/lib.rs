@@ -310,6 +310,145 @@ pub unsafe extern "C" fn wasm_storage_table_columns(
 }
 
 //===----------------------------------------------------------------------===//
+// Item 3 / M2a: custom-index build bridge.
+//
+// The C++ WasmBoundIndex / WasmCreateIndexPlan call these extern-C fns; each
+// routes to the host-provided `duckdb:extension/index-host` import, which the
+// host forwards to the index component's `index-dispatch` export. The build is
+// driven create -> append -> build; explicit search is exposed component-side as
+// a table function (hnsw_search), so the core does not call index-search.
+//
+// C ABI: create returns a component-side index-handle (0 == error); append/build
+// return 0 on success, -1 on error (message in wasm_index_last_error). Vectors
+// cross the ABI flattened: `vectors_flat` is n_rows*dims contiguous f32.
+//===----------------------------------------------------------------------===//
+
+static INDEX_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+
+fn index_set_last_error(msg: String) {
+    let cell = INDEX_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = CString::new(msg).ok();
+    }
+}
+
+fn index_format_error(err: &bindings::duckdb::extension::index_host::Duckerror) -> String {
+    use bindings::duckdb::extension::index_host::Duckerror as E;
+    match err {
+        E::Invalidargument(m) => format!("invalid argument: {m}"),
+        E::Unsupported(m) => format!("unsupported: {m}"),
+        E::Invalidstate(m) => format!("invalid state: {m}"),
+        E::Io(m) => format!("io error: {m}"),
+        E::Internal(m) => format!("internal error: {m}"),
+    }
+}
+
+/// Returns the most recent index-bridge error message (or an empty C string),
+/// owned by the core; valid until the next bridge call.
+#[no_mangle]
+pub extern "C" fn wasm_index_last_error() -> *const c_char {
+    let cell = INDEX_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(s) => s.as_ptr(),
+            None => b"\0".as_ptr() as *const c_char,
+        },
+        Err(_) => b"\0".as_ptr() as *const c_char,
+    }
+}
+
+/// Allocate an empty index builder for `(type_name, index_name)` over a
+/// FLOAT[dims] key. Returns the component-side index-handle, 0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_index_create(
+    type_name: *const c_char,
+    index_name: *const c_char,
+    dims: u32,
+) -> u32 {
+    if type_name.is_null() || index_name.is_null() {
+        index_set_last_error("wasm_index_create: null argument".to_string());
+        return 0;
+    }
+    let type_str = match CStr::from_ptr(type_name).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            index_set_last_error("wasm_index_create: type not UTF-8".to_string());
+            return 0;
+        }
+    };
+    let name_str = match CStr::from_ptr(index_name).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            index_set_last_error("wasm_index_create: name not UTF-8".to_string());
+            return 0;
+        }
+    };
+    match bindings::duckdb::extension::index_host::index_create(type_str, name_str, dims) {
+        Ok(handle) => handle,
+        Err(err) => {
+            index_set_last_error(index_format_error(&err));
+            0
+        }
+    }
+}
+
+/// Append `n_rows` rows: `rowids` is n_rows i64; `vectors_flat` is n_rows*dims
+/// contiguous f32. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_index_append(
+    handle: u32,
+    rowids: *const i64,
+    n_rows: u32,
+    vectors_flat: *const f32,
+    dims: u32,
+) -> i32 {
+    if (n_rows > 0) && (rowids.is_null() || vectors_flat.is_null()) {
+        index_set_last_error("wasm_index_append: null buffer".to_string());
+        return -1;
+    }
+    let n = n_rows as usize;
+    let d = dims as usize;
+    let rowid_slice = if n == 0 { &[][..] } else { slice::from_raw_parts(rowids, n) };
+    let flat = if n == 0 { &[][..] } else { slice::from_raw_parts(vectors_flat, n * d) };
+    let rowids_vec: Vec<i64> = rowid_slice.to_vec();
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        vectors.push(flat[i * d..(i + 1) * d].to_vec());
+    }
+    match bindings::duckdb::extension::index_host::index_append(handle, &rowids_vec, &vectors) {
+        Ok(()) => 0,
+        Err(err) => {
+            index_set_last_error(index_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Finalize the index build. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wasm_index_build(handle: u32) -> i32 {
+    match bindings::duckdb::extension::index_host::index_build(handle) {
+        Ok(()) => 0,
+        Err(err) => {
+            index_set_last_error(index_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Drop the index. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wasm_index_drop(handle: u32) -> i32 {
+    match bindings::duckdb::extension::index_host::index_drop(handle) {
+        Ok(()) => 0,
+        Err(err) => {
+            index_set_last_error(index_format_error(&err));
+            -1
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
 // M2b scan bridge: projection + filter pushdown.
 //
 // The C++ TableFunction owns a scan handle (returned by `wasm_storage_scan_open`)
@@ -2908,14 +3047,17 @@ impl ConnectionState {
             wasm_register_file_system(self.database);
         }
 
-        // Item 3 / M1: register the fixed custom index type "wasm_hnsw" so
-        // `CREATE INDEX ... USING wasm_hnsw` routes to WasmBoundIndex. The C++
-        // side is idempotent (process-wide once-guard + FindByName dup-check), so
-        // calling before every query is cheap and guarantees the type is present
-        // before any CREATE INDEX binds. Dynamic per-component pull is M2.
-        if let Ok(c_type) = CString::new("wasm_hnsw") {
-            unsafe {
-                wasm_register_index_type(self.database, c_type.as_ptr());
+        // Item 3 / M2a: register each custom index TYPE a component has declared
+        // (via `register-index-type`, surfaced through the
+        // `index-host.index-type-list` import) so `CREATE INDEX ... USING <type>`
+        // routes to a WasmBoundIndex bound to that type. The C++ side is
+        // idempotent (FindByName dup-check), so calling before every query is
+        // cheap. This replaces M1's hardcoded "wasm_hnsw".
+        for type_name in bindings::duckdb::extension::index_host::index_type_list() {
+            if let Ok(c_type) = CString::new(type_name.as_str()) {
+                unsafe {
+                    wasm_register_index_type(self.database, c_type.as_ptr());
+                }
             }
         }
 

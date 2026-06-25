@@ -1,31 +1,33 @@
 //===----------------------------------------------------------------------===//
 // wasm_index.cpp
 //
-// Custom-index DE-RISK (remaining-wit-capabilities-plan Item 3 / M1).
+// Custom-index REAL build + search (remaining-wit-capabilities-plan Item 3 / M2a).
 //
-// Proves a C++ class subclassing duckdb::BoundIndex compiles, links into the
-// wasm core, registers a custom INDEX TYPE on the live DatabaseInstance, and is
-// reached by `CREATE INDEX ... USING <type>`. This keystone serves vss (HNSW)
-// and spatial (R-tree). Mirrors the PROVEN shims wasm_storage.cpp /
-// wasm_files.cpp: a C++ subclass of a DuckDB-internal abstract type, registered
-// mid-session via an extern-C bridge driven from Rust (core/src/lib.rs).
+// A WasmBoundIndex : BoundIndex registers a custom INDEX TYPE (e.g. "wasm_hnsw")
+// on the live DatabaseInstance. `CREATE INDEX ... USING <type>` routes to the
+// duckdb 1.5.x generic index-build framework (the `build_*` callbacks on
+// IndexType: bind -> global-init -> local-init -> sink -> combine -> finalize),
+// which DuckDB drives over a SCAN -> PROJECTION -> FILTER pipeline it builds for
+// us. We DON'T use the `create_plan` escape hatch: the generic framework already
+// splits each chunk into a key_chunk (the FLOAT[N] vector) and a row_chunk (the
+// ROW_TYPE rowid), so build_sink receives exactly what we forward to the wasm
+// index component.
 //
-// M1 is a STUB: every BoundIndex pure-virtual throws/no-ops. The index type is
-// registered with a `create_plan` callback (the planner's escape hatch in
-// plan_create_index.cpp). create_plan constructs a WasmBoundIndex (exercising
-// the ctor + the registered create_instance), logs that the index was reached,
-// then throws NotImplementedException("wasm index M1 stub: ...") so the test
-// observes a RECOGNIZABLE stub error rather than "Unknown index type".
+// The actual HNSW build + search live in a wasm COMPONENT (hnswfns) behind the
+// `index-host` / `index-dispatch` WIT boundary; this TU is just the C++ shim
+// that turns the DuckDB build pipeline into bridge calls (wasm_index_create /
+// _append / _build), mirroring the storage shim (wasm_storage.cpp).
 //
-// Routing proof chain (DuckDB 1.5.x, this header set):
-//   CREATE INDEX ... USING wasm_hnsw
-//     -> binder -> LogicalCreateIndex(index_type="wasm_hnsw")
-//     -> PhysicalPlanGenerator::CreatePlan(LogicalCreateIndex)
-//        config.GetIndexTypes().FindByName("wasm_hnsw")  [must be non-null]
-//        if (index_type->create_plan) return create_plan(input);  [our hook]
+//   build_global_init:  wasm_index_create(type, index_name, dims) -> handle
+//   build_sink:         extract (rowid, FLOAT[N]) -> wasm_index_append(handle,..)
+//   build_finalize:     wasm_index_build(handle); return the WasmBoundIndex
+//
+// Explicit kNN search is a component-side TABLE FUNCTION (hnsw_search), keyed by
+// index NAME, so it reaches the same built index this pipeline populated -- the
+// core never calls index-search. (The optimizer auto-rewrite is deferred: M2b.)
 //
 // Compiled in-core (DUCKDB_BUILD_LIBRARY) with the EXACT wasi-sdk flags used for
-// wasm_storage.cpp / wasm_files.cpp (see core/build.rs build_wasm_cpp).
+// wasm_storage.cpp (see core/build.rs build_wasm_cpp).
 //===----------------------------------------------------------------------===//
 
 #include "duckdb.hpp"
@@ -35,54 +37,58 @@
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
 
+#include "wasm_index_bridge.h"
+
 #include <atomic>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
 // WasmBoundIndex
 //
-// The M1 stub index instance. Every pure-virtual from BoundIndex / Index is a
-// throw-or-no-op:
-//   pure-virtual surface for THIS version (duckdb 1.5.x):
-//     ErrorData Append(IndexLock&, DataChunk&, Vector&)            -> stub throw
-//     void      CommitDrop(IndexLock&)                            -> no-op
-//     ErrorData Insert(IndexLock&, DataChunk&, Vector&)            -> stub throw
-//     bool      MergeIndexes(IndexLock&, BoundIndex&)             -> false
-//     void      Vacuum(IndexLock&)                                -> no-op
-//     idx_t     GetInMemorySize(IndexLock&)                       -> 0
-//     void      Verify(IndexLock&)                                -> no-op
-//     string    ToString(IndexLock&, bool)                        -> name
-//     void      VerifyAllocations(IndexLock&)                     -> no-op
-//     string    GetConstraintViolationMessage(...)               -> message
-// (Delete has a base default; Serialize* are not pure - left to base.)
+// The catalog-resident index instance returned by build_finalize. The HEAVY
+// lifting (the HNSW graph) lives in the component, keyed by index name + the
+// `handle` we stash here; this object is the DuckDB-side catalog handle. The
+// pure-virtuals are no-ops/throws: M2a keeps the built graph in component
+// memory (persistence is later), and search goes through the table function,
+// not through this BoundIndex.
 //===----------------------------------------------------------------------===//
 
 class WasmBoundIndex : public BoundIndex {
 public:
-	// Match the canonical custom-index ctor (cf. vss HNSWIndex), forwarding the
-	// engine-supplied identity to the BoundIndex base. `index_type` carries the
-	// USING name so EXPLAIN / catalog reflect the custom type.
 	WasmBoundIndex(const string &name, const string &index_type, IndexConstraintType index_constraint_type,
 	               const vector<column_t> &column_ids, TableIOManager &table_io_manager,
-	               const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db)
-	    : BoundIndex(name, index_type, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
-		fprintf(stderr, "[wasm_index] WasmBoundIndex constructed: name='%s' type='%s' columns=%zu\n", name.c_str(),
-		        index_type.c_str(), (size_t)column_ids.size());
+	               const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db, uint32_t handle)
+	    : BoundIndex(name, index_type, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db),
+	      wasm_handle(handle) {
 	}
 
+	//! The component-side index-handle (from wasm_index_create); 0 == unbuilt.
+	uint32_t wasm_handle = 0;
+
 	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override {
-		throw NotImplementedException("wasm index M1 stub: Append");
+		// M2a: incremental row append after build is not supported (the component
+		// index is built once). A no-op keeps INSERTs after CREATE INDEX from
+		// throwing; the explicit hnsw_search reflects the built snapshot.
+		return ErrorData {};
 	}
 
 	void CommitDrop(IndexLock &index_lock) override {
-		// no-op
+		if (wasm_handle != 0) {
+			wasm_index_drop(wasm_handle);
+			wasm_handle = 0;
+		}
 	}
 
 	void Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) override {
@@ -90,11 +96,11 @@ public:
 	}
 
 	ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) override {
-		throw NotImplementedException("wasm index M1 stub: Insert");
+		return ErrorData {};
 	}
 
 	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override {
-		return false;
+		return true;
 	}
 
 	void Vacuum(IndexLock &l) override {
@@ -119,56 +125,170 @@ public:
 
 	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
 	                                      DataChunk &input) override {
-		return "wasm index M1 stub: constraint violation";
+		return "wasm index: constraint violation";
 	}
 };
 
 //===----------------------------------------------------------------------===//
-// IndexType wiring
+// Build framework callbacks (mirror src/execution/index/art/art_index.cpp).
 //
-// create_instance: builds a WasmBoundIndex from a CreateIndexInput (the engine
-//   uses this to (re)materialize an index instance, e.g. on load). For M1 it is
-//   also driven from create_plan so the ctor is exercised by CREATE INDEX.
-//
-// create_plan: the planner's escape hatch. We deliberately reach the index
-//   instance and then throw a RECOGNIZABLE stub so the de-risk test observes
-//   the custom type was constructed + routed, not "Unknown index type".
+// DuckDB drives: build_bind -> build_global_init -> build_local_init ->
+// build_sink (per chunk) -> build_combine -> build_finalize. The generic
+// PhysicalCreateIndex hands build_sink a key_chunk (FLOAT[N]) + row_chunk
+// (ROW_TYPE rowid), already projected + null-filtered.
 //===----------------------------------------------------------------------===//
 
-static unique_ptr<BoundIndex> WasmCreateIndexInstance(CreateIndexInput &input) {
-	return make_uniq<WasmBoundIndex>(input.name, std::string("wasm_hnsw"), input.constraint_type, input.column_ids,
-	                                 input.table_io_manager, input.unbound_expressions, input.db);
+namespace {
+
+//! Carries the registered USING type name into the build callbacks. The
+//! IndexType (and thus its callbacks) is registered per type name, but the
+//! callbacks are plain C function pointers with no captured state, so we stash
+//! the type name in the IndexTypeInfo and read it back at global-init.
+struct WasmIndexTypeInfo : public IndexTypeInfo {
+	explicit WasmIndexTypeInfo(string type_name_p) : type_name(std::move(type_name_p)) {
+	}
+	string type_name;
+};
+
+struct WasmIndexBindData : public IndexBuildBindData {
+	// nothing to bind for M2a
+};
+
+unique_ptr<IndexBuildBindData> WasmBuildBind(IndexBuildBindInput &input) {
+	if (input.expressions.size() != 1) {
+		throw BinderException("wasm index: exactly one key column is supported");
+	}
+	auto &arr_type = input.expressions[0]->return_type;
+	if (arr_type.id() != LogicalTypeId::ARRAY) {
+		throw BinderException("wasm index keys must be of type FLOAT[N]");
+	}
+	return make_uniq<WasmIndexBindData>();
 }
 
-static PhysicalOperator &WasmCreateIndexPlan(PlanIndexInput &input) {
-	// Construct the index instance to exercise the WasmBoundIndex ctor + the
-	// registered create_instance path. We don't have a CreateIndexInput here
-	// (that's built inside the physical operator), so log + throw the stub: the
-	// fact we reached this callback already proves registration + routing.
-	fprintf(stderr, "[wasm_index] WasmCreateIndexPlan reached for USING wasm_hnsw -> M1 stub\n");
-	throw NotImplementedException("wasm index M1 stub: create_plan (USING wasm_hnsw)");
+//! Global state owns the WasmBoundIndex (returned at finalize) + the dims read
+//! from the key array type. wasm_index_create is called HERE (once), so the
+//! component allocates the builder before the first sink batch.
+struct WasmIndexGlobalState : public IndexBuildGlobalState {
+	unique_ptr<WasmBoundIndex> global_index;
+	uint32_t handle = 0;
+	idx_t dims = 0;
+};
+
+unique_ptr<IndexBuildGlobalState> WasmBuildGlobalInit(IndexBuildInitGlobalStateInput &input) {
+	auto state = make_uniq<WasmIndexGlobalState>();
+
+	// The indexed key is FLOAT[N]; N = ArrayType size of the (single) expression.
+	auto &arr_type = input.expressions[0]->return_type;
+	idx_t dims = ArrayType::GetSize(arr_type);
+	state->dims = dims;
+
+	// The USING type name. M2a registers a single custom type ("wasm_hnsw") that
+	// routes to the one index backend; the component keys its state by index
+	// NAME, so the type name is informational. The build callbacks are plain C
+	// function pointers (no captured type), so we use the canonical name here.
+	string type_name = "wasm_hnsw";
+
+	auto &storage = input.table.GetStorage();
+
+	// Allocate the component-side builder. The index is keyed by NAME in the
+	// component so the hnsw_search table function reaches the SAME index.
+	uint32_t handle = wasm_index_create(type_name.c_str(), input.info.index_name.c_str(), (uint32_t)dims);
+	if (handle == 0) {
+		throw InternalException("wasm index create failed: %s", wasm_index_last_error());
+	}
+	state->handle = handle;
+
+	state->global_index = make_uniq<WasmBoundIndex>(input.info.index_name, type_name, input.info.constraint_type,
+	                                                input.storage_ids, TableIOManager::Get(storage), input.expressions,
+	                                                storage.db, handle);
+
+	return std::move(state);
 }
+
+struct WasmIndexLocalState : public IndexBuildLocalState {
+	// M2a: the build is single-pass into the one component-side index (no thread
+	// merge), so the local state is empty.
+};
+
+unique_ptr<IndexBuildLocalState> WasmBuildLocalInit(IndexBuildInitLocalStateInput &input) {
+	return make_uniq<WasmIndexLocalState>();
+}
+
+//! Extract (rowid, FLOAT[N] vector) from the projected chunks and append to the
+//! component-side builder. key_chunk.data[0] is the FLOAT[N] ARRAY; its child
+//! vector holds the floats contiguously (after Flatten the framework already
+//! flattened the input). row_chunk.data[0] is the ROW_TYPE rowid.
+void WasmBuildSink(IndexBuildSinkInput &input, DataChunk &key_chunk, DataChunk &row_chunk) {
+	auto &gstate = input.global_state.Cast<WasmIndexGlobalState>();
+	auto count = key_chunk.size();
+	if (count == 0) {
+		return;
+	}
+
+	auto &array_vec = key_chunk.data[0];
+	const idx_t array_size = ArrayType::GetSize(array_vec.GetType());
+	if (array_size != gstate.dims) {
+		throw InternalException("wasm index: key array size %llu != index dims %llu", (unsigned long long)array_size,
+		                        (unsigned long long)gstate.dims);
+	}
+
+	// Flatten so the child floats + rowids are contiguous flat arrays.
+	array_vec.Flatten(count);
+	auto &child_vec = ArrayVector::GetEntry(array_vec);
+	child_vec.Flatten(count * array_size);
+	auto &rowid_vec = row_chunk.data[0];
+	rowid_vec.Flatten(count);
+
+	const float *child_data = FlatVector::GetData<float>(child_vec);
+	const int64_t *rowid_data = FlatVector::GetData<int64_t>(rowid_vec);
+
+	// Build contiguous rowid + flattened vector buffers for the bridge. The
+	// array child is already row-major (count * array_size), matching the
+	// bridge's `vectors_flat` layout exactly, so we can pass it through.
+	std::vector<int64_t> rowids(rowid_data, rowid_data + count);
+
+	int32_t rc = wasm_index_append(gstate.handle, rowids.data(), (uint32_t)count, child_data, (uint32_t)array_size);
+	if (rc != 0) {
+		throw InternalException("wasm index append failed: %s", wasm_index_last_error());
+	}
+}
+
+void WasmBuildCombine(IndexBuildCombineInput &input) {
+	// Single component-side index; nothing to merge.
+}
+
+//! Finalize the component-side build and hand the catalog the WasmBoundIndex.
+unique_ptr<BoundIndex> WasmBuildFinalize(IndexBuildFinalizeInput &input) {
+	auto &gstate = input.global_state.Cast<WasmIndexGlobalState>();
+	int32_t rc = wasm_index_build(gstate.handle);
+	if (rc != 0) {
+		throw InternalException("wasm index build failed: %s", wasm_index_last_error());
+	}
+	return std::move(gstate.global_index);
+}
+
+//! create_instance: re-materialize a WasmBoundIndex (e.g. on catalog load). For
+//! M2a there is no persistence, so this builds an unbuilt (handle 0) stub.
+unique_ptr<BoundIndex> WasmCreateIndexInstance(CreateIndexInput &input) {
+	return make_uniq<WasmBoundIndex>(input.name, std::string("wasm_hnsw"), input.constraint_type, input.column_ids,
+	                                 input.table_io_manager, input.unbound_expressions, input.db, 0);
+}
+
+} // namespace
 
 } // namespace duckdb
 
-//! Registers a custom index type named `type_name` on the given database's
-//! index-type set. Mid-session safe: a process-wide once-guard plus a dup-name
-//! check (FindByName) make repeated calls harmless. The registered type routes
-//! `CREATE INDEX ... USING <type_name>` to WasmCreateIndexPlan / the
-//! WasmBoundIndex instance.
+//! Registers a custom index type named `type_name`. The build framework
+//! callbacks turn `CREATE INDEX ... USING <type_name>` into wasm_index_create /
+//! _append / _build bridge calls. Mid-session safe: a dup-name check
+//! (FindByName) makes repeated calls harmless.
 extern "C" void wasm_register_index_type(duckdb_database db, const char *type_name) {
-	static std::atomic<bool> registered {false};
 	if (!db || !type_name) {
-		return;
-	}
-	bool expected = false;
-	if (!registered.compare_exchange_strong(expected, true)) {
 		return;
 	}
 	try {
 		auto wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(db);
 		if (!wrapper || !wrapper->database) {
-			registered.store(false);
 			return;
 		}
 		auto &instance = *wrapper->database->instance;
@@ -180,14 +300,18 @@ extern "C" void wasm_register_index_type(duckdb_database db, const char *type_na
 		duckdb::IndexType index_type;
 		index_type.name = std::string(type_name);
 		index_type.create_instance = duckdb::WasmCreateIndexInstance;
-		index_type.create_plan = duckdb::WasmCreateIndexPlan;
+		index_type.build_bind = duckdb::WasmBuildBind;
+		index_type.build_global_init = duckdb::WasmBuildGlobalInit;
+		index_type.build_local_init = duckdb::WasmBuildLocalInit;
+		index_type.build_sink = duckdb::WasmBuildSink;
+		index_type.build_combine = duckdb::WasmBuildCombine;
+		index_type.build_finalize = duckdb::WasmBuildFinalize;
+		index_type.index_info = duckdb::make_shared_ptr<duckdb::WasmIndexTypeInfo>(std::string(type_name));
 		index_types.RegisterIndexType(index_type);
 		fprintf(stderr, "[wasm_index] registered custom index type '%s'\n", type_name);
 	} catch (const std::exception &e) {
 		fprintf(stderr, "wasm_register_index_type failed: %s\n", e.what());
-		registered.store(false);
 	} catch (...) {
 		fprintf(stderr, "wasm_register_index_type failed: unknown error\n");
-		registered.store(false);
 	}
 }
