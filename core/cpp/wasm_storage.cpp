@@ -67,19 +67,56 @@ static std::string WasmStorageLastError() {
 
 //! Maps a duckdb_type enum code (returned by the bridge) to a LogicalType.
 static LogicalType WasmTypeCodeToLogical(uint32_t code) {
+	// Codes are the duckdb_type enum values produced by the Rust bridge's
+	// storage_logicaltype_to_code; keep this switch in lock-step with it so the
+	// full rich type set (not just the original 6) round-trips into a storage
+	// table's declared column types.
 	switch (code) {
 	case 1: // DUCKDB_TYPE_BOOLEAN
 		return LogicalType::BOOLEAN;
+	case 2: // DUCKDB_TYPE_TINYINT
+		return LogicalType::TINYINT;
+	case 3: // DUCKDB_TYPE_SMALLINT
+		return LogicalType::SMALLINT;
+	case 4: // DUCKDB_TYPE_INTEGER
+		return LogicalType::INTEGER;
 	case 5: // DUCKDB_TYPE_BIGINT
 		return LogicalType::BIGINT;
+	case 6: // DUCKDB_TYPE_UTINYINT
+		return LogicalType::UTINYINT;
+	case 7: // DUCKDB_TYPE_USMALLINT
+		return LogicalType::USMALLINT;
+	case 8: // DUCKDB_TYPE_UINTEGER
+		return LogicalType::UINTEGER;
 	case 9: // DUCKDB_TYPE_UBIGINT
 		return LogicalType::UBIGINT;
+	case 10: // DUCKDB_TYPE_FLOAT
+		return LogicalType::FLOAT;
 	case 11: // DUCKDB_TYPE_DOUBLE
 		return LogicalType::DOUBLE;
+	case 12: // DUCKDB_TYPE_TIMESTAMP
+		return LogicalType::TIMESTAMP;
+	case 13: // DUCKDB_TYPE_DATE
+		return LogicalType::DATE;
+	case 14: // DUCKDB_TYPE_TIME
+		return LogicalType::TIME;
+	case 15: // DUCKDB_TYPE_INTERVAL
+		return LogicalType::INTERVAL;
 	case 17: // DUCKDB_TYPE_VARCHAR
 		return LogicalType::VARCHAR;
 	case 18: // DUCKDB_TYPE_BLOB
 		return LogicalType::BLOB;
+	case 19: // DUCKDB_TYPE_DECIMAL -- the bridge code can't carry width/scale, so
+		// declare a wide default; the actual values are re-read with full
+		// precision via the underlying parquet/delta readers.
+		return LogicalType::DECIMAL(38, 9);
+	case 24: // DUCKDB_TYPE_LIST -- escape-hatch best-effort: the bridge code can't
+		// carry the child type, so default to LIST(VARCHAR).
+		return LogicalType::LIST(LogicalType::VARCHAR);
+	case 27: // DUCKDB_TYPE_UUID
+		return LogicalType::UUID;
+	case 31: // DUCKDB_TYPE_TIMESTAMP_TZ
+		return LogicalType::TIMESTAMP_TZ;
 	default:
 		return LogicalType::VARCHAR;
 	}
