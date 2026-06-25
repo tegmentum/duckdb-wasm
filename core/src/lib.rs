@@ -3256,6 +3256,29 @@ impl ConnectionState {
     /// DuckDB's (non-deprecated) result + data-chunk to Arrow conversion API.
     fn query_arrow_ipc(&self, sql: &str) -> Result<Vec<u8>, DuckDbError> {
         self.sync_storage_extensions();
+        // Storage-registration timing: a `LOAD <storage-ext>` registers its
+        // ATTACH `TYPE` host-side, but `sync_storage_extensions` above only ran
+        // ONCE, before this batch executes. So a batch like
+        // `LOAD x; ATTACH ... (TYPE x)` would bind the ATTACH before the type is
+        // registered. When the batch carries a LOAD AND more statements, run each
+        // statement on its own (re-syncing before each) so a dependent ATTACH
+        // sees the type its preceding LOAD just declared. Single statements (the
+        // common case) keep the fast single-`duckdb_query` path untouched.
+        if let Some(last) = self.split_for_load_sync(sql) {
+            for stmt in &last.0 {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                self.sync_storage_extensions();
+                let _ = self.query_arrow_ipc_one(stmt)?;
+            }
+            self.sync_storage_extensions();
+            return self.query_arrow_ipc_one(&last.1);
+        }
+        self.query_arrow_ipc_one(sql)
+    }
+
+    fn query_arrow_ipc_one(&self, sql: &str) -> Result<Vec<u8>, DuckDbError> {
         use arrow_array::{ffi::from_ffi, RecordBatch, StructArray};
         use arrow_data::ffi::FFI_ArrowArray;
         use arrow_ipc::writer::StreamWriter;
@@ -3366,6 +3389,42 @@ impl ConnectionState {
 
     fn collect_rows(&self, sql: &str) -> Result<(Vec<Columndef>, Vec<Row>), DuckDbError> {
         self.sync_storage_extensions();
+        // See `query_arrow_ipc` for the rationale: split a LOAD-carrying batch so
+        // each statement re-syncs storage types before it binds. Single
+        // statements keep the fast path.
+        if let Some(last) = self.split_for_load_sync(sql) {
+            for stmt in &last.0 {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                self.sync_storage_extensions();
+                let _ = self.collect_rows_one(stmt)?;
+            }
+            self.sync_storage_extensions();
+            return self.collect_rows_one(&last.1);
+        }
+        self.collect_rows_one(sql)
+    }
+
+    /// If `sql` is a multi-statement batch that contains a `LOAD`, returns the
+    /// leading statements (`.0`) and the trailing statement (`.1`) to run one at a
+    /// time with a storage-type re-sync before each. Returns `None` for a single
+    /// statement or a batch with no LOAD (the common, fast single-query path).
+    fn split_for_load_sync(&self, sql: &str) -> Option<(Vec<String>, String)> {
+        let stmts = split_sql_statements(sql);
+        if stmts.len() < 2 {
+            return None;
+        }
+        let has_load = stmts.iter().any(|s| statement_is_load(s));
+        if !has_load {
+            return None;
+        }
+        let mut leading: Vec<String> = stmts;
+        let last = leading.pop().unwrap();
+        Some((leading, last))
+    }
+
+    fn collect_rows_one(&self, sql: &str) -> Result<(Vec<Columndef>, Vec<Row>), DuckDbError> {
         let c_sql = CString::new(sql).map_err(|_| DuckDbError::EmbeddedNull)?;
 
         unsafe {
@@ -4985,6 +5044,19 @@ fn split_pragma_args(inner: &str) -> Vec<String> {
 /// single/double-quoted strings (with doubled-quote escapes). Good enough for
 /// the generated FTS index DDL (no semicolons inside string literals there, but
 /// the quote handling keeps it robust).
+/// True if `stmt` (one SQL statement) is a `LOAD <name>` -- the trigger for
+/// running a multi-statement batch one statement at a time so a later
+/// `ATTACH ... (TYPE <name>)` sees the storage type the LOAD just registered.
+/// Tolerant of leading whitespace/comments-stripped input; matches the first
+/// keyword case-insensitively.
+fn statement_is_load(stmt: &str) -> bool {
+    stmt.trim_start()
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .map(|kw| kw.eq_ignore_ascii_case("load"))
+        .unwrap_or(false)
+}
+
 fn split_sql_statements(script: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut buf = String::new();
