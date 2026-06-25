@@ -1492,3 +1492,35 @@ popd >/dev/null
 cp "$TMPDIR/libduckdb_combined.a" "$ARTIFACTS_DIR/libduckdb-wasi.a"
 
 echo "Static library copied to $ARTIFACTS_DIR/libduckdb-wasi.a" >&2
+
+# Self-record the core's embedded set for ducklink's embedding-tracking
+# ("Bundles") feature. ducklink's tooling/builds.py ingests this manifest:
+#   python3 tooling/builds.py record <name> --kind core \
+#       --from-manifest registry/last-core-build.json
+# Minimal + non-breaking: only runs when $DUCKLINK points at the ducklink repo.
+if [ -n "${DUCKLINK:-}" ] && [ -d "${DUCKLINK}/registry" ]; then
+  CORE_ARTIFACT="$ARTIFACTS_DIR/libduckdb-wasi.a"
+  CORE_HASH="$(
+    { command -v b2sum >/dev/null 2>&1 && b2sum -l 256 "$CORE_ARTIFACT" 2>/dev/null; } \
+      || { command -v shasum >/dev/null 2>&1 && shasum -a 256 "$CORE_ARTIFACT" 2>/dev/null; } \
+      || { command -v sha256sum >/dev/null 2>&1 && sha256sum "$CORE_ARTIFACT" 2>/dev/null; } \
+      || echo "unknown -"
+  )"
+  CORE_HASH="${CORE_HASH%% *}"
+  BUILT_AT="$(date +%s)"
+  EMBED_JSON="$(
+    printf '%s' "${EMBED_EXTENSIONS:-}" | awk -v RS=',' '
+      { gsub(/^[ \t]+|[ \t]+$/, "", $0); if ($0 != "") printf "%s\"%s\"", (n++ ? "," : ""), $0 }'
+  )"
+  cat > "${DUCKLINK}/registry/last-core-build.json" <<EOF
+{
+  "name": "core",
+  "kind": "core",
+  "embedded_extensions": [${EMBED_JSON}],
+  "core_artifact": "artifacts/libduckdb-wasi.a",
+  "core_hash": "${CORE_HASH}",
+  "built_at": ${BUILT_AT}
+}
+EOF
+  echo "Recorded core embed-manifest -> ${DUCKLINK}/registry/last-core-build.json" >&2
+fi
