@@ -137,6 +137,17 @@ fn storage_logicaltype_to_code(ty: Logicaltype) -> u32 {
         Logicaltype::Float64 => 11, // DUCKDB_TYPE_DOUBLE
         Logicaltype::Text => 17,    // DUCKDB_TYPE_VARCHAR
         Logicaltype::Blob => 18,    // DUCKDB_TYPE_BLOB
+        Logicaltype::Int32 => 4,    // DUCKDB_TYPE_INTEGER
+        Logicaltype::Timestamp => 12, // DUCKDB_TYPE_TIMESTAMP
+        Logicaltype::Int8 => 2,     // DUCKDB_TYPE_TINYINT
+        Logicaltype::Int16 => 3,    // DUCKDB_TYPE_SMALLINT
+        Logicaltype::Uint8 => 6,    // DUCKDB_TYPE_UTINYINT
+        Logicaltype::Uint16 => 7,   // DUCKDB_TYPE_USMALLINT
+        Logicaltype::Uint32 => 8,   // DUCKDB_TYPE_UINTEGER
+        Logicaltype::Float32 => 10, // DUCKDB_TYPE_FLOAT
+        Logicaltype::Date => 13,    // DUCKDB_TYPE_DATE
+        Logicaltype::Time => 14,    // DUCKDB_TYPE_TIME
+        Logicaltype::Timestamptz => 31, // DUCKDB_TYPE_TIMESTAMP_TZ
     }
 }
 
@@ -3185,6 +3196,24 @@ impl exported_database::GuestPreparedStatement for PreparedStatementState {
                         bytes.as_ptr() as *const c_void,
                         bytes.len() as duckdb::idx_t,
                     ),
+                    // No dedicated int32/timestamp bind in the minimal C-API; bind
+                    // the int64 representation (DuckDB casts to the param's type;
+                    // timestamp is micros-since-1970 as int64).
+                    Duckvalue::Int32(v) => duckdb::duckdb_bind_int64(stmt, idx, *v as i64),
+                    Duckvalue::Timestamp(micros) => {
+                        duckdb::duckdb_bind_int64(stmt, idx, *micros)
+                    }
+                    Duckvalue::Int8(v) => duckdb::duckdb_bind_int64(stmt, idx, *v as i64),
+                    Duckvalue::Int16(v) => duckdb::duckdb_bind_int64(stmt, idx, *v as i64),
+                    Duckvalue::Uint8(v) => duckdb::duckdb_bind_uint64(stmt, idx, *v as u64),
+                    Duckvalue::Uint16(v) => duckdb::duckdb_bind_uint64(stmt, idx, *v as u64),
+                    Duckvalue::Uint32(v) => duckdb::duckdb_bind_uint64(stmt, idx, *v as u64),
+                    Duckvalue::Float32(v) => duckdb::duckdb_bind_double(stmt, idx, *v as f64),
+                    Duckvalue::Date(days) => duckdb::duckdb_bind_int64(stmt, idx, *days as i64),
+                    Duckvalue::Time(micros) => duckdb::duckdb_bind_int64(stmt, idx, *micros),
+                    Duckvalue::Timestamptz(micros) => {
+                        duckdb::duckdb_bind_int64(stmt, idx, *micros)
+                    }
                 };
                 if state != DUCKDB_SUCCESS {
                     return Err(Duckerror::from(DuckDbError::message(format!(
@@ -3293,6 +3322,23 @@ impl exported_database::GuestAppender for AppenderState {
                         bytes.as_ptr() as *const c_void,
                         bytes.len() as duckdb::idx_t,
                     ),
+                    // Minimal C-API appender: widen int32 / pass timestamp micros
+                    // through the int64 append (DuckDB casts to the column type).
+                    Duckvalue::Int32(v) => duckdb::duckdb_append_int64(appender, *v as i64),
+                    Duckvalue::Timestamp(micros) => {
+                        duckdb::duckdb_append_int64(appender, *micros)
+                    }
+                    Duckvalue::Int8(v) => duckdb::duckdb_append_int64(appender, *v as i64),
+                    Duckvalue::Int16(v) => duckdb::duckdb_append_int64(appender, *v as i64),
+                    Duckvalue::Uint8(v) => duckdb::duckdb_append_uint64(appender, *v as u64),
+                    Duckvalue::Uint16(v) => duckdb::duckdb_append_uint64(appender, *v as u64),
+                    Duckvalue::Uint32(v) => duckdb::duckdb_append_uint64(appender, *v as u64),
+                    Duckvalue::Float32(v) => duckdb::duckdb_append_double(appender, *v as f64),
+                    Duckvalue::Date(days) => duckdb::duckdb_append_int64(appender, *days as i64),
+                    Duckvalue::Time(micros) => duckdb::duckdb_append_int64(appender, *micros),
+                    Duckvalue::Timestamptz(micros) => {
+                        duckdb::duckdb_append_int64(appender, *micros)
+                    }
                 };
                 if state != DUCKDB_SUCCESS {
                     return Err(Duckerror::from(DuckDbError::message(appender_error_message(
@@ -3674,6 +3720,17 @@ fn duckdb_type_to_logical(type_id: duckdb::duckdb_type) -> Option<Logicaltype> {
         duckdb::DUCKDB_TYPE_DOUBLE => Some(Logicaltype::Float64),
         duckdb::DUCKDB_TYPE_VARCHAR => Some(Logicaltype::Text),
         duckdb::DUCKDB_TYPE_BLOB => Some(Logicaltype::Blob),
+        duckdb::DUCKDB_TYPE_INTEGER => Some(Logicaltype::Int32),
+        duckdb::DUCKDB_TYPE_TIMESTAMP => Some(Logicaltype::Timestamp),
+        duckdb::DUCKDB_TYPE_TINYINT => Some(Logicaltype::Int8),
+        duckdb::DUCKDB_TYPE_SMALLINT => Some(Logicaltype::Int16),
+        duckdb::DUCKDB_TYPE_UTINYINT => Some(Logicaltype::Uint8),
+        duckdb::DUCKDB_TYPE_USMALLINT => Some(Logicaltype::Uint16),
+        duckdb::DUCKDB_TYPE_UINTEGER => Some(Logicaltype::Uint32),
+        duckdb::DUCKDB_TYPE_FLOAT => Some(Logicaltype::Float32),
+        duckdb::DUCKDB_TYPE_DATE => Some(Logicaltype::Date),
+        duckdb::DUCKDB_TYPE_TIME => Some(Logicaltype::Time),
+        duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => Some(Logicaltype::Timestamptz),
         _ => None,
     }
 }
@@ -4774,6 +4831,17 @@ fn convert_runtime_logicaltype(logical: runtime_exports::Logicaltype) -> Logical
         runtime_exports::Logicaltype::Float64 => Logicaltype::Float64,
         runtime_exports::Logicaltype::Text => Logicaltype::Text,
         runtime_exports::Logicaltype::Blob => Logicaltype::Blob,
+        runtime_exports::Logicaltype::Int32 => Logicaltype::Int32,
+        runtime_exports::Logicaltype::Timestamp => Logicaltype::Timestamp,
+        runtime_exports::Logicaltype::Int8 => Logicaltype::Int8,
+        runtime_exports::Logicaltype::Int16 => Logicaltype::Int16,
+        runtime_exports::Logicaltype::Uint8 => Logicaltype::Uint8,
+        runtime_exports::Logicaltype::Uint16 => Logicaltype::Uint16,
+        runtime_exports::Logicaltype::Uint32 => Logicaltype::Uint32,
+        runtime_exports::Logicaltype::Float32 => Logicaltype::Float32,
+        runtime_exports::Logicaltype::Date => Logicaltype::Date,
+        runtime_exports::Logicaltype::Time => Logicaltype::Time,
+        runtime_exports::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
     }
 }
 
@@ -4785,6 +4853,17 @@ fn convert_loader_logicaltype(logical: extension_loader_hooks::Logicaltype) -> L
         extension_loader_hooks::Logicaltype::Float64 => Logicaltype::Float64,
         extension_loader_hooks::Logicaltype::Text => Logicaltype::Text,
         extension_loader_hooks::Logicaltype::Blob => Logicaltype::Blob,
+        extension_loader_hooks::Logicaltype::Int32 => Logicaltype::Int32,
+        extension_loader_hooks::Logicaltype::Timestamp => Logicaltype::Timestamp,
+        extension_loader_hooks::Logicaltype::Int8 => Logicaltype::Int8,
+        extension_loader_hooks::Logicaltype::Int16 => Logicaltype::Int16,
+        extension_loader_hooks::Logicaltype::Uint8 => Logicaltype::Uint8,
+        extension_loader_hooks::Logicaltype::Uint16 => Logicaltype::Uint16,
+        extension_loader_hooks::Logicaltype::Uint32 => Logicaltype::Uint32,
+        extension_loader_hooks::Logicaltype::Float32 => Logicaltype::Float32,
+        extension_loader_hooks::Logicaltype::Date => Logicaltype::Date,
+        extension_loader_hooks::Logicaltype::Time => Logicaltype::Time,
+        extension_loader_hooks::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
     }
 }
 
@@ -4892,6 +4971,17 @@ fn describe_loader_logicaltype(logical: &extension_loader_hooks::Logicaltype) ->
         extension_loader_hooks::Logicaltype::Float64 => "FLOAT64",
         extension_loader_hooks::Logicaltype::Text => "TEXT",
         extension_loader_hooks::Logicaltype::Blob => "BLOB",
+        extension_loader_hooks::Logicaltype::Int32 => "INT32",
+        extension_loader_hooks::Logicaltype::Timestamp => "TIMESTAMP",
+        extension_loader_hooks::Logicaltype::Int8 => "INT8",
+        extension_loader_hooks::Logicaltype::Int16 => "INT16",
+        extension_loader_hooks::Logicaltype::Uint8 => "UINT8",
+        extension_loader_hooks::Logicaltype::Uint16 => "UINT16",
+        extension_loader_hooks::Logicaltype::Uint32 => "UINT32",
+        extension_loader_hooks::Logicaltype::Float32 => "FLOAT32",
+        extension_loader_hooks::Logicaltype::Date => "DATE",
+        extension_loader_hooks::Logicaltype::Time => "TIME",
+        extension_loader_hooks::Logicaltype::Timestamptz => "TIMESTAMPTZ",
     }
 }
 
@@ -4927,6 +5017,17 @@ fn duckdb_type_for_logical(logical: Logicaltype) -> duckdb::duckdb_type {
         Logicaltype::Float64 => duckdb::DUCKDB_TYPE_DOUBLE,
         Logicaltype::Text => duckdb::DUCKDB_TYPE_VARCHAR,
         Logicaltype::Blob => duckdb::DUCKDB_TYPE_BLOB,
+        Logicaltype::Int32 => duckdb::DUCKDB_TYPE_INTEGER,
+        Logicaltype::Timestamp => duckdb::DUCKDB_TYPE_TIMESTAMP,
+        Logicaltype::Int8 => duckdb::DUCKDB_TYPE_TINYINT,
+        Logicaltype::Int16 => duckdb::DUCKDB_TYPE_SMALLINT,
+        Logicaltype::Uint8 => duckdb::DUCKDB_TYPE_UTINYINT,
+        Logicaltype::Uint16 => duckdb::DUCKDB_TYPE_USMALLINT,
+        Logicaltype::Uint32 => duckdb::DUCKDB_TYPE_UINTEGER,
+        Logicaltype::Float32 => duckdb::DUCKDB_TYPE_FLOAT,
+        Logicaltype::Date => duckdb::DUCKDB_TYPE_DATE,
+        Logicaltype::Time => duckdb::DUCKDB_TYPE_TIME,
+        Logicaltype::Timestamptz => duckdb::DUCKDB_TYPE_TIMESTAMP_TZ,
     }
 }
 
@@ -5641,6 +5742,65 @@ unsafe fn read_scalar_argument(
             let string_value = ptr::read(data.add(row as usize));
             Ok(Duckvalue::Blob(duckdb_string_to_vec(string_value)))
         }
+        Logicaltype::Int32 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i32;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Int32(value))
+        }
+        Logicaltype::Timestamp => {
+            // DUCKDB_TYPE_TIMESTAMP is physically an int64 of micros since 1970.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Timestamp(value))
+        }
+        Logicaltype::Int8 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i8;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Int8(value))
+        }
+        Logicaltype::Int16 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i16;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Int16(value))
+        }
+        Logicaltype::Uint8 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u8;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Uint8(value))
+        }
+        Logicaltype::Uint16 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u16;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Uint16(value))
+        }
+        Logicaltype::Uint32 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u32;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Uint32(value))
+        }
+        Logicaltype::Float32 => {
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut f32;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Float32(value))
+        }
+        Logicaltype::Date => {
+            // DUCKDB_TYPE_DATE is physically an int32 of days since 1970-01-01.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i32;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Date(value))
+        }
+        Logicaltype::Time => {
+            // DUCKDB_TYPE_TIME is physically an int64 of micros since midnight.
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Time(value))
+        }
+        Logicaltype::Timestamptz => {
+            // DUCKDB_TYPE_TIMESTAMP_TZ is physically an int64 of micros since 1970 (UTC).
+            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let value = *data.add(row as usize);
+            Ok(Duckvalue::Timestamptz(value))
+        }
     }
 }
 
@@ -5744,6 +5904,142 @@ unsafe fn write_duckvalue_to_vector(
             duckdb::duckdb_validity_set_row_valid(validity, row);
             Ok(())
         }
+        Duckvalue::Int32(v) => {
+            if *logical != Logicaltype::Int32 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected int32 result, got {}",
+                    duckvalue_kind(&Duckvalue::Int32(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i32;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Timestamp(micros) => {
+            if *logical != Logicaltype::Timestamp {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected timestamp result, got {}",
+                    duckvalue_kind(&Duckvalue::Timestamp(micros))
+                )));
+            }
+            // DUCKDB_TYPE_TIMESTAMP is physically an int64 of micros since 1970.
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i64;
+            *data.add(row as usize) = micros;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Int8(v) => {
+            if *logical != Logicaltype::Int8 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected int8 result, got {}",
+                    duckvalue_kind(&Duckvalue::Int8(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i8;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Int16(v) => {
+            if *logical != Logicaltype::Int16 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected int16 result, got {}",
+                    duckvalue_kind(&Duckvalue::Int16(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i16;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Uint8(v) => {
+            if *logical != Logicaltype::Uint8 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected uint8 result, got {}",
+                    duckvalue_kind(&Duckvalue::Uint8(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut u8;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Uint16(v) => {
+            if *logical != Logicaltype::Uint16 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected uint16 result, got {}",
+                    duckvalue_kind(&Duckvalue::Uint16(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut u16;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Uint32(v) => {
+            if *logical != Logicaltype::Uint32 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected uint32 result, got {}",
+                    duckvalue_kind(&Duckvalue::Uint32(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut u32;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Float32(v) => {
+            if *logical != Logicaltype::Float32 {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected float32 result, got {}",
+                    duckvalue_kind(&Duckvalue::Float32(v))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut f32;
+            *data.add(row as usize) = v;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Date(days) => {
+            if *logical != Logicaltype::Date {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected date result, got {}",
+                    duckvalue_kind(&Duckvalue::Date(days))
+                )));
+            }
+            // DUCKDB_TYPE_DATE is physically an int32 of days since 1970-01-01.
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i32;
+            *data.add(row as usize) = days;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Time(micros) => {
+            if *logical != Logicaltype::Time {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected time result, got {}",
+                    duckvalue_kind(&Duckvalue::Time(micros))
+                )));
+            }
+            // DUCKDB_TYPE_TIME is physically an int64 of micros since midnight.
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i64;
+            *data.add(row as usize) = micros;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Timestamptz(micros) => {
+            if *logical != Logicaltype::Timestamptz {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected timestamptz result, got {}",
+                    duckvalue_kind(&Duckvalue::Timestamptz(micros))
+                )));
+            }
+            // DUCKDB_TYPE_TIMESTAMP_TZ is physically an int64 of micros since 1970 (UTC).
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut i64;
+            *data.add(row as usize) = micros;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
     }
 }
 
@@ -5764,6 +6060,17 @@ fn duckvalue_kind(value: &Duckvalue) -> &'static str {
         Duckvalue::Float64(_) => "float64",
         Duckvalue::Text(_) => "text",
         Duckvalue::Blob(_) => "blob",
+        Duckvalue::Int32(_) => "int32",
+        Duckvalue::Timestamp(_) => "timestamp",
+        Duckvalue::Int8(_) => "int8",
+        Duckvalue::Int16(_) => "int16",
+        Duckvalue::Uint8(_) => "uint8",
+        Duckvalue::Uint16(_) => "uint16",
+        Duckvalue::Uint32(_) => "uint32",
+        Duckvalue::Float32(_) => "float32",
+        Duckvalue::Date(_) => "date",
+        Duckvalue::Time(_) => "time",
+        Duckvalue::Timestamptz(_) => "timestamptz",
     }
 }
 
@@ -5793,8 +6100,21 @@ unsafe fn duckdb_value_to_duckvalue(
     let result = match logical {
         Logicaltype::Boolean => Duckvalue::Boolean(duckdb::duckdb_get_bool(value)),
         Logicaltype::Int64 => Duckvalue::Int64(duckdb::duckdb_get_int64(value)),
+        Logicaltype::Int32 => Duckvalue::Int32(duckdb::duckdb_get_int32(value)),
         Logicaltype::Uint64 => Duckvalue::Uint64(duckdb::duckdb_get_uint64(value)),
         Logicaltype::Float64 => Duckvalue::Float64(duckdb::duckdb_get_double(value)),
+        Logicaltype::Timestamp => Duckvalue::Timestamp(duckdb::duckdb_get_timestamp(value).micros),
+        Logicaltype::Int8 => Duckvalue::Int8(duckdb::duckdb_get_int8(value)),
+        Logicaltype::Int16 => Duckvalue::Int16(duckdb::duckdb_get_int16(value)),
+        Logicaltype::Uint8 => Duckvalue::Uint8(duckdb::duckdb_get_uint8(value)),
+        Logicaltype::Uint16 => Duckvalue::Uint16(duckdb::duckdb_get_uint16(value)),
+        Logicaltype::Uint32 => Duckvalue::Uint32(duckdb::duckdb_get_uint32(value)),
+        Logicaltype::Float32 => Duckvalue::Float32(duckdb::duckdb_get_float(value)),
+        Logicaltype::Date => Duckvalue::Date(duckdb::duckdb_get_date(value).days),
+        Logicaltype::Time => Duckvalue::Time(duckdb::duckdb_get_time(value).micros),
+        Logicaltype::Timestamptz => {
+            Duckvalue::Timestamptz(duckdb::duckdb_get_timestamp_tz(value).micros)
+        }
         Logicaltype::Text => {
             let ptr = duckdb::duckdb_get_varchar(value);
             if ptr.is_null() {

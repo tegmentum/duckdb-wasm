@@ -116,8 +116,31 @@ pub const DUCKDB_TYPE_UINTEGER: duckdb_type = 8;
 pub const DUCKDB_TYPE_UBIGINT: duckdb_type = 9;
 pub const DUCKDB_TYPE_FLOAT: duckdb_type = 10;
 pub const DUCKDB_TYPE_DOUBLE: duckdb_type = 11;
+pub const DUCKDB_TYPE_TIMESTAMP: duckdb_type = 12;
+pub const DUCKDB_TYPE_DATE: duckdb_type = 13;
+pub const DUCKDB_TYPE_TIME: duckdb_type = 14;
 pub const DUCKDB_TYPE_VARCHAR: duckdb_type = 17;
 pub const DUCKDB_TYPE_BLOB: duckdb_type = 18;
+pub const DUCKDB_TYPE_TIMESTAMP_TZ: duckdb_type = 31;
+
+/// DuckDB's TIMESTAMP representation: microseconds since 1970-01-01.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_timestamp {
+    pub micros: i64,
+}
+/// DuckDB's DATE representation: days since 1970-01-01.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_date {
+    pub days: i32,
+}
+/// DuckDB's TIME representation: microseconds since midnight.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_time {
+    pub micros: i64,
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct duckdb_result {
@@ -335,8 +358,19 @@ extern "C" {
     ) -> duckdb_expression;
 
     pub fn duckdb_get_bool(val: duckdb_value) -> bool;
+    pub fn duckdb_get_int8(val: duckdb_value) -> i8;
+    pub fn duckdb_get_int16(val: duckdb_value) -> i16;
+    pub fn duckdb_get_int32(val: duckdb_value) -> i32;
     pub fn duckdb_get_int64(val: duckdb_value) -> i64;
+    pub fn duckdb_get_uint8(val: duckdb_value) -> u8;
+    pub fn duckdb_get_uint16(val: duckdb_value) -> u16;
+    pub fn duckdb_get_uint32(val: duckdb_value) -> u32;
+    pub fn duckdb_get_timestamp(val: duckdb_value) -> duckdb_timestamp;
+    pub fn duckdb_get_timestamp_tz(val: duckdb_value) -> duckdb_timestamp;
+    pub fn duckdb_get_date(val: duckdb_value) -> duckdb_date;
+    pub fn duckdb_get_time(val: duckdb_value) -> duckdb_time;
     pub fn duckdb_get_uint64(val: duckdb_value) -> u64;
+    pub fn duckdb_get_float(val: duckdb_value) -> f32;
     pub fn duckdb_get_double(val: duckdb_value) -> f64;
     pub fn duckdb_get_varchar(val: duckdb_value) -> *mut c_char;
     pub fn duckdb_get_blob(val: duckdb_value) -> duckdb_blob;
