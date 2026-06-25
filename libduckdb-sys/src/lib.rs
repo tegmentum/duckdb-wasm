@@ -40,6 +40,14 @@ pub struct duckdb_blob {
     pub size: idx_t,
 }
 
+/// A LIST vector row entry: the (offset, length) window into the child vector.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct duckdb_list_entry {
+    pub offset: u64,
+    pub length: u64,
+}
+
 pub type duckdb_delete_callback_t = Option<unsafe extern "C" fn(*mut c_void)>;
 pub type duckdb_replacement_scan_info = *mut c_void;
 pub type duckdb_replacement_callback_t = Option<
@@ -124,6 +132,8 @@ pub const DUCKDB_TYPE_HUGEINT: duckdb_type = 16;
 pub const DUCKDB_TYPE_VARCHAR: duckdb_type = 17;
 pub const DUCKDB_TYPE_BLOB: duckdb_type = 18;
 pub const DUCKDB_TYPE_DECIMAL: duckdb_type = 19;
+pub const DUCKDB_TYPE_LIST: duckdb_type = 24;
+pub const DUCKDB_TYPE_STRUCT: duckdb_type = 25;
 pub const DUCKDB_TYPE_UUID: duckdb_type = 27;
 pub const DUCKDB_TYPE_TIMESTAMP_TZ: duckdb_type = 31;
 pub const DUCKDB_TYPE_GEOMETRY: duckdb_type = 40;
@@ -570,6 +580,21 @@ extern "C" {
     pub fn duckdb_create_decimal_type(width: u8, scale: u8) -> duckdb_logical_type;
     pub fn duckdb_destroy_logical_type(logical_type: *mut duckdb_logical_type);
     pub fn duckdb_get_type_id(logical_type: duckdb_logical_type) -> duckdb_type;
+
+    // --- LIST vector access (escape-hatch nested writes/reads) ---
+    pub fn duckdb_list_vector_get_child(vector: duckdb_vector) -> duckdb_vector;
+    pub fn duckdb_list_vector_get_size(vector: duckdb_vector) -> idx_t;
+    pub fn duckdb_list_vector_set_size(vector: duckdb_vector, size: idx_t) -> duckdb_state;
+    pub fn duckdb_list_vector_reserve(vector: duckdb_vector, required_capacity: idx_t)
+        -> duckdb_state;
+    // --- STRUCT vector access ---
+    pub fn duckdb_struct_vector_get_child(vector: duckdb_vector, index: idx_t) -> duckdb_vector;
+    // --- LIST / STRUCT logical-type introspection ---
+    pub fn duckdb_list_type_child_type(ty: duckdb_logical_type) -> duckdb_logical_type;
+    pub fn duckdb_struct_type_child_count(ty: duckdb_logical_type) -> idx_t;
+    pub fn duckdb_struct_type_child_name(ty: duckdb_logical_type, index: idx_t) -> *mut c_char;
+    pub fn duckdb_struct_type_child_type(ty: duckdb_logical_type, index: idx_t)
+        -> duckdb_logical_type;
     pub fn duckdb_validity_row_is_valid(validity: *mut u64, row: idx_t) -> bool;
     pub fn duckdb_string_is_inlined(string: duckdb_string_t) -> bool;
     pub fn duckdb_string_t_length(string: duckdb_string_t) -> u32;
