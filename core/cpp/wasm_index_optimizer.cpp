@@ -60,8 +60,6 @@
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include "wasm_index_bridge.h"
@@ -220,52 +218,41 @@ public:
 		for (uint32_t i = 0; i < dims; i++) {
 			query[i] = vec_children[i].GetValue<float>();
 		}
-		const uint32_t k = (uint32_t)top_n.limit;
+		const idx_t k = (idx_t)top_n.limit;
 		if (k == 0) {
 			return false;
 		}
-
-		// 7. FIRE the index: ask the component for the k nearest row-ids.
-		std::vector<int64_t> rowids(k);
-		int32_t n = wasm_index_search(wasm_index->wasm_handle, query.data(), dims, k, rowids.data());
-		if (n < 0) {
-			fprintf(stderr, "[wasm_index] search failed: %s\n", wasm_index_last_error());
+		// The wasm index returns at most STANDARD_VECTOR_SIZE rows per fetch chunk;
+		// like vss, keep the swap simple by requiring k to fit a single vector.
+		if (k >= STANDARD_VECTOR_SIZE) {
 			return false;
 		}
-		fprintf(stderr,
-		        "[wasm_index] optimizer rewrote top-k distance -> index scan "
-		        "(handle=%u k=%u hits=%d)\n",
-		        wasm_index->wasm_handle, k, n);
-		fprintf(stderr, "[wasm_index] search handle=%u k=%u\n", wasm_index->wasm_handle, k);
-
-		// 8. REWRITE: constrain the GET to exactly the index's k row-ids and drop
-		//    TOP_N. We push a `rowid = r0 OR rowid = r1 OR ...` table-filter: a
-		//    ConjunctionOrFilter of CONSTANT_COMPARISON equalities, because the
-		//    scan's TableFilterState::Initialize supports CONSTANT_COMPARISON /
-		//    CONJUNCTION_OR but NOT a bare IN_FILTER on the rowid column. Adding
-		//    COLUMN_IDENTIFIER_ROW_ID to the column list (APPENDED, so it does not
-		//    shift existing projection bindings) lets the physical planner map the
-		//    filter onto the scan; an empty hit set degenerates to `rowid = -1`,
-		//    which matches nothing (correct: no neighbours).
-		get.AddColumnId(COLUMN_IDENTIFIER_ROW_ID);
-		unique_ptr<TableFilter> rowid_filter;
-		if (n == 0) {
-			rowid_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(-1));
-		} else if (n == 1) {
-			rowid_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(rowids[0]));
-		} else {
-			auto or_filter = make_uniq<ConjunctionOrFilter>();
-			for (int32_t i = 0; i < n; i++) {
-				or_filter->child_filters.push_back(
-				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(rowids[i])));
-			}
-			rowid_filter = std::move(or_filter);
+		if (!get.table_filters.filters.empty()) {
+			// the index scan does not support pushed-down table filters; M2b match
+			// already required none, so this is just a guard.
+			return false;
 		}
-		get.table_filters.filters[COLUMN_IDENTIFIER_ROW_ID] = std::move(rowid_filter);
 
-		// Keep the projection (it computes the output columns); drop the TOP_N: the
-		// rowid filter already restricts to the k index-selected rows. (We keep the
-		// projection node, which becomes the new subtree root.)
+		// 7. REWRITE (vss-style): swap the GET's table function to the wasm HNSW
+		//    index scan + carry a WasmIndexScanBindData. The index scan's
+		//    init_global FIRES the search and returns the k nearest rows IN
+		//    DISTANCE ORDER (nearest-first); execute fetches them by rowid. So the
+		//    plan becomes a clean index scan with NO outer sort and NO rowid filter.
+		fprintf(stderr, "[wasm_index] optimizer swapped seq_scan -> wasm_hnsw_index_scan (handle=%u k=%llu)\n",
+		        wasm_index->wasm_handle, (unsigned long long)k);
+
+		auto &duck_table = table->Cast<DuckTableEntry>();
+		auto bind_data = make_uniq<WasmIndexScanBindData>(duck_table, wasm_index->wasm_handle, dims, k, std::move(query));
+
+		get.function = WasmIndexScanFunction::GetFunction();
+		auto cardinality = get.function.cardinality(context, bind_data.get());
+		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
+		get.estimated_cardinality = cardinality->estimated_cardinality;
+		get.bind_data = std::move(bind_data);
+
+		// Drop the TOP_N: the index scan already returns exactly k rows in distance
+		// order. The PROJECTION (which computes the output columns, including the
+		// distance expr) becomes the new subtree root -- correct results, no resort.
 		plan = std::move(top_n.children[0]);
 		return true;
 	}

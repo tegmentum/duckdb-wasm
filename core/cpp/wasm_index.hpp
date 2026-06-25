@@ -12,8 +12,11 @@
 
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/common/types/value.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace duckdb {
 
@@ -68,6 +71,49 @@ public:
 	                                      DataChunk &input) override {
 		return "wasm index: constraint violation";
 	}
+};
+
+//===----------------------------------------------------------------------===//
+// wasm_hnsw_index_scan TABLE FUNCTION (M2b full rewrite, vss-style)
+//
+// The optimizer rule (wasm_index_optimizer.cpp) swaps a matched seq_scan GET's
+// `function` to this TableFunction and sets `bind_data` to a WasmIndexScanBindData.
+// init_global FIRES the index once (wasm_index_search) to get the k nearest
+// rowids IN DISTANCE ORDER (instant-distance returns them sorted nearest-first);
+// execute fetches the table rows for those rowids via DataTable::Fetch, emitting
+// them in index order. Mirrors vss's HNSWIndexScanFunction exactly for this
+// duckdb version, except the ordered rowids come from the wasm component instead
+// of a live IndexScanState.
+//===----------------------------------------------------------------------===//
+
+//! Bind data carried from the optimizer into the swapped GET. Extends
+//! TableScanBindData (like vss's HNSWIndexScanBindData) so the planner treats it
+//! as a base-table scan (projection pushdown / column ids work unchanged).
+struct WasmIndexScanBindData final : public TableScanBindData {
+	WasmIndexScanBindData(TableCatalogEntry &table, uint32_t wasm_handle, uint32_t dims, idx_t limit,
+	                      std::vector<float> query)
+	    : TableScanBindData(table), wasm_handle(wasm_handle), dims(dims), limit(limit), query(std::move(query)) {
+		is_index_scan = true;
+	}
+
+	//! The component-side built index handle to search.
+	uint32_t wasm_handle;
+	//! The FLOAT[N] dimensionality (length of `query`).
+	uint32_t dims;
+	//! k -- the number of nearest rows to return.
+	idx_t limit;
+	//! The query vector (`dims` floats).
+	std::vector<float> query;
+
+public:
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<WasmIndexScanBindData>();
+		return &other.table == &table && other.wasm_handle == wasm_handle;
+	}
+};
+
+struct WasmIndexScanFunction {
+	static TableFunction GetFunction();
 };
 
 //! Registers the M2b optimizer rule that auto-rewrites top-k distance queries

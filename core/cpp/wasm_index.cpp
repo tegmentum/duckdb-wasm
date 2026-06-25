@@ -45,6 +45,18 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
 
+// wasm_hnsw_index_scan TableFunction (M2b full rewrite) -- mirrors vss
+// src/hnsw/hnsw_index_scan.cpp for this duckdb version.
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
+#include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+
 #include "wasm_index_bridge.h"
 #include "wasm_index.hpp"
 
@@ -219,6 +231,153 @@ unique_ptr<BoundIndex> WasmCreateIndexInstance(CreateIndexInput &input) {
 }
 
 } // namespace
+
+//===----------------------------------------------------------------------===//
+// wasm_hnsw_index_scan TABLE FUNCTION
+//
+// vss-style physical index scan. The optimizer swaps a matched seq_scan GET's
+// `function` to this and sets bind_data = WasmIndexScanBindData. We fire the
+// component search once at init_global (rowids already sorted nearest-first by
+// instant-distance) and fetch the table rows for those rowids in execute,
+// preserving distance order. No outer TOP_N / sort needed.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+BindInfo WasmIndexScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<WasmIndexScanBindData>();
+	return BindInfo(bind_data.table);
+}
+
+struct WasmIndexScanGlobalState : public GlobalTableFunctionState {
+	ColumnFetchState fetch_state;
+	vector<StorageIndex> column_ids;
+
+	// The k nearest rowids from the wasm index, IN DISTANCE ORDER, + a cursor.
+	vector<int64_t> rowids;
+	idx_t cursor = 0;
+
+	// For projection-pushdown (filter-column removal) path.
+	DataChunk all_columns;
+	vector<idx_t> projection_ids;
+};
+
+unique_ptr<GlobalTableFunctionState> WasmIndexScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<WasmIndexScanBindData>();
+	auto result = make_uniq<WasmIndexScanGlobalState>();
+
+	// Map the requested (logical) column ids to storage column ids, exactly like
+	// vss's HNSWIndexScanInitGlobal.
+	result->column_ids.reserve(input.column_ids.size());
+	for (auto &id : input.column_ids) {
+		storage_t col_id = id;
+		if (id != DConstants::INVALID_INDEX) {
+			col_id = bind_data.table.GetColumn(LogicalIndex(id)).StorageOid();
+		}
+		result->column_ids.emplace_back(col_id);
+	}
+
+	// FIRE the index once: ask the component for the k nearest rowids (sorted
+	// nearest-first by instant-distance). Store the ordered list + cursor.
+	const idx_t k = bind_data.limit;
+	result->rowids.resize(k);
+	int32_t n = wasm_index_search(bind_data.wasm_handle, bind_data.query.data(), bind_data.dims, (uint32_t)k,
+	                              result->rowids.data());
+	if (n < 0) {
+		throw InternalException("wasm index scan: search failed: %s", wasm_index_last_error());
+	}
+	result->rowids.resize((idx_t)n);
+	fprintf(stderr, "[wasm_index] index-scan fired (handle=%u k=%llu hits=%d)\n", bind_data.wasm_handle,
+	        (unsigned long long)k, n);
+
+	if (!input.CanRemoveFilterColumns()) {
+		return std::move(result);
+	}
+
+	// Projection-pushdown path: scan into all_columns, then project.
+	result->projection_ids = input.projection_ids;
+	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
+	const auto &columns = duck_table.GetColumns();
+	vector<LogicalType> scanned_types;
+	for (const auto &col_idx : input.column_indexes) {
+		if (col_idx.IsRowIdColumn()) {
+			scanned_types.emplace_back(LogicalType::ROW_TYPE);
+		} else {
+			scanned_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
+		}
+	}
+	result->all_columns.Initialize(context, scanned_types);
+	return std::move(result);
+}
+
+void WasmIndexScanExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<WasmIndexScanBindData>();
+	auto &state = data_p.global_state->Cast<WasmIndexScanGlobalState>();
+	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+
+	// Emit the next chunk of (at most STANDARD_VECTOR_SIZE) rowids in order.
+	const idx_t remaining = state.rowids.size() - state.cursor;
+	if (remaining == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+
+	// Build a ROW_TYPE vector of the rowids for this chunk (preserves distance
+	// order: row i of the output corresponds to the i-th nearest neighbour).
+	Vector row_ids(LogicalType::ROW_TYPE, count);
+	auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+	for (idx_t i = 0; i < count; i++) {
+		row_id_data[i] = (row_t)state.rowids[state.cursor + i];
+	}
+	state.cursor += count;
+
+	// Fetch the table rows by rowid (vss uses the exact same DataTable::Fetch).
+	if (state.projection_ids.empty()) {
+		bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids, row_ids, count, state.fetch_state);
+		return;
+	}
+	state.all_columns.Reset();
+	bind_data.table.GetStorage().Fetch(transaction, state.all_columns, state.column_ids, row_ids, count,
+	                                   state.fetch_state);
+	output.ReferenceColumns(state.all_columns, state.projection_ids);
+}
+
+unique_ptr<BaseStatistics> WasmIndexScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                                                   column_t column_id) {
+	auto &bind_data = bind_data_p->Cast<WasmIndexScanBindData>();
+	return bind_data.table.GetStatistics(context, column_id);
+}
+
+unique_ptr<NodeStatistics> WasmIndexScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<WasmIndexScanBindData>();
+	return make_uniq<NodeStatistics>(bind_data.limit, bind_data.limit);
+}
+
+InsertionOrderPreservingMap<string> WasmIndexScanToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &bind_data = input.bind_data->Cast<WasmIndexScanBindData>();
+	result["Table"] = bind_data.table.name;
+	result["wasm HNSW index handle"] = std::to_string(bind_data.wasm_handle);
+	return result;
+}
+
+} // namespace
+
+TableFunction WasmIndexScanFunction::GetFunction() {
+	TableFunction func("wasm_hnsw_index_scan", {}, WasmIndexScanExecute);
+	func.init_local = nullptr;
+	func.init_global = WasmIndexScanInitGlobal;
+	func.statistics = WasmIndexScanStatistics;
+	func.cardinality = WasmIndexScanCardinality;
+	func.pushdown_complex_filter = nullptr;
+	func.to_string = WasmIndexScanToString;
+	func.table_scan_progress = nullptr;
+	func.projection_pushdown = true;
+	func.filter_pushdown = false;
+	func.get_bind_info = WasmIndexScanBindInfo;
+	return func;
+}
 
 } // namespace duckdb
 
