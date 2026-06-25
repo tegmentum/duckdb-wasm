@@ -31,6 +31,16 @@ int32_t wasm_index_append(uint32_t handle, const int64_t *rowids, uint32_t n_row
                           const float *vectors_flat, uint32_t dims);
 int32_t wasm_index_build(uint32_t handle);
 int32_t wasm_index_drop(uint32_t handle);
+
+// M2b (optimizer auto-rewrite): kNN search over the built index. `query` is
+// `dims` contiguous f32; on success writes up to `k` rowids into `out_rowids`
+// (caller-allocated, length >= k) and returns the count written (0..=k), or -1
+// on error (message in wasm_index_last_error). The optimizer rule calls this at
+// optimize time to turn `ORDER BY array_distance(col, const) LIMIT k` into a
+// table scan restricted to the index's k nearest rowids.
+int32_t wasm_index_search(uint32_t handle, const float *query, uint32_t dims, uint32_t k,
+                          int64_t *out_rowids);
+
 const char *wasm_index_last_error(void);
 
 #ifdef __cplusplus

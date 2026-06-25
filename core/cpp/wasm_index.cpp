@@ -46,6 +46,7 @@
 #include "duckdb/main/config.hpp"
 
 #include "wasm_index_bridge.h"
+#include "wasm_index.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -57,77 +58,19 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // WasmBoundIndex
 //
-// The catalog-resident index instance returned by build_finalize. The HEAVY
-// lifting (the HNSW graph) lives in the component, keyed by index name + the
-// `handle` we stash here; this object is the DuckDB-side catalog handle. The
-// pure-virtuals are no-ops/throws: M2a keeps the built graph in component
-// memory (persistence is later), and search goes through the table function,
-// not through this BoundIndex.
+// The catalog-resident index instance returned by build_finalize. The class
+// itself lives in wasm_index.hpp so the M2b optimizer rule
+// (wasm_index_optimizer.cpp) can find it on a table's index list and read its
+// `wasm_handle` + `dims` to drive a kNN search. Only CommitDrop needs the bridge,
+// so it is defined here (the rest are inline no-ops in the header).
 //===----------------------------------------------------------------------===//
 
-class WasmBoundIndex : public BoundIndex {
-public:
-	WasmBoundIndex(const string &name, const string &index_type, IndexConstraintType index_constraint_type,
-	               const vector<column_t> &column_ids, TableIOManager &table_io_manager,
-	               const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db, uint32_t handle)
-	    : BoundIndex(name, index_type, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db),
-	      wasm_handle(handle) {
+void WasmBoundIndex::CommitDrop(IndexLock &index_lock) {
+	if (wasm_handle != 0) {
+		wasm_index_drop(wasm_handle);
+		wasm_handle = 0;
 	}
-
-	//! The component-side index-handle (from wasm_index_create); 0 == unbuilt.
-	uint32_t wasm_handle = 0;
-
-	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override {
-		// M2a: incremental row append after build is not supported (the component
-		// index is built once). A no-op keeps INSERTs after CREATE INDEX from
-		// throwing; the explicit hnsw_search reflects the built snapshot.
-		return ErrorData {};
-	}
-
-	void CommitDrop(IndexLock &index_lock) override {
-		if (wasm_handle != 0) {
-			wasm_index_drop(wasm_handle);
-			wasm_handle = 0;
-		}
-	}
-
-	void Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) override {
-		// no-op
-	}
-
-	ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) override {
-		return ErrorData {};
-	}
-
-	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override {
-		return true;
-	}
-
-	void Vacuum(IndexLock &l) override {
-		// no-op
-	}
-
-	idx_t GetInMemorySize(IndexLock &state) override {
-		return 0;
-	}
-
-	void Verify(IndexLock &l) override {
-		// no-op
-	}
-
-	string ToString(IndexLock &l, bool display_ascii) override {
-		return name;
-	}
-
-	void VerifyAllocations(IndexLock &l) override {
-		// no-op
-	}
-
-	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
-	                                      DataChunk &input) override {
-		return "wasm index: constraint violation";
-	}
-};
+}
 
 //===----------------------------------------------------------------------===//
 // Build framework callbacks (mirror src/execution/index/art/art_index.cpp).
@@ -200,7 +143,7 @@ unique_ptr<IndexBuildGlobalState> WasmBuildGlobalInit(IndexBuildInitGlobalStateI
 
 	state->global_index = make_uniq<WasmBoundIndex>(input.info.index_name, type_name, input.info.constraint_type,
 	                                                input.storage_ids, TableIOManager::Get(storage), input.expressions,
-	                                                storage.db, handle);
+	                                                storage.db, handle, (uint32_t)dims);
 
 	return std::move(state);
 }
@@ -270,8 +213,9 @@ unique_ptr<BoundIndex> WasmBuildFinalize(IndexBuildFinalizeInput &input) {
 //! create_instance: re-materialize a WasmBoundIndex (e.g. on catalog load). For
 //! M2a there is no persistence, so this builds an unbuilt (handle 0) stub.
 unique_ptr<BoundIndex> WasmCreateIndexInstance(CreateIndexInput &input) {
-	return make_uniq<WasmBoundIndex>(input.name, std::string("wasm_hnsw"), input.constraint_type, input.column_ids,
-	                                 input.table_io_manager, input.unbound_expressions, input.db, 0);
+	return make_uniq<WasmBoundIndex>(input.name, std::string(WASM_HNSW_INDEX_TYPE), input.constraint_type,
+	                                 input.column_ids, input.table_io_manager, input.unbound_expressions, input.db, 0,
+	                                 0);
 }
 
 } // namespace
@@ -297,6 +241,10 @@ extern "C" void wasm_register_index_type(duckdb_database db, const char *type_na
 		if (index_types.FindByName(type_name)) {
 			return; // already present (built-in or prior registration)
 		}
+		// M2b: install the optimizer rule that auto-rewrites top-k distance
+		// queries into a wasm-index scan. Done here (once, when the type is first
+		// registered) so the rule is present before any matching query binds.
+		duckdb::wasm_register_index_optimizer(instance);
 		duckdb::IndexType index_type;
 		index_type.name = std::string(type_name);
 		index_type.create_instance = duckdb::WasmCreateIndexInstance;

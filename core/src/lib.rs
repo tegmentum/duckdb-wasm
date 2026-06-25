@@ -448,6 +448,47 @@ pub extern "C" fn wasm_index_drop(handle: u32) -> i32 {
     }
 }
 
+/// Item 3 / M2b: kNN search bridge used by the OPTIMIZER rule (not the build
+/// pipeline). The C++ `wasm_index_optimizer.cpp` rewrites
+/// `ORDER BY array_distance(col, const) LIMIT k` into an index scan; at optimize
+/// time it calls this to ask the component for the k nearest rowids of `query`,
+/// then constrains the table scan to exactly those rowids. Routes to the
+/// host-provided `index-host.index-search` import (handle -> built map in the
+/// component), mirroring how the explicit `hnsw_search` table function reaches
+/// the SAME built index.
+///
+/// `query` is `dims` contiguous f32. On success, writes up to `k` rowids into
+/// the caller-provided `out_rowids` buffer (length >= k) and returns the count
+/// written (0..=k). Returns -1 on error (message in `wasm_index_last_error`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_index_search(
+    handle: u32,
+    query: *const f32,
+    dims: u32,
+    k: u32,
+    out_rowids: *mut i64,
+) -> i32 {
+    if query.is_null() || out_rowids.is_null() {
+        index_set_last_error("wasm_index_search: null buffer".to_string());
+        return -1;
+    }
+    let q = slice::from_raw_parts(query, dims as usize).to_vec();
+    match bindings::duckdb::extension::index_host::index_search(handle, &q, k) {
+        Ok(hits) => {
+            let n = std::cmp::min(hits.len(), k as usize);
+            let out = slice::from_raw_parts_mut(out_rowids, n);
+            for (i, hit) in hits.iter().take(n).enumerate() {
+                out[i] = hit.rowid;
+            }
+            n as i32
+        }
+        Err(err) => {
+            index_set_last_error(index_format_error(&err));
+            -1
+        }
+    }
+}
+
 //===----------------------------------------------------------------------===//
 // M2b scan bridge: projection + filter pushdown.
 //

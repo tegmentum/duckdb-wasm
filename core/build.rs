@@ -15,6 +15,10 @@ fn main() {
     // subclass registered as a custom INDEX TYPE so `CREATE INDEX ... USING
     // wasm_hnsw` routes to it. Same flags.
     build_wasm_cpp("wasm_index.cpp");
+    // Item 3 / M2b: the optimizer rule (cpp/wasm_index_optimizer.cpp) that
+    // auto-rewrites `ORDER BY array_distance(col, const) LIMIT k` into a
+    // wasm-index scan. Same flags; shares wasm_index.hpp with wasm_index.cpp.
+    build_wasm_cpp("wasm_index_optimizer.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
