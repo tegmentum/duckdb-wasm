@@ -1,4 +1,4 @@
-package duckdb:extension;
+package duckdb:extension@2.0.0;
 
 // httpfs M2. Host -> core file I/O callbacks. The DuckDB-compiled-to-wasm core
 // IMPORTS this interface; the native host PROVIDES it and routes each call to

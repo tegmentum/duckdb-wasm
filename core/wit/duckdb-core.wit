@@ -1,15 +1,15 @@
 package duckdb:component;
 
-use duckdb:extension/config;
-use duckdb:extension/logging;
-use duckdb:extension/runtime;
-use duckdb:extension/types;
-use duckdb:extension/callback-dispatch;
-use duckdb:extension/storage-host;
-use duckdb:extension/index-host;
-use duckdb:extension/collation-host;
-use duckdb:extension/pragma-host;
-use duckdb:extension/files-host;
+use duckdb:extension/config@2.0.0;
+use duckdb:extension/logging@2.0.0;
+use duckdb:extension/runtime@2.0.0;
+use duckdb:extension/types@2.0.0;
+use duckdb:extension/callback-dispatch@2.0.0;
+use duckdb:extension/storage-host@2.0.0;
+use duckdb:extension/index-host@2.0.0;
+use duckdb:extension/collation-host@2.0.0;
+use duckdb:extension/pragma-host@2.0.0;
+use duckdb:extension/files-host@2.0.0;
 use wasi:cli/environment@0.2.6;
 use wasi:cli/stdout@0.2.6;
 use wasi:cli/stderr@0.2.6;
@@ -247,17 +247,17 @@ world libduckdb {
     import wasi:io/streams@0.2.6;
     import host-extension-loader;
     import extension-loader-hooks;
-    import duckdb:extension/callback-dispatch;
-    import duckdb:extension/storage-host;
-    import duckdb:extension/index-host;
-    import duckdb:extension/collation-host;
-    import duckdb:extension/pragma-host;
-    import duckdb:extension/files-host;
+    import duckdb:extension/callback-dispatch@2.0.0;
+    import duckdb:extension/storage-host@2.0.0;
+    import duckdb:extension/index-host@2.0.0;
+    import duckdb:extension/collation-host@2.0.0;
+    import duckdb:extension/pragma-host@2.0.0;
+    import duckdb:extension/files-host@2.0.0;
     import tvm:memory/manager@0.1.0;
     import tvm:memory/bytes@0.1.0;
 
     export database;
-    export duckdb:extension/config;
-    export duckdb:extension/logging;
-    export duckdb:extension/runtime;
+    export duckdb:extension/config@2.0.0;
+    export duckdb:extension/logging@2.0.0;
+    export duckdb:extension/runtime@2.0.0;
 }

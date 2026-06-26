@@ -1,4 +1,4 @@
-package duckdb:extension;
+package duckdb:extension@2.0.0;
 
 // Host -> core collation pull. The DuckDB-compiled-to-wasm core IMPORTS this
 // interface; the native host PROVIDES it, returning the collations that
