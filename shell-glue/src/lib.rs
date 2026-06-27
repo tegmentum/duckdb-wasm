@@ -36,6 +36,15 @@ use libduckdb_sys as duckdb;
 
 const DUCKDB_SUCCESS: duckdb::duckdb_state = 0;
 
+/// Sentinel callback handles for the resolver observability scalars. These match
+/// `ducklink_host::RESOLVER_EXPLAIN_HANDLE` / `RESOLVER_SET_HANDLE`: the host's
+/// `dispatch_scalar_batch` recognizes them and routes to the multi-provider
+/// resolver (instead of a resident extension), so `SELECT extension_provider(x)`
+/// reports the chosen provider + reasoning and `SELECT set_extension_provider(x)`
+/// forces a provider -- both over the SAME direct call-scalar-batch import.
+const RESOLVER_EXPLAIN_HANDLE: u32 = 0xFFFF_FFFF;
+const RESOLVER_SET_HANDLE: u32 = 0xFFFF_FFFE;
+
 /// The dedicated registration connection handed in by the C++ db-handle bridge
 /// (a sibling `duckdb::Connection*` reinterpreted as a C-API duckdb_connection).
 static REGISTRATION_CONN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -52,6 +61,28 @@ fn clog(msg: &str) {
 pub unsafe extern "C" fn duckdb_shell_ext_set_connection(conn: *mut c_void) {
     REGISTRATION_CONN.store(conn, Ordering::SeqCst);
     clog("[shell-glue] registration connection set");
+    // Register the resolver observability/override scalars up front (available
+    // without a prior LOAD). They dispatch via the sentinel handles, which the
+    // host routes to the multi-provider resolver.
+    let c = conn as duckdb::duckdb_connection;
+    if !c.is_null() {
+        register_resolver_scalar(c, "extension_provider", RESOLVER_EXPLAIN_HANDLE);
+        register_resolver_scalar(c, "set_extension_provider", RESOLVER_SET_HANDLE);
+    }
+}
+
+/// Register one resolver observability scalar (`name(TEXT) -> TEXT`) on the shell
+/// connection with a sentinel callback handle the host resolver intercepts.
+unsafe fn register_resolver_scalar(conn: duckdb::duckdb_connection, name: &str, handle: u32) {
+    let def = ScalarDef {
+        name: name.to_string(),
+        arguments: vec![Logicaltype::Text],
+        returns: Logicaltype::Text,
+        callback_handle: handle,
+    };
+    if let Err(err) = register_scalar_function_on_connection(conn, def) {
+        clog(&format!("[shell-glue] failed to register '{name}': {err}"));
+    }
 }
 
 /// The C entry `LoadExternalExtensionInternal` calls for `LOAD <name>` (the
