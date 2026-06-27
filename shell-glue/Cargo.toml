@@ -12,3 +12,8 @@ crate-type = ["staticlib"]
 
 [dependencies]
 wit-bindgen = "0.57"
+# Reuse the DuckDB C-API extern declarations + types (duckdb_connection,
+# duckdb_create_scalar_function, ...). The symbols themselves are provided by the
+# merged libduckdb-wasi.a at the final clang link; this dep only supplies the
+# bindings (and its link directives are inert for a staticlib).
+libduckdb-sys = { path = "../libduckdb-sys" }

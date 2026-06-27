@@ -1,13 +1,97 @@
-// Minimal de-risk world for the clang-driver Route A link: prove that a
-// wit-bindgen staticlib contributes a `duckdb:component/host-extension-loader`
-// import that wasm-component-ld folds into the final shell command component
-// (alongside the auto wasi:cli/run export from the C `_start`).
+// Route A install-glue world: the imports the real DuckDB shell command needs so
+// that `LOAD <name>` dispatches shell -> ducklink runtime -> resident extension
+// wasm. These interfaces mirror core/wit/duckdb-core.wit (package duckdb:component)
+// + duckdb:extension/callback-dispatch@2.0.0 verbatim, so the host's existing
+// linker wiring (request-load -> ExtensionManager, get-pending-registrations,
+// call-scalar-batch -> dispatch_scalar) satisfies them unchanged.
 package duckdb:component;
 
 interface host-extension-loader {
+    /// Request the host to load a componentized DuckDB extension. Returns true if handled.
     request-load: func(name: string) -> bool;
+}
+
+interface extension-loader-hooks {
+    use duckdb:extension/types@2.0.0.{logicaltype, columndef, funcflags};
+
+    record func-arg {
+        name: option<string>,
+        logical: logicaltype,
+    }
+
+    record func-opts {
+        description: option<string>,
+        tags: list<string>,
+        attributes: funcflags,
+    }
+
+    record ext-opts {
+        description: option<string>,
+        tags: list<string>,
+    }
+
+    record scalar-registration {
+        name: string,
+        arguments: list<func-arg>,
+        returns: logicaltype,
+        callback-handle: u32,
+        options: option<func-opts>,
+    }
+
+    record table-registration {
+        name: string,
+        arguments: list<func-arg>,
+        columns: list<columndef>,
+        callback-handle: u32,
+        options: option<ext-opts>,
+    }
+
+    record aggregate-registration {
+        name: string,
+        arguments: list<func-arg>,
+        returns: logicaltype,
+        callback-handle: u32,
+        options: option<func-opts>,
+    }
+
+    record macro-registration {
+        schema: string,
+        name: string,
+        parameters: list<string>,
+        definition-sql: string,
+    }
+
+    record replacement-scan-registration {
+        extensions: list<string>,
+        function-name: string,
+    }
+
+    record logical-type-registration {
+        name: string,
+        physical: string,
+    }
+
+    record cast-registration {
+        source: string,
+        target: string,
+        callback-handle: u32,
+    }
+
+    record pending-registrations {
+        scalars: list<scalar-registration>,
+        tables: list<table-registration>,
+        aggregates: list<aggregate-registration>,
+        macros: list<macro-registration>,
+        replacement-scans: list<replacement-scan-registration>,
+        logical-types: list<logical-type-registration>,
+        casts: list<cast-registration>,
+    }
+
+    get-pending-registrations: func() -> pending-registrations;
 }
 
 world shell-glue {
     import host-extension-loader;
+    import extension-loader-hooks;
+    import duckdb:extension/callback-dispatch@2.0.0;
 }

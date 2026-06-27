@@ -255,18 +255,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "duckdb-shell-component"
-version = "0.1.0"
-dependencies = [
- "libc",
- "libduckdb-sys",
- "wit-bindgen-rt",
-]
-
-[[package]]
 name = "duckdb-shell-glue"
 version = "0.1.0"
 dependencies = [
+ "libduckdb-sys",
  "wit-bindgen",
 ]
 

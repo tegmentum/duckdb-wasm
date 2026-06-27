@@ -61,6 +61,10 @@ CXXFLAGS=(
   -DDISABLE_DUCKDB_REMOTE_INSTALL -DDUCKDB_DISABLE_EXTENSION_LOAD
   -DDUCKDB_NO_THREADS -DDUCKDB_SKIP_HTTP
   -DUSE_DUCKDB_SHELL_WRAPPER
+  # Route A: enable the db-handle bridge hook in the (patched) shell.cpp and make
+  # its declaration visible everywhere via force-include.
+  -DDUCKDB_SHELL_EXT
+  -include "$HERE/cmake/shell-wasi/shell_ext_bridge.h"
   -I"$HERE/cmake/shell-wasi/include"
   -include "$HERE/cmake/shell-wasi/shell-wasi-shim.h"
   -I"$HERE/cmake/wasi-override/include"
@@ -70,10 +74,11 @@ CXXFLAGS=(
   -I"$DUCKDB_SOURCE_DIR/third_party/utf8proc/include"
 )
 
+# All shell TUs except shell.cpp, which is compiled from a patched copy (the
+# db-handle bridge hook is injected into ShellState::OpenDB).
 SOURCES=(
   shell_command_line_option.cpp
   shell_extension.cpp
-  shell.cpp
   shell_helpers.cpp
   shell_metadata_command.cpp
   shell_prompt.cpp
@@ -91,6 +96,26 @@ for src in "${SOURCES[@]}"; do
   "$CXX" "${CXXFLAGS[@]}" -c "$SHELL_SRC/$src" -o "$obj"
   OBJS+=("$obj")
 done
+
+# shell.cpp: inject the db-handle bridge call right after the shell extension is
+# loaded in ShellState::OpenDB (both the normal and fallback paths reach it with
+# `db`/`conn` set). The injection is guarded by DUCKDB_SHELL_EXT, so the patched
+# copy is still byte-identical behaviour for the standalone build.
+PATCHED_SHELL="$OUT_DIR/obj/shell_patched.cpp"
+echo "  GEN shell_patched.cpp (db-handle bridge hook)" >&2
+perl -pe 's{(LoadStaticExtension<duckdb::ShellExtension>\(\);)}{$1\n#ifdef DUCKDB_SHELL_EXT\n\t\tduckdb_shell_ext_register_db((void*)db.get());\n#endif}' \
+  "$SHELL_SRC/shell.cpp" > "$PATCHED_SHELL"
+if ! grep -q "duckdb_shell_ext_register_db" "$PATCHED_SHELL"; then
+  echo "ERROR: failed to inject db-handle bridge hook into shell.cpp" >&2; exit 1
+fi
+echo "  CXX shell_patched.cpp" >&2
+"$CXX" "${CXXFLAGS[@]}" -c "$PATCHED_SHELL" -o "$OUT_DIR/obj/shell.o"
+OBJS+=("$OUT_DIR/obj/shell.o")
+
+# The db-handle bridge TU (creates a sibling C-API connection on the shell db).
+echo "  CXX shell_ext_bridge.cpp" >&2
+"$CXX" "${CXXFLAGS[@]}" -c "$HERE/cmake/shell-wasi/shell_ext_bridge.cpp" -o "$OUT_DIR/obj/shell_ext_bridge.o"
+OBJS+=("$OUT_DIR/obj/shell_ext_bridge.o")
 
 # wasi shim stubs WITHOUT the duckdb_component_load_extension stub (renamed away
 # so the Rust glue provides the real symbol).
