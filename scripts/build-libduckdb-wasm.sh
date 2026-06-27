@@ -186,34 +186,81 @@ fi
 # httpfs. It depends on delta (uc_delta_ccv2_commit) at runtime. So just embed it
 # (with httpfs + delta) -- the config enables it; nothing to patch here.
 
-# quack: CLIENT-ONLY on wasm. The httplib SERVER (quack_http_server.cpp, a
-# 128-thread pool + listen/accept) compiles + links unchanged on wasm32-wasip2
-# (std::thread is in libc++; pthread_create is a weak libc stub), so the server
-# TUs are harmless dead code -- no exclusion needed. But quack_serve would, at
-# runtime, try to spin a listener httplib can't bind() in the wasip2 sandbox, so
-# extend quack's bind-time guard (it already throws for __EMSCRIPTEN__) to cover
-# __wasi__, giving a clean error instead of a thread/socket failure. The CLIENT
-# (quack_client.cpp, over the curl HTTPUtil) is unaffected. Idempotent; a missing
-# anchor (beta churn) is a non-fatal skip -- the server is dead code regardless.
+# quack: CLIENT + host-bridged SERVER on wasm. The httplib SERVER
+# (quack_http_server.cpp, a 128-thread pool + listen/accept) can't listen() in
+# the wasip2 sandbox, but quack's per-request HANDLER -- QuackServer::HandleMessage
+# (DuckDB-internal (de)serialization) -- is already decoupled from httplib. So,
+# mirroring the ui extension (the native host owns the socket + accept loop and
+# bridges each request into the core), we:
+#   (1) stage cmake/quack-deps/quack_wasi_bridge.cpp (a listen-less WasiQuackServer
+#       exposing HandleMessage + the duckdb_quack_handle_request C entrypoint the
+#       host's accept loop calls) into the quack source + its object library, and
+#   (2) route CreateServer (quack_storage.cpp) to that bridge server on __wasi__
+#       instead of HttpQuackServer, so quack_serve('quack:host:port') builds the
+#       bridge (no socket bind) -- the host then owns the TcpListener.
+# The httplib server TUs remain compiled (dead code; std::thread is in libc++,
+# pthread_create is a weak libc stub) -- not worth excluding. Idempotent; missing
+# anchors (beta churn) are non-fatal skips. The CLIENT (quack_client.cpp over the
+# curl HTTPUtil) is unaffected.
 QUACK_SRC="$BUILD_DIR/_deps/quack_extension_fc-src"
+QUACK_BRIDGE_SRC="$(pwd)/cmake/quack-deps/quack_wasi_bridge.cpp"
 if ext_selected quack \
-   && [[ -f "$QUACK_SRC/src/quack_start_stop.cpp" ]]; then
+   && [[ -d "$QUACK_SRC/src" && -f "$QUACK_BRIDGE_SRC" ]]; then
+  # (1a) stage the bridge TU into the fetched quack source tree.
+  cp "$QUACK_BRIDGE_SRC" "$QUACK_SRC/src/quack_wasi_bridge.cpp"
+  # (1b) add it to quack's object library (src/CMakeLists.txt). Idempotent.
+  python3 - "$QUACK_SRC/src/CMakeLists.txt" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'quack_wasi_bridge.cpp' in s:
+    sys.exit(0)
+anchor = '  quack_uri.cpp\n'
+if anchor not in s:
+    sys.stderr.write('quack src/CMakeLists.txt: quack_uri.cpp anchor not found -- skipping bridge add\n')
+    sys.exit(0)
+s = s.replace(anchor, anchor + '  quack_wasi_bridge.cpp\n', 1)
+open(p, 'w').write(s)
+print('patched quack src/CMakeLists.txt: added quack_wasi_bridge.cpp')
+PY
+  # (1c) ensure quack_serve is NOT guarded off on wasi: it must reach CreateServer
+  # (-> the bridge server) so quack_serve('quack:...') builds the host-bridged
+  # server. Revert any stale "|| defined(__wasi__)" a prior client-only build added
+  # to the bind-time guard (FetchContent doesn't re-fetch, so a reused build dir
+  # can carry it). Idempotent; upstream is __EMSCRIPTEN__-only.
   python3 - "$QUACK_SRC/src/quack_start_stop.cpp" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-if 'quack-wasi-no-serve' in s:
+stale = '#if defined(__EMSCRIPTEN__) || defined(__wasi__)'
+if stale in s:
+    s = s.replace(stale, '#ifdef __EMSCRIPTEN__ // quack-wasi-bridge-serve', 1)
+    open(p, 'w').write(s)
+    print('reverted quack_start_stop.cpp: quack_serve enabled on wasi (bridge mode)')
+PY
+  # (2) route CreateServer to the listen-less bridge server on wasi.
+  python3 - "$QUACK_SRC/src/quack_storage.cpp" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'quack-wasi-bridge-server' in s:
     sys.exit(0)
-old = '#ifdef __EMSCRIPTEN__\n\tthrow NotImplementedException("quack_serve is currently not implemented for the wasm platform'
-new = ('#if defined(__EMSCRIPTEN__) || defined(__wasi__) // quack-wasi-no-serve\n'
-       '\tthrow NotImplementedException("quack_serve is currently not implemented for the wasm platform')
+old = '\tserver = make_uniq<HttpQuackServer>(context, listen_uri, token);'
+new = ('#ifdef __wasi__\n'
+       '\t// quack-wasi-bridge-server: the native host owns the socket + accept\n'
+       '\t// loop; build the listen-less bridge (quack_wasi_bridge.cpp) instead of\n'
+       '\t// httplib, which can\'t listen() in the wasip2 sandbox.\n'
+       '\textern QuackServer *QuackWasiCreateServer(ClientContext &, const QuackUri &, const string &);\n'
+       '\tserver = unique_ptr<QuackServer>(QuackWasiCreateServer(context, listen_uri, token));\n'
+       '#else\n'
+       '\tserver = make_uniq<HttpQuackServer>(context, listen_uri, token);\n'
+       '#endif')
 if old not in s:
-    sys.stderr.write('quack_start_stop.cpp: __EMSCRIPTEN__ quack_serve guard anchor '
-                     'not found -- skipping (server is dead code on wasi anyway)\n')
+    sys.stderr.write('quack_storage.cpp: CreateServer HttpQuackServer anchor not found -- skipping\n')
     sys.exit(0)
 s = s.replace(old, new, 1)
 open(p, 'w').write(s)
-print('patched quack_start_stop.cpp: quack_serve guarded off on wasi (client-only)')
+print('patched quack_storage.cpp: CreateServer uses the wasi bridge server')
 PY
 fi
 

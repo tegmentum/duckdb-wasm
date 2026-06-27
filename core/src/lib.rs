@@ -4309,6 +4309,34 @@ impl exported_database::Guest for Component {
         unsafe { duckdb_ui_free(buf) };
         result
     }
+
+    // Bridge one quack RPC request body to the statically-linked `quack`
+    // extension's listen-less bridge server (cmake/quack-deps/quack_wasi_bridge.cpp):
+    // QuackServer::HandleMessage does the DuckDB-internal (de)serialization. The
+    // native host owns the socket + frames the POST /quack envelope; this just
+    // takes the serialized request body and returns the serialized response body
+    // (the `application/vnd.duckdb` payload). Returns none if no bridge server is
+    // active (quack_serve was not run) or the handler failed. The C entry returns
+    // a malloc'd buffer that we copy out and free.
+    fn handle_quack_request(body: Vec<u8>) -> Option<Vec<u8>> {
+        extern "C" {
+            fn duckdb_quack_handle_request(
+                body: *const u8,
+                body_len: usize,
+                out_len: *mut usize,
+            ) -> *mut u8;
+            fn duckdb_quack_free(buf: *mut u8);
+        }
+
+        let mut out_len: usize = 0;
+        let buf = unsafe { duckdb_quack_handle_request(body.as_ptr(), body.len(), &mut out_len) };
+        if buf.is_null() {
+            return None;
+        }
+        let response = unsafe { std::slice::from_raw_parts(buf, out_len) }.to_vec();
+        unsafe { duckdb_quack_free(buf) };
+        Some(response)
+    }
 }
 
 #[no_mangle]

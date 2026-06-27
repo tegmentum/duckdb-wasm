@@ -135,6 +135,16 @@ interface database {
     /// the wasip2 sandbox). `start-ui-server` must have been run first; returns
     /// none if the UI server isn't started. `headers` is a "Key: Value\n" block.
     handle-ui-request: func(method: string, path: string, headers: string, body: list<u8>) -> option<ui-response>;
+
+    /// Handle one quack RPC request body through the (static) `quack` extension's
+    /// listen-less bridge server (QuackServer::HandleMessage; DuckDB-internal
+    /// serialization). The native host owns the TcpListener + accept loop and
+    /// frames the POST /quack envelope -- httplib can't listen() in the wasip2
+    /// sandbox -- so it forwards the raw request body here and writes the returned
+    /// bytes back as the `application/vnd.duckdb` response body. `quack_serve(...)`
+    /// must have been run first to build the bridge server; returns none if no
+    /// bridge server is active (or the handler failed).
+    handle-quack-request: func(body: list<u8>) -> option<list<u8>>;
 }
 
 interface host-extension-loader {
