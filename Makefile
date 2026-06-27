@@ -7,7 +7,7 @@
 WASI_TARGET ?= wasm32-wasip2
 ENV = . scripts/setup-env.sh >/dev/null
 
-.PHONY: core core-browser env clean
+.PHONY: core core-browser shell env clean
 
 # Print the resolved build environment (and whether each input exists).
 env:
@@ -22,6 +22,13 @@ core:
 core-browser:
 	$(ENV) && cargo component build -p duckdb-component-core \
 	  --target $(WASI_TARGET) --release --no-default-features --features browser
+
+# The REAL DuckDB shell (external/duckdb/tools/shell) as a wasi:cli/run component
+# -> build/duckdb-shell/duckdb-shell.wasm. Run it with:
+#   wasmtime run -W exceptions=y -S inherit-network --dir .::/ \
+#     build/duckdb-shell/duckdb-shell.wasm
+shell:
+	bash scripts/build-shell-wasm.sh
 
 clean:
 	cargo clean
