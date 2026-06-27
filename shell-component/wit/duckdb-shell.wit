@@ -1,0 +1,11 @@
+// Spike world: the real DuckDB shell as a wasi:cli/run command component.
+// Step 0 de-risk -- just prove the C++ shell objects + libduckdb archive link
+// into a cargo-component command that exports wasi:cli/run. The extension-import
+// surface (duckdb:component/host-extension-loader + extension-loader-hooks +
+// duckdb:extension/callback-dispatch) is added in Step 1 once linking is proven.
+package duckdb:shell;
+
+world duckdb-shell {
+    include wasi:cli/imports@0.2.6;
+    export wasi:cli/run@0.2.6;
+}

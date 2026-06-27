@@ -1,0 +1,32 @@
+[package]
+name = "duckdb-shell-component"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# The Route A shell command component: real DuckDB shell front-end + engine +
+# (Step 1) the extension-install glue, exporting wasi:cli/run.
+name = "duckdb_shell_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+libduckdb-sys = { path = "../libduckdb-sys" }
+wit-bindgen-rt = { version = "0.41.0", features = ["bitflags"] }
+libc = { version = "0.2", default-features = false }
+
+[package.metadata.component]
+package = "duckdb:shell"
+
+[package.metadata.component.target]
+path = "wit"
+world = "duckdb-shell"
+
+[package.metadata.component.target.dependencies]
+"duckdb:extension" = { path = "wit/deps/duckdb-extension" }
+"wasi:cli" = { path = "wit/deps/wasi-cli" }
+"wasi:filesystem" = { path = "wit/deps/wasi-filesystem" }
+"wasi:io" = { path = "wit/deps/wasi-io" }
+"wasi:clocks" = { path = "wit/deps/wasi-clocks" }
+"wasi:sockets" = { path = "wit/deps/wasi-sockets" }
+"wasi:random" = { path = "wit/deps/wasi-random" }
+"tvm:memory" = { path = "wit/deps/tvm" }

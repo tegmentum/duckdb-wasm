@@ -1,0 +1,13 @@
+// Minimal de-risk world for the clang-driver Route A link: prove that a
+// wit-bindgen staticlib contributes a `duckdb:component/host-extension-loader`
+// import that wasm-component-ld folds into the final shell command component
+// (alongside the auto wasi:cli/run export from the C `_start`).
+package duckdb:component;
+
+interface host-extension-loader {
+    request-load: func(name: string) -> bool;
+}
+
+world shell-glue {
+    import host-extension-loader;
+}

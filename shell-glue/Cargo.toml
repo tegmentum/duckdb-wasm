@@ -1,0 +1,14 @@
+[package]
+name = "duckdb-shell-glue"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "shell_glue"
+# A wasm staticlib (archive of wasm objects) linked into the shell command by
+# the clang driver in scripts/build-shell-wasm.sh. Carries the wit-bindgen
+# component-type metadata so wasm-component-ld declares the extension imports.
+crate-type = ["staticlib"]
+
+[dependencies]
+wit-bindgen = "0.57"

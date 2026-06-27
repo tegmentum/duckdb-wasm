@@ -2,7 +2,14 @@
 members = [
     "libduckdb-sys",
     "core",
+    "shell-glue",
 ]
+# NOTE: `shell-component/` is intentionally NOT a workspace member. It is the
+# Step 0 de-risk record showing the cargo-component command path is a no-go for
+# Route A (it routes wasi:cli/run crates through wasm32-wasip1 + the preview1
+# adapter, ABI-incompatible with the wasip2 engine archive). The working Route A
+# build is the clang driver in scripts/build-shell-ext-wasm.sh + the shell-glue
+# wit-bindgen staticlib.
 # `core` compiles to the `ducklink_core.wasm` component and is the default build
 # target; the workspace members share one lockfile but need
 # `--target wasm32-wasip2` + the wasi-sdk env to actually build (see README).
