@@ -5029,7 +5029,7 @@ impl config_exports::Guest for ConfigHost {
     }
 }
 
-config_exports::__export_duckdb_extension_config_2_0_0_cabi!(
+config_exports::__export_duckdb_extension_config_2_2_0_cabi!(
     ConfigHost with_types_in bindings::exports::duckdb::extension::config
 );
 
@@ -5041,7 +5041,7 @@ impl logging_exports::Guest for LoggingHost {
     fn log_fields(_level: Loglevel, _message: String, _fields: Vec<Logfield>) {}
 }
 
-logging_exports::__export_duckdb_extension_logging_2_0_0_cabi!(
+logging_exports::__export_duckdb_extension_logging_2_2_0_cabi!(
     LoggingHost with_types_in bindings::exports::duckdb::extension::logging
 );
 
@@ -5828,7 +5828,7 @@ impl runtime_exports::Guest for RuntimeHost {
     }
 }
 
-runtime_exports::__export_duckdb_extension_runtime_2_0_0_cabi!(
+runtime_exports::__export_duckdb_extension_runtime_2_2_0_cabi!(
     RuntimeHost with_types_in bindings::exports::duckdb::extension::runtime
 );
 
