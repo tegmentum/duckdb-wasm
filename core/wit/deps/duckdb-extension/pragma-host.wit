@@ -1,4 +1,4 @@
-package duckdb:extension@2.0.0;
+package duckdb:extension@2.2.0;
 
 // Host -> core pragma pull (Item 4). The DuckDB-compiled-to-wasm core IMPORTS
 // this interface; the native host PROVIDES it, returning the pragmas that
