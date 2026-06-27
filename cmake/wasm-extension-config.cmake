@@ -216,23 +216,35 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../build/wasi-deps/mariadb/lib/mariadb/libm
   )
 endif()
 
-# httpfs / ui / unity_catalog all need CURL + OpenSSL from ~/git/curl-wasm +
-# ~/git/openssl-wasm. The var-setup below only runs if at least one of them is
+# httpfs / ui / unity_catalog / quack all need CURL + OpenSSL from ~/git/curl-wasm
+# + ~/git/openssl-wasm. The var-setup below only runs if at least one of them is
 # selected (so a lean build doesn't re-enable the http module or wire curl).
 #   - httpfs: HTTP/S3 filesystem over wasi:sockets (curl client; embedded CA
 #     bundle via CURLOPT_CAINFO_BLOB). BSD sockets are grafted from the wasip2
 #     libc into the wasip1 core module by scripts/build-libduckdb-wasm.sh.
 #   - ui: the real DuckDB UI, bridged through the native host (duckdb-host ui).
 #   - unity_catalog: ATTACH a Unity Catalog (REST over DuckDB's HTTPUtil/curl).
+#   - quack: client of DuckDB's client-server protocol (over the same HTTPUtil).
 want(httpfs)
 set(_w_httpfs ${WANT})
 want(ui)
 set(_w_ui ${WANT})
 want(unity_catalog)
 set(_w_uc ${WANT})
+want(quack)
+set(_w_quack ${WANT})
+# quack's CLIENT (quack_query / ATTACH 'quack:') autoloads + requires httpfs at
+# runtime: it rides DuckDB's HTTPUtil abstraction and httpfs's LoadInternal sets
+# config.http_util = HTTPFSCurlUtil on wasi (curl over wasi:sockets; the httplib
+# client doesn't work on wasi). On wasm AutoLoadExtension only resolves EMBEDDED
+# extensions, so embedding quack implies embedding httpfs (force it on + re-enable
+# the http_util base classes below).
+if(_w_quack)
+  set(_w_httpfs TRUE)
+endif()
 set(OPENSSL_WASM_DIR "$ENV{HOME}/git/openssl-wasm/build/openssl")
 set(CURL_WASM_DIR "$ENV{HOME}/git/curl-wasm/build")
-if((_w_httpfs OR _w_ui OR _w_uc)
+if((_w_httpfs OR _w_ui OR _w_uc OR _w_quack)
    AND EXISTS "${OPENSSL_WASM_DIR}/libcrypto.a"
    AND EXISTS "${CURL_WASM_DIR}/curl/lib/libcurl.a")
   if(_w_httpfs)
@@ -279,6 +291,32 @@ if((_w_httpfs OR _w_ui OR _w_uc)
     GIT_URL https://github.com/duckdb/unity_catalog
     GIT_TAG d52a7ee8678a23a8e0f950e955b9ffa1df0c3395   # DuckDB 1.5.4-pinned commit
     INCLUDE_DIR src/include
+  )
+
+  # quack: DuckDB's client-server protocol (an autoloadable core extension as of
+  # DuckDB 1.5.3; BETA until DuckDB 2.0 -- protocol / fn-names / serialization
+  # "subject to change", so the tag is pinned). CLIENT ONLY on wasm:
+  #   quack_query('quack:host:port', sql)  +  ATTACH 'quack:host'
+  # against a remote DuckDB Quack server. The client (src/quack_client.cpp) rides
+  # DuckDB's HTTPUtil abstraction (HTTPUtil::Get(db) -> Request) -- the SAME one
+  # httpfs uses -- and AutoLoadExtension("httpfs")s itself; httpfs's patched
+  # LoadInternal sets config.http_util = HTTPFSCurlUtil on wasi, so quack's
+  # outbound POSTs go through curl-over-wasi:sockets (httpfs-proven), NOT the
+  # broken httplib client. Deps = openssl + curl only (vcpkg.json), already wired
+  # above for httpfs -- no new native dep.
+  #
+  # The httplib-based SERVER (src/quack_http_server.cpp: a 128-thread ThreadPool +
+  # listen/accept) is NOT usable on wasip2 (httplib can't listen() in the sandbox,
+  # like the ui extension's server). It nonetheless COMPILES + LINKS unchanged on
+  # wasm32-wasip2 (std::thread is in libc++, pthread_create is a weak libc stub),
+  # so no source exclusion is needed -- the server TUs are dead code here.
+  # quack_serve is guarded to throw a clear "not supported on wasm" at bind-time
+  # (apply_extension_patches in scripts/build-libduckdb-wasm.sh) so it never tries
+  # to spin a listener it can't run. The host-bridged server is the deferred path.
+  embed_ext(quack          # quack_query / ATTACH 'quack:' CLIENT (curl HTTPUtil + openssl-wasm)
+    GIT_URL https://github.com/duckdb/duckdb-quack
+    GIT_TAG 40de7badae4193c29d9c0834473fb76acc6c51e6   # BETA -- pinned (protocol churns pre-DuckDB-2.0)
+    INCLUDE_DIR src/include                            # quack_extension.hpp for the generated loader
   )
 endif()
 

@@ -186,6 +186,37 @@ fi
 # httpfs. It depends on delta (uc_delta_ccv2_commit) at runtime. So just embed it
 # (with httpfs + delta) -- the config enables it; nothing to patch here.
 
+# quack: CLIENT-ONLY on wasm. The httplib SERVER (quack_http_server.cpp, a
+# 128-thread pool + listen/accept) compiles + links unchanged on wasm32-wasip2
+# (std::thread is in libc++; pthread_create is a weak libc stub), so the server
+# TUs are harmless dead code -- no exclusion needed. But quack_serve would, at
+# runtime, try to spin a listener httplib can't bind() in the wasip2 sandbox, so
+# extend quack's bind-time guard (it already throws for __EMSCRIPTEN__) to cover
+# __wasi__, giving a clean error instead of a thread/socket failure. The CLIENT
+# (quack_client.cpp, over the curl HTTPUtil) is unaffected. Idempotent; a missing
+# anchor (beta churn) is a non-fatal skip -- the server is dead code regardless.
+QUACK_SRC="$BUILD_DIR/_deps/quack_extension_fc-src"
+if ext_selected quack \
+   && [[ -f "$QUACK_SRC/src/quack_start_stop.cpp" ]]; then
+  python3 - "$QUACK_SRC/src/quack_start_stop.cpp" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'quack-wasi-no-serve' in s:
+    sys.exit(0)
+old = '#ifdef __EMSCRIPTEN__\n\tthrow NotImplementedException("quack_serve is currently not implemented for the wasm platform'
+new = ('#if defined(__EMSCRIPTEN__) || defined(__wasi__) // quack-wasi-no-serve\n'
+       '\tthrow NotImplementedException("quack_serve is currently not implemented for the wasm platform')
+if old not in s:
+    sys.stderr.write('quack_start_stop.cpp: __EMSCRIPTEN__ quack_serve guard anchor '
+                     'not found -- skipping (server is dead code on wasi anyway)\n')
+    sys.exit(0)
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+print('patched quack_start_stop.cpp: quack_serve guarded off on wasi (client-only)')
+PY
+fi
+
 # duckdb-avro: our wasi avro-c is deflate-only (no lzma/snappy), so drop those
 # REQUIRED find_library() calls + their use in ALL_AVRO_LIBRARIES. Idempotent.
 AVRO_SRC="$BUILD_DIR/_deps/avro_extension_fc-src"
