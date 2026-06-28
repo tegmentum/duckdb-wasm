@@ -1,4 +1,4 @@
-# v3 core-shim wiring status (parser DONE; optimizer/window/filter remaining)
+# v3 core-shim wiring status (parser/window/optimizer DONE; filter pushdown documented)
 
 Status (2026-06-28, major-3 baseline `duckdb:extension@3.0.0`):
 
@@ -10,27 +10,52 @@ Status (2026-06-28, major-3 baseline `duckdb:extension@3.0.0`):
   component's `parser-dispatch` export. PROVEN: `LOAD ggsql; VISUALIZE SELECT
   'apple' AS label, 3 AS n UNION ALL SELECT 'pear', 1` returns
   `(apple,3,###) (pear,1,#)`.
-- **OPTIMIZER / WINDOW / TABLE-FN FILTER PUSHDOWN -- contract + host capture done;
-  DuckDB-execution driving DEFERRED.** Each needs deeper DuckDB-execution
-  integration than the parser query-path interception:
-  - Optimizer: a real C++ `OptimizerExtension` (scaffolding exists in
-    `wasm_index_optimizer.cpp`) that flattens the plan to the neutral `plan-shape`,
-    calls a new `optimizer-host.call-optimize`, and applies the rewrite directive.
-    The `rewrite-query` directive needs a mid-optimize re-bind (a C++ Parser+Planner
-    pass); the `apply(structured-rewrite)` directive generalizes the existing
-    hard-coded index reroute.
-  - Window (aggregate+frame): the core must register the component's incremental
-    aggregate (init/update/combine/finalize via the C aggregate API) so DuckDB's
-    window machinery frames it, plus drive `aggregate-incr-dispatch.call-aggregate-
-    window`. `aggregate-incr-dispatch` is NOT yet wired core-side.
-  - Table-fn filter pushdown: the core must first register a STREAMING table
-    function driven through `table-stream-dispatch` (not yet wired core-side), then
-    pass pushed filters via `call-table-open-filtered`. The host-side drivers
-    (`table_stream_bindings`, `aggregate_incr_bindings`) already EXIST in
-    ducklink-runtime; the gap is the core connecting them to DuckDB execution.
+- **WINDOW (aggregate+frame) -- DONE, executes end-to-end (no new code).** The
+  core already registers component aggregates via the C aggregate API with real
+  init/update/combine/finalize callbacks (`aggregate_state_*`) that accumulate the
+  rows of each call and dispatch to the component. DuckDB's WINDOW machinery REUSES
+  those callbacks, calling update with the frame's rows + finalize per output row.
+  PROVEN: `harmonic_mean(x) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND
+  CURRENT ROW)` -> running harmonic mean `(1, 1.333, 1.714)`; a bounded sliding
+  frame `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` -> `(1, 1.333, 2.667, 4)`. The
+  explicit `aggregate-incr-dispatch.call-aggregate-window` contract entry is an
+  alternative path; execution rides DuckDB's framing of the registered aggregate.
+- **OPTIMIZER -- DONE, executes end-to-end.** A real C++ component-driven
+  `OptimizerExtension` (`core/cpp/wasm_component_optimizer.cpp`) flattens the bound
+  plan to neutral JSON, offers it to declared rules via the new `optimizer-host`
+  interface (+ `wasm_optimizer_rewrite` bridge -> the component's
+  `optimizer-dispatch.call-optimize`), and re-plans the returned `rewrite-query`
+  SQL in place (Parser+Planner). PROVEN: `LOAD qopt; SELECT x FROM optme` -> `99`
+  (the rule matches the GET on `optme` and rewrites the whole query).
+- **TABLE-FN FILTER PUSHDOWN -- DOCUMENTED, not yet wired (feasible via internal
+  C++, NOT via the stable C API).** Confirmed: the DuckDB stable C table-function
+  API exposes only PROJECTION pushdown (`duckdb_table_function_supports_projection_
+  pushdown` + `duckdb_init_get_column_index`); there is NO C entry point to mark a
+  table function filter-pushdown-capable or to read the pushed `TableFilter` set.
+  So `call-table-open-filtered` cannot be driven through the C API the component
+  table functions currently use. It IS feasible over the boundary -- the STORAGE
+  path already does by-value-safe filter pushdown (`storage.scan-filter` /
+  `compare-op` extracted in `core/cpp/wasm_storage.cpp`, which is an internal C++
+  `TableFunction` with `filter_pushdown = true`). The remaining work is a C++
+  STREAMING `TableFunction` shim (the `wasm_storage` pattern: `filter_pushdown =
+  true`; in init read `TableFunctionInitInput`'s filters + project list; open the
+  cursor via a new `table-stream-host.call-open-filtered` carrying the neutral
+  filter descriptor; `execute` pulls via `call-table-next`). The host-side driver
+  (`table_stream_bindings` in ducklink-runtime) already exists; the gap is the C++
+  streaming TableFunction + the `table-stream-host` interface + a streaming
+  component. This is the one remaining capability; it is additive within major-3.
 
-The PARSER pattern below was the template that landed; the remaining three follow
-the same host<->core shape (a new `<cap>-host` interface + a core hook).
+  Added constraint (why it is documented rather than wired now): the FROZEN
+  component-facing contract registers every table function through
+  `runtime.table-registry` with NO streaming / filter-pushdown marker, so the core
+  cannot tell a streaming+filterable table fn from a regular one at registration
+  time. Driving `call-table-open-filtered` therefore means either (a) a registration
+  marker -- a change to the frozen WIT surface, out of scope here -- or (b)
+  promoting ALL component table functions to internal C++ filter-pushdown
+  TableFunctions, which risks regressing the working C-API whole-batch `call-table`
+  path. Both are larger than an additive shim; hence documented with the plan above
+  rather than half-wired (the storage `scan-filter` path remains the proof that
+  by-value-safe filter pushdown reaches a component today).
 
 ## 1. Extend the host<->core drain protocol
 
