@@ -14,6 +14,23 @@ interface table-stream-host {
 
   type resultset = list<list<duckvalue>>;
 
+  // A streaming + filter-pushdown-capable table function a component declared
+  // (via the component-facing `table-stream.register-filterable-table` marker).
+  // The core pulls this list lazily (before queries, like collation/optimizer
+  // sync) and registers a real C++ streaming TableFunction (filter_pushdown =
+  // true) for each not-yet-seen entry. `arguments` are the positional argument
+  // types (name informational); `columns` is the emitted schema; `handle` is the
+  // global routable callback-handle threaded into ts-open-filtered/next/close.
+  record filterable-table {
+    name: string,
+    arguments: list<columndef>,
+    columns: list<columndef>,
+    handle: u32,
+  }
+
+  // Enumerate the filterable streaming table functions declared so far.
+  filterable-table-list: func() -> list<filterable-table>;
+
   // The pushed-down comparator. Mirrors table-stream-dispatch.filter-op.
   enum ts-filter-op {
     eq, ne, lt, le, gt, ge, is-in, is-null, is-not-null,

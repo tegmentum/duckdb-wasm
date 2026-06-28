@@ -12,6 +12,8 @@ use duckdb:extension/pragma-host@3.0.0;
 use duckdb:extension/parser-host@3.0.0;
 use duckdb:extension/optimizer-host@3.0.0;
 use duckdb:extension/files-host@3.0.0;
+// 3.1.0 additive: streaming/filter-pushdown table-fn core<->host bridge.
+use duckdb:extension/table-stream-host@3.0.0;
 use wasi:cli/environment@0.2.6;
 use wasi:cli/stdout@0.2.6;
 use wasi:cli/stderr@0.2.6;
@@ -267,6 +269,9 @@ world libduckdb {
     import duckdb:extension/parser-host@3.0.0;
     import duckdb:extension/optimizer-host@3.0.0;
     import duckdb:extension/files-host@3.0.0;
+    // 3.1.0 additive: the host provides this; the core drives a component's
+    // streaming filter-pushdown table fn through it (ts-open-filtered/next/close).
+    import duckdb:extension/table-stream-host@3.0.0;
     import tvm:memory/manager@0.1.0;
     import tvm:memory/bytes@0.1.0;
 

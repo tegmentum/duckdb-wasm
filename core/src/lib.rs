@@ -75,6 +75,11 @@ static STORAGE_REGISTERED_TYPES: OnceLock<Mutex<std::collections::HashSet<String
 /// re-registering on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
 static COLLATION_REGISTERED_NAMES: OnceLock<Mutex<std::collections::HashSet<String>>> =
     OnceLock::new();
+/// 3.1.0 additive minor: names of streaming/filter-pushdown table functions for
+/// which a C++ TableFunction has already been registered (avoids re-registering
+/// on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
+static FILTERABLE_TABLES_REGISTERED: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
 /// Item 4: pragmas components have declared (via `runtime.pragma-registry.register-call`),
 /// pulled through the `pragma-host.pragma-list` import. Maps the PRAGMA name the
 /// user types to the callback-dispatch handle for `callback-dispatch.call-pragma`.
@@ -145,6 +150,27 @@ extern "C" {
 // only when optimizer rules exist.
 extern "C" {
     fn wasm_register_component_optimizer(db: duckdb::duckdb_database);
+}
+
+// 3.1.0 additive minor: implemented in core/cpp/wasm_table_stream.cpp. Registers a
+// real streaming TableFunction (filter_pushdown = true) named `name` for a
+// component that declared a filterable table fn (via the component-facing
+// `table-stream.register-filterable-table` marker, surfaced through
+// `table-stream-host.filterable-table-list`). At scan time it reads the SQL
+// WHERE's pushed TableFilter set, maps it to the neutral ts-filter descriptor,
+// and drives the component via the `wasm_table_stream_*` bridge below ->
+// `table-stream-host` -> the component's `call-table-open-filtered`. Idempotent
+// (system-catalog CreateTableFunction with IGNORE_ON_CONFLICT). `arg_type_codes`
+// is a comma-joined list of duckdb_type codes; `cols_spec` is '\n'-joined
+// `name\t<code>` lines. Returns 0 on success.
+extern "C" {
+    fn wasm_register_filterable_table_function(
+        db: duckdb::duckdb_database,
+        name: *const c_char,
+        handle: u32,
+        arg_type_codes: *const c_char,
+        cols_spec: *const c_char,
+    ) -> i32;
 }
 
 // M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
@@ -812,6 +838,253 @@ pub extern "C" fn wasm_storage_scan_close(scan: u32) {
     let _ = sh::storage_scan_close(scan);
     if let Ok(mut m) = storage_scans().lock() {
         m.remove(&scan);
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// 3.1.0 additive minor: streaming + FILTER-PUSHDOWN table-fn bridge.
+//
+// The C++ streaming TableFunction (cpp/wasm_table_stream.cpp) calls these
+// extern-C fns; each routes to the host-provided `table-stream-host` import,
+// which the host forwards to the owning component's `table-stream-dispatch`
+// export (call-table-open-filtered / next / close). Mirrors the wasm_storage_*
+// scan bridge, but for a NAMED function with bound argument values.
+//===----------------------------------------------------------------------===//
+
+static TABLE_STREAM_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+
+fn ts_set_last_error(msg: String) {
+    let cell = TABLE_STREAM_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cell.lock() {
+        *guard = CString::new(msg).ok();
+    }
+}
+
+/// Most recent table-stream bridge error (owned by the core; valid until the next
+/// bridge call). Empty C string when none.
+#[no_mangle]
+pub extern "C" fn wasm_table_stream_last_error() -> *const c_char {
+    let cell = TABLE_STREAM_LAST_ERROR.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(s) => s.as_ptr(),
+            None => b"\0".as_ptr() as *const c_char,
+        },
+        Err(_) => b"\0".as_ptr() as *const c_char,
+    }
+}
+
+/// Per-cursor state: the emitted (post-projection) column types, used to drive
+/// `write_duckvalue_to_vector` in fill.
+struct WasmTsScanState {
+    column_types: Vec<Logicaltype>,
+}
+
+static TABLE_STREAM_SCANS: OnceLock<Mutex<HashMap<u32, WasmTsScanState>>> = OnceLock::new();
+
+fn table_stream_scans() -> &'static Mutex<HashMap<u32, WasmTsScanState>> {
+    TABLE_STREAM_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// C-ABI mirror of `WasmTsValue` in wasm_table_stream_bridge.h.
+#[repr(C)]
+pub struct WasmTsValue {
+    value_type: u8,
+    i64: i64,
+    f64: f64,
+    text: *const c_char,
+}
+
+/// C-ABI mirror of `WasmTsFilter` in wasm_table_stream_bridge.h.
+#[repr(C)]
+pub struct WasmTsFilter {
+    column: u32,
+    op: u8,
+    values: *const WasmTsValue,
+    nvalues: u32,
+}
+
+/// Build a Duckvalue from a tagged C value.
+unsafe fn ts_duckvalue_from_tagged(v: &WasmTsValue) -> Duckvalue {
+    match v.value_type {
+        1 => Duckvalue::Boolean(v.i64 != 0), // WASM_TS_VAL_BOOLEAN
+        2 => Duckvalue::Int64(v.i64),        // WASM_TS_VAL_INT64
+        3 => Duckvalue::Float64(v.f64),      // WASM_TS_VAL_FLOAT64
+        4 => {
+            // WASM_TS_VAL_TEXT
+            if v.text.is_null() {
+                Duckvalue::Text(String::new())
+            } else {
+                Duckvalue::Text(CStr::from_ptr(v.text).to_string_lossy().into_owned())
+            }
+        }
+        _ => Duckvalue::Null, // WASM_TS_VAL_NONE
+    }
+}
+
+/// Map a C-ABI ts-op code (WASM_TS_OP_*) to the table-stream-host TsFilterOp.
+fn ts_op_from_code(op: u8) -> Option<bindings::duckdb::extension::table_stream_host::TsFilterOp> {
+    use bindings::duckdb::extension::table_stream_host::TsFilterOp as Op;
+    Some(match op {
+        0 => Op::Eq,
+        1 => Op::Ne,
+        2 => Op::Lt,
+        3 => Op::Le,
+        4 => Op::Gt,
+        5 => Op::Ge,
+        6 => Op::IsIn,
+        7 => Op::IsNull,
+        8 => Op::IsNotNull,
+        _ => return None,
+    })
+}
+
+/// Open a streaming cursor for table fn `handle` with bound `args`, `projection`
+/// (real column indices, emit order; nproj==0 => all), and conjunctive `filters`.
+/// Returns a cursor handle, or 0 on error (message in wasm_table_stream_last_error).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_table_stream_open(
+    handle: u32,
+    args: *const WasmTsValue,
+    nargs: u32,
+    projection: *const u32,
+    nproj: u32,
+    filters: *const WasmTsFilter,
+    nfilt: u32,
+) -> u32 {
+    use bindings::duckdb::extension::table_stream_host as tsh;
+
+    let args_slice: &[WasmTsValue] = if args.is_null() || nargs == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(args, nargs as usize)
+    };
+    let arg_values: Vec<Duckvalue> = args_slice.iter().map(|a| ts_duckvalue_from_tagged(a)).collect();
+
+    let projection_slice: &[u32] = if projection.is_null() || nproj == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(projection, nproj as usize)
+    };
+
+    let filters_slice: &[WasmTsFilter] = if filters.is_null() || nfilt == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(filters, nfilt as usize)
+    };
+
+    let mut ts_filters: Vec<tsh::TsFilter> = Vec::with_capacity(filters_slice.len());
+    for f in filters_slice {
+        let op = match ts_op_from_code(f.op) {
+            Some(op) => op,
+            None => continue, // unknown op: skip (engine re-applies)
+        };
+        let vals_slice: &[WasmTsValue] = if f.values.is_null() || f.nvalues == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(f.values, f.nvalues as usize)
+        };
+        let values: Vec<Duckvalue> = vals_slice.iter().map(|v| ts_duckvalue_from_tagged(v)).collect();
+        ts_filters.push(tsh::TsFilter {
+            column: f.column,
+            op,
+            values,
+        });
+    }
+
+    clog!(
+        "[table-stream] core open handle={handle} args={} projection={:?} nfilt={}",
+        arg_values.len(),
+        projection_slice,
+        ts_filters.len()
+    );
+
+    match tsh::ts_open_filtered(handle, &arg_values, projection_slice, &ts_filters) {
+        Ok(open) => {
+            let column_types: Vec<Logicaltype> =
+                open.columns.iter().map(|c| c.logical.clone()).collect();
+            table_stream_scans()
+                .lock()
+                .map(|mut m| m.insert(open.cursor, WasmTsScanState { column_types }))
+                .ok();
+            open.cursor
+        }
+        Err(err) => {
+            ts_set_last_error(format!("table-stream open failed: {err:?}"));
+            0
+        }
+    }
+}
+
+/// Pull the next batch into `chunk` (a `duckdb_data_chunk` raw handle). Returns
+/// true if rows were written, false at EOF (chunk size 0) or on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_table_stream_fill(handle: u32, cursor: u32, chunk: *mut c_void) -> bool {
+    use bindings::duckdb::extension::table_stream_host as tsh;
+
+    let output = chunk as duckdb::duckdb_data_chunk;
+    if output.is_null() {
+        ts_set_last_error("wasm_table_stream_fill: null chunk".to_string());
+        return false;
+    }
+
+    let column_types: Vec<Logicaltype> = match table_stream_scans().lock() {
+        Ok(m) => match m.get(&cursor) {
+            Some(state) => state.column_types.clone(),
+            None => {
+                ts_set_last_error(format!("wasm_table_stream_fill: unknown cursor {cursor}"));
+                return false;
+            }
+        },
+        Err(_) => {
+            ts_set_last_error("wasm_table_stream_fill: scan map poisoned".to_string());
+            return false;
+        }
+    };
+
+    let rows = match tsh::ts_next(handle, cursor, 2048) {
+        Ok(rows) => rows,
+        Err(err) => {
+            ts_set_last_error(format!("table-stream next failed: {err:?}"));
+            return false;
+        }
+    };
+
+    if rows.is_empty() {
+        duckdb::duckdb_data_chunk_set_size(output, 0);
+        return false;
+    }
+
+    duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
+    let ncols = column_types.len();
+    for col_idx in 0..ncols {
+        let vector = duckdb::duckdb_data_chunk_get_vector(output, col_idx as duckdb::idx_t);
+        let logical = &column_types[col_idx];
+        for (row, row_values) in rows.iter().enumerate() {
+            if row_values.len() != ncols {
+                ts_set_last_error(format!(
+                    "wasm_table_stream_fill: row {row} has {} cols, expected {ncols}",
+                    row_values.len()
+                ));
+                return false;
+            }
+            let value = row_values[col_idx].clone();
+            if let Err(err) = write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, value) {
+                ts_set_last_error(format_duckerror(&err));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Close + free a streaming cursor.
+#[no_mangle]
+pub extern "C" fn wasm_table_stream_close(handle: u32, cursor: u32) {
+    use bindings::duckdb::extension::table_stream_host as tsh;
+    let _ = tsh::ts_close(handle, cursor);
+    if let Ok(mut m) = table_stream_scans().lock() {
+        m.remove(&cursor);
     }
 }
 
@@ -3416,6 +3689,11 @@ impl ConnectionState {
         // Item 2: register any collations components have declared (mid-session).
         self.sync_collations();
 
+        // 3.1.0 additive minor: register a real streaming + filter-pushdown
+        // TableFunction for each filterable table fn a component declared (via the
+        // `table-stream` marker, surfaced through table-stream-host).
+        self.sync_filterable_tables();
+
         // Item 4: pull any pragmas components have declared (mid-session) into the
         // process-wide registry, so `PRAGMA <name>(...)` can be intercepted.
         sync_pragmas();
@@ -3438,6 +3716,71 @@ impl ConnectionState {
                     wasm_register_storage_extension(self.database, c_type.as_ptr());
                 }
                 guard.insert(type_name);
+            }
+        }
+    }
+
+    /// 3.1.0 additive minor: pulls the streaming + filter-pushdown table functions
+    /// components have declared (via the `table-stream.register-filterable-table`
+    /// marker, surfaced through `table-stream-host.filterable-table-list`) and
+    /// registers a real C++ streaming `TableFunction` (filter_pushdown = true) for
+    /// each not-yet-seen one. Mid-session safe: registration uses the system
+    /// catalog with IGNORE_ON_CONFLICT, and we dedup-guard here. Called lazily
+    /// before each query, like `sync_collations`.
+    fn sync_filterable_tables(&self) {
+        let tables = bindings::duckdb::extension::table_stream_host::filterable_table_list();
+        if tables.is_empty() {
+            return;
+        }
+        let seen = FILTERABLE_TABLES_REGISTERED.get_or_init(|| Mutex::new(Default::default()));
+        let mut guard = match seen.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for t in tables {
+            if guard.contains(&t.name) {
+                continue;
+            }
+            // Positional arg type codes (comma-joined duckdb_type codes).
+            let arg_codes = t
+                .arguments
+                .iter()
+                .map(|a| storage_logicaltype_to_code(&a.logical).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            // Emitted column schema as '\n'-joined `name\t<code>` lines.
+            let cols_spec = t
+                .columns
+                .iter()
+                .map(|c| format!("{}\t{}", c.name, storage_logicaltype_to_code(&c.logical)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (name_c, args_c, cols_c) = match (
+                CString::new(t.name.as_str()),
+                CString::new(arg_codes),
+                CString::new(cols_spec),
+            ) {
+                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                _ => continue,
+            };
+            let rc = unsafe {
+                wasm_register_filterable_table_function(
+                    self.database,
+                    name_c.as_ptr(),
+                    t.handle,
+                    args_c.as_ptr(),
+                    cols_c.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                clog!(
+                    "[table-stream] registered filterable table fn '{}' (handle={})",
+                    t.name,
+                    t.handle
+                );
+                guard.insert(t.name);
+            } else {
+                clog!("[table-stream] failed to register filterable table fn '{}'", t.name);
             }
         }
     }

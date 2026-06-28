@@ -23,6 +23,11 @@ fn main() {
     // that flattens the plan to JSON, offers it to declared optimizer components,
     // and re-plans the returned rewrite SQL. Same wasi-sdk flags.
     build_wasm_cpp("wasm_component_optimizer.cpp");
+    // 3.1.0 additive minor: the streaming + FILTER-PUSHDOWN TableFunction
+    // (cpp/wasm_table_stream.cpp) for a component that declared a filterable table
+    // fn. Reads the pushed TableFilter set, maps it to the neutral ts-filter
+    // descriptor, and drives the component via table-stream-host. Same flags.
+    build_wasm_cpp("wasm_table_stream.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
