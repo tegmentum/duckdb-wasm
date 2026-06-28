@@ -137,6 +137,16 @@ extern "C" {
     );
 }
 
+// 2.3.0 / v3: implemented in core/cpp/wasm_component_optimizer.cpp. Registers a
+// component-driven OptimizerExtension on the database that flattens the bound
+// logical plan to JSON, offers it to declared optimizer rules (via the
+// `wasm_optimizer_rewrite` bridge below -> `optimizer-host`), and re-plans the
+// returned rewrite SQL in place. Idempotent (process-wide once-guard); registered
+// only when optimizer rules exist.
+extern "C" {
+    fn wasm_register_component_optimizer(db: duckdb::duckdb_database);
+}
+
 // M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
 // WasmTableEntry call these extern-C fns; each routes to the host-provided
 // `duckdb:extension/storage-host` import, which the host forwards to the
@@ -478,6 +488,42 @@ pub extern "C" fn wasm_index_drop(handle: u32) -> i32 {
 /// `query` is `dims` contiguous f32. On success, writes up to `k` rowids into
 /// the caller-provided `out_rowids` buffer (length >= k) and returns the count
 /// written (0..=k). Returns -1 on error (message in `wasm_index_last_error`).
+/// 2.3.0 / v3: offer the flattened plan JSON to every declared component optimizer
+/// rule (via `optimizer-host`); return the first rule's rewrite SQL as a malloc'd
+/// C string (freed by `wasm_optimizer_free`), or NULL if none rewrote it. Called
+/// by the C++ WasmComponentOptimizer at optimize time.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_optimizer_rewrite(plan_json: *const c_char) -> *mut c_char {
+    if plan_json.is_null() {
+        return ptr::null_mut();
+    }
+    let pj = match CStr::from_ptr(plan_json).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return ptr::null_mut(),
+    };
+    let specs = bindings::duckdb::extension::optimizer_host::optimizer_list();
+    for spec in specs {
+        match bindings::duckdb::extension::optimizer_host::call_optimize(spec.callback_handle, &pj)
+        {
+            Ok(Some(sql)) => {
+                return CString::new(sql)
+                    .map(|c| c.into_raw())
+                    .unwrap_or(ptr::null_mut());
+            }
+            _ => continue,
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Free a C string returned by `wasm_optimizer_rewrite`.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_optimizer_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(CString::from_raw(ptr));
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wasm_index_search(
     handle: u32,
@@ -3354,6 +3400,16 @@ impl ConnectionState {
                 unsafe {
                     wasm_register_index_type(self.database, c_type.as_ptr());
                 }
+            }
+        }
+
+        // 2.3.0 / v3: if any component declared an optimizer rule, register the
+        // component-driven OptimizerExtension once (idempotent C++ guard). At
+        // optimize time it flattens the plan + offers it to the rules via the
+        // wasm_optimizer_rewrite bridge.
+        if !bindings::duckdb::extension::optimizer_host::optimizer_list().is_empty() {
+            unsafe {
+                wasm_register_component_optimizer(self.database);
             }
         }
 

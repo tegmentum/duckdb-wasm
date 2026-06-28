@@ -19,6 +19,10 @@ fn main() {
     // auto-rewrites `ORDER BY array_distance(col, const) LIMIT k` into a
     // wasm-index scan. Same flags; shares wasm_index.hpp with wasm_index.cpp.
     build_wasm_cpp("wasm_index_optimizer.cpp");
+    // 2.3.0 / v3: the component-driven optimizer rule (cpp/wasm_component_optimizer.cpp)
+    // that flattens the plan to JSON, offers it to declared optimizer components,
+    // and re-plans the returned rewrite SQL. Same wasi-sdk flags.
+    build_wasm_cpp("wasm_component_optimizer.cpp");
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
