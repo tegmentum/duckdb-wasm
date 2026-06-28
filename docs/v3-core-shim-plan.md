@@ -1,22 +1,36 @@
-# v3 core-shim wiring plan (parser + general optimizer)
+# v3 core-shim wiring status (parser DONE; optimizer/window/filter remaining)
 
-Status: **DEFERRED core-shim work for the `duckdb:extension@2.3.0` (v3) contract.**
+Status (2026-06-28, major-3 baseline `duckdb:extension@3.0.0`):
 
-The v3 WIT contract (in tegmentum/ducklink, branch `feat/wit-v3`) added two new
-advanced-tier capabilities that need a wasm-core C++ shim, plus a host<->core drain
-extension. The CONTRACT, host capture wiring, ggsql PoC component, freeze policy,
-leak audit, and stable-C peg are DONE and verified. This doc is the remaining
-core-shim integration, anchored to the exact files, so it can land as a focused
-follow-up (it needs a full `build-libduckdb-wasm.sh` + `make core` cycle to verify,
-which is why it is split out).
+- **PARSER -- DONE, executes end-to-end.** The core (`core/src/lib.rs`) imports a
+  new `parser-host` interface and intercepts in `execute`: when the built-in parser
+  rejects a statement, it offers the text to each declared parser extension via
+  `parser-host.call-parse` and runs the returned string->SQL rewrite. The host
+  (ducklink-host) provides `parser-host` and routes `call-parse` to the owning
+  component's `parser-dispatch` export. PROVEN: `LOAD ggsql; VISUALIZE SELECT
+  'apple' AS label, 3 AS n UNION ALL SELECT 'pear', 1` returns
+  `(apple,3,###) (pear,1,#)`.
+- **OPTIMIZER / WINDOW / TABLE-FN FILTER PUSHDOWN -- contract + host capture done;
+  DuckDB-execution driving DEFERRED.** Each needs deeper DuckDB-execution
+  integration than the parser query-path interception:
+  - Optimizer: a real C++ `OptimizerExtension` (scaffolding exists in
+    `wasm_index_optimizer.cpp`) that flattens the plan to the neutral `plan-shape`,
+    calls a new `optimizer-host.call-optimize`, and applies the rewrite directive.
+    The `rewrite-query` directive needs a mid-optimize re-bind (a C++ Parser+Planner
+    pass); the `apply(structured-rewrite)` directive generalizes the existing
+    hard-coded index reroute.
+  - Window (aggregate+frame): the core must register the component's incremental
+    aggregate (init/update/combine/finalize via the C aggregate API) so DuckDB's
+    window machinery frames it, plus drive `aggregate-incr-dispatch.call-aggregate-
+    window`. `aggregate-incr-dispatch` is NOT yet wired core-side.
+  - Table-fn filter pushdown: the core must first register a STREAMING table
+    function driven through `table-stream-dispatch` (not yet wired core-side), then
+    pass pushed filters via `call-table-open-filtered`. The host-side drivers
+    (`table_stream_bindings`, `aggregate_incr_bindings`) already EXIST in
+    ducklink-runtime; the gap is the core connecting them to DuckDB execution.
 
-What already works without this: the host (ducklink-runtime) CAPTURES parser and
-optimizer registrations (`ExtensionStoreState::register_parser_extension` /
-`register_optimizer_rule` -> `pending_parsers` / `pending_optimizers`, drained via
-`take_pending_parsers` / `take_pending_optimizers`). The ggsql PoC loads and the
-registration is captured ("registered parser extension 'ggsql'"). The missing piece
-is the CORE applying those registrations to DuckDB and driving the component's
-`parser-dispatch` / `optimizer-dispatch` exports.
+The PARSER pattern below was the template that landed; the remaining three follow
+the same host<->core shape (a new `<cap>-host` interface + a core hook).
 
 ## 1. Extend the host<->core drain protocol
 
