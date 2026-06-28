@@ -29,6 +29,7 @@ mod tvm_spill;
 use bindings::duckdb::component::extension_loader_hooks;
 use bindings::duckdb::extension::callback_dispatch;
 use bindings::duckdb::extension::pragma_host;
+use bindings::duckdb::extension::parser_host;
 use bindings::duckdb::extension::types::{
     Complexvalue, Configerror, Decimalvalue, Duckvalue, Funcflags, Intervalvalue, Logfield,
     Logicaltype, Loglevel, Uuidvalue,
@@ -82,6 +83,12 @@ static COLLATION_REGISTERED_NAMES: OnceLock<Mutex<std::collections::HashSet<Stri
 /// RETURNS a SQL script as text -- no mid-callback re-entry into SQL) and then runs
 /// that script on the same connection.
 static DECLARED_PRAGMAS: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
+/// 2.3.0 / v3: parser extensions components have declared (via
+/// `parser.register-parser-extension`), pulled through `parser-host.parser-list`.
+/// When the built-in parser rejects a statement, the core offers it to each
+/// declared parser (`parser-host.call-parse`); the component returns a string->SQL
+/// rewrite the core runs in its place. (name, callback-handle).
+static DECLARED_PARSERS: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
 /// Registered replacement scans (file extension -> table function name).
 static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::new();
 /// Databases that already have the global replacement-scan callback installed.
@@ -3427,8 +3434,58 @@ impl ConnectionState {
         if let Some(result) = self.run_intercepted_pragma(sql)? {
             return Ok(result);
         }
-        let (columns, rows) = self.collect_rows(sql)?;
-        Ok(QueryResult { columns, rows })
+        match self.collect_rows(sql) {
+            Ok((columns, rows)) => Ok(QueryResult { columns, rows }),
+            // 2.3.0 / v3: the built-in parser rejected this statement. Offer it to
+            // any component-declared PARSER extension; if one claims it (returns a
+            // string->SQL rewrite), run the rewrite in its place. This is the
+            // by-value-safe ParserExtension path (text in, SQL out) -- mirrors the
+            // pragma returns-SQL interception. If no parser claims it, surface the
+            // original error.
+            Err(orig) => match self.run_intercepted_parser(sql)? {
+                Some(result) => Ok(result),
+                None => Err(orig),
+            },
+        }
+    }
+
+    /// 2.3.0 / v3: offer `sql` (which the built-in parser rejected) to each
+    /// component-declared parser extension via `parser-host.call-parse`. The first
+    /// that returns `some(rewrite)` wins: the core runs the rewrite SQL on this
+    /// connection and returns its result. Returns `Ok(None)` if none claim it.
+    fn run_intercepted_parser(&self, sql: &str) -> Result<Option<QueryResult>, DuckDbError> {
+        sync_parsers();
+        let handles: Vec<(String, u32)> = {
+            let guard = declared_parsers()
+                .lock()
+                .expect("declared parsers mutex poisoned");
+            if guard.is_empty() {
+                return Ok(None);
+            }
+            guard.clone()
+        };
+        for (_name, handle) in handles {
+            let rewrite = parser_host::call_parse(handle, sql)
+                .map_err(|err| DuckDbError::message(format_duckerror(&err)))?;
+            let script = match rewrite {
+                Some(s) => s,
+                None => continue, // this parser declined; try the next
+            };
+            // Run the rewrite on this connection. Multiple statements are separated
+            // by ';'; return the LAST statement's result (so `VISUALIZE SELECT ...`
+            // yields the rewritten query's rows).
+            let mut last: Option<(Vec<Columndef>, Vec<Row>)> = None;
+            for statement in split_sql_statements(&script) {
+                let trimmed = statement.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                last = Some(self.collect_rows(trimmed)?);
+            }
+            let (columns, rows) = last.unwrap_or_else(|| (Vec::new(), Vec::new()));
+            return Ok(Some(QueryResult { columns, rows }));
+        }
+        Ok(None)
     }
 
     /// Item 4: if `sql` is `PRAGMA <name>(...)` for a component-declared pragma,
@@ -5216,6 +5273,28 @@ struct AggregateState {
 
 fn declared_pragmas() -> &'static Mutex<std::collections::HashMap<String, u32>> {
     DECLARED_PRAGMAS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn declared_parsers() -> &'static Mutex<Vec<(String, u32)>> {
+    DECLARED_PARSERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 2.3.0 / v3: pull the parser extensions components have declared into the
+/// registry (declared at LOAD; the pull is lazy, mirroring sync_pragmas).
+fn sync_parsers() {
+    let specs = parser_host::parser_list();
+    if specs.is_empty() {
+        return;
+    }
+    let mut guard = match declared_parsers().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    for spec in specs {
+        if !guard.iter().any(|(_, h)| *h == spec.callback_handle) {
+            guard.push((spec.name, spec.callback_handle));
+        }
+    }
 }
 
 /// Pull the pragmas components have declared (via the `pragma-host.pragma-list`
