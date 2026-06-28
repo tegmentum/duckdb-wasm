@@ -27,8 +27,46 @@ Status (2026-06-28, major-3 baseline `duckdb:extension@3.0.0`):
   `optimizer-dispatch.call-optimize`), and re-plans the returned `rewrite-query`
   SQL in place (Parser+Planner). PROVEN: `LOAD qopt; SELECT x FROM optme` -> `99`
   (the rule matches the GET on `optme` and rewrites the whole query).
-- **TABLE-FN FILTER PUSHDOWN -- DOCUMENTED, not yet wired (feasible via internal
-  C++, NOT via the stable C API).** Confirmed: the DuckDB stable C table-function
+- **TABLE-FN FILTER PUSHDOWN -- ADDITIVE MARKER LANDED @3.1.0; core-shim DESIGN
+  COMPLETE; host-mediated SQL run is the remaining integration step.** Update
+  (2026-06-28): the registration-marker blocker called out below was resolved as
+  a SANCTIONED ADDITIVE MINOR (the first off the frozen major-3 baseline, the
+  proof the freeze policy's additive growth-path works). Landed on the ducklink
+  branch `feat/wit-3.1-filterpushdown`:
+    - a NEW component-facing `table-stream` registration interface (opt-in marker,
+      `register-filterable-table`) in a new opt-in world -- NO edit to the shared
+      types/runtime enums (freeze rule 3). CONTRACT_MINOR 0->1, digest
+      80d5951b -> 1b94f15d; catalog re-stamped + verified; existing @3.0.0
+      components load UN-REBUILT on the 3.1.0 host (proven by a runtime test).
+    - the host driver `ExtensionInstance::table_open_filtered` over the (already
+      @3.0.0) `table-stream-dispatch.call-table-open-filtered`, plus a routable
+      global callback-handle for the registered streaming fn.
+    - PROVEN at the WIT boundary: the `numstream` component prunes rows AT THE
+      SOURCE from the pushed-down neutral filter descriptor crossing the boundary
+      (`v > 5` -> 6,7,8,9; `v > 2 AND v <= 6` -> 3,4,5,6), via the
+      `table-stream-boundary-test` crate (mirrors the storage scan-filter proof).
+  REMAINING (this core, host-mediated SQL): the by-value-safe core<->host bridge
+  is designed as `table-stream-host` (added here, UNWIRED into the libduckdb world
+  so this commit is non-breaking) -- mirrors `storage-host`: `ts-open-filtered`
+  (handle, args, projection, ts-filter[]) / `ts-next` / `ts-close`. The C++ shim
+  is a near-copy of `wasm_storage.cpp`'s scan TableFunction (filter_pushdown =
+  true; init reads `column_ids` + `filters`; flatten to the neutral descriptor;
+  `wasm_table_stream_open/fill/close` extern-C bridges -> the imported
+  `table-stream-host`), registered by NAME (ExtensionUtil::RegisterFunction) from
+  a new `filterable-tables` list added to `extension-loader-hooks.pending-
+  registrations`, populated host-side from `take_pending_filterable_tables`.
+  Why this slice is NOT wired in this isolated pass: it is a COORDINATED
+  core+host change, and `ducklink-host`'s core bindgen reads the SIBLING main
+  duckdb-wasm checkout's `core/wit` (path `../../../duckdb-wasm/core/wit`), so a
+  core-world import of `table-stream-host` cannot be matched by a host provider
+  without either editing the main duckdb-wasm working tree (which a concurrent
+  agent is merging into) or hacking the bindgen path -- neither is permitted under
+  the isolation constraint. The interface + plan are landed so integration is a
+  mechanical wiring step once the branches merge; the boundary test already
+  proves the filter reaches the component and prunes.
+
+- **TABLE-FN FILTER PUSHDOWN (original v3 finding) -- feasible via internal
+  C++, NOT via the stable C API.** Confirmed: the DuckDB stable C table-function
   API exposes only PROJECTION pushdown (`duckdb_table_function_supports_projection_
   pushdown` + `duckdb_init_get_column_index`); there is NO C entry point to mark a
   table function filter-pushdown-capable or to read the pushed `TableFilter` set.
