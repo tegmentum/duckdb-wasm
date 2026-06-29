@@ -5557,7 +5557,12 @@ struct ScalarFunctionEntry {
 // The algorithm lives in a WIT-free crate (e.g. `isin`) shared with the
 // component build; only the Duckvalue glue is here.
 
-#[cfg(feature = "embed-isin")]
+#[cfg(any(
+    feature = "embed-isin",
+    feature = "embed-aba",
+    feature = "embed-fnv1a",
+    feature = "embed-siphash"
+))]
 fn register_embedded_scalar(
     name: &str,
     arguments: Vec<Logicaltype>,
@@ -5585,6 +5590,67 @@ fn embed_arg_text(args: &[Duckvalue], i: usize, fname: &str) -> Result<String, D
             "{fname}: expected VARCHAR argument at position {i}"
         ))),
     }
+}
+
+/// Borrow a VARCHAR argument, mapping SQL NULL to `None` (so the embedded
+/// function can propagate NULL). Any non-text, non-null value is an error.
+#[cfg(any(feature = "embed-aba", feature = "embed-fnv1a", feature = "embed-siphash"))]
+fn embed_opt_text<'a>(
+    args: &'a [Duckvalue],
+    i: usize,
+    fname: &str,
+) -> Result<Option<&'a str>, Duckerror> {
+    match args.get(i) {
+        Some(Duckvalue::Text(s)) => Ok(Some(s.as_str())),
+        Some(Duckvalue::Null) | None => Ok(None),
+        _ => Err(Duckerror::Invalidargument(format!(
+            "{fname}: expected VARCHAR argument at position {i}"
+        ))),
+    }
+}
+
+/// Read an integer key argument as u64 (NULL or absent -> 0), matching the
+/// siphash component's `key()` helper.
+#[cfg(feature = "embed-siphash")]
+fn embed_key_u64(args: &[Duckvalue], i: usize) -> u64 {
+    match args.get(i) {
+        Some(Duckvalue::Int64(n)) => *n as u64,
+        Some(Duckvalue::Uint64(n)) => *n,
+        _ => 0,
+    }
+}
+
+/// ABA routing-number validate, byte-for-byte from aba-core::logic::validate
+/// (collect digits ignoring whitespace/hyphens; 9-digit weighted checksum).
+#[cfg(feature = "embed-aba")]
+fn embed_aba_validate(s: &str) -> bool {
+    let mut num: Vec<u32> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_whitespace() || c == '-' {
+            continue;
+        }
+        match c.to_digit(10) {
+            Some(d) => num.push(d),
+            None => return false,
+        }
+    }
+    if num.len() != 9 {
+        return false;
+    }
+    let w = [3u32, 7, 1, 3, 7, 1, 3, 7, 1];
+    let sum: u32 = num.iter().zip(w).map(|(&d, k)| d * k).sum();
+    sum % 10 == 0
+}
+
+/// FNV-1a 64-bit over bytes, byte-for-byte from the checksums component.
+#[cfg(feature = "embed-fnv1a")]
+fn embed_fnv1a_64(b: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &x in b {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Push the definitions for every compiled-in extension once; they are then
@@ -5615,6 +5681,52 @@ fn register_embedded_extensions() {
             |args| match isin::check_digit(&embed_arg_text(args, 0, "isin_check_digit")?) {
                 Some(d) => Ok(Duckvalue::Int64(d)),
                 None => Ok(Duckvalue::Null),
+            },
+        );
+    }
+    #[cfg(feature = "embed-aba")]
+    {
+        register_embedded_scalar(
+            "aba_validate",
+            vec![Logicaltype::Text],
+            Logicaltype::Boolean,
+            |args| match embed_opt_text(args, 0, "aba_validate")? {
+                Some(s) => Ok(Duckvalue::Boolean(embed_aba_validate(s))),
+                None => Ok(Duckvalue::Boolean(false)),
+            },
+        );
+    }
+    #[cfg(feature = "embed-fnv1a")]
+    {
+        register_embedded_scalar(
+            "fnv1a_64",
+            vec![Logicaltype::Text],
+            Logicaltype::Uint64,
+            |args| match embed_opt_text(args, 0, "fnv1a_64")? {
+                Some(s) => Ok(Duckvalue::Uint64(embed_fnv1a_64(s.as_bytes()))),
+                None => Ok(Duckvalue::Null),
+            },
+        );
+    }
+    #[cfg(feature = "embed-siphash")]
+    {
+        register_embedded_scalar(
+            "siphash",
+            vec![Logicaltype::Int64, Logicaltype::Int64, Logicaltype::Text],
+            Logicaltype::Uint64,
+            |args| {
+                use std::hash::Hasher;
+                match embed_opt_text(args, 2, "siphash")? {
+                    Some(s) => {
+                        let mut hasher = siphasher::sip::SipHasher13::new_with_keys(
+                            embed_key_u64(args, 0),
+                            embed_key_u64(args, 1),
+                        );
+                        hasher.write(s.as_bytes());
+                        Ok(Duckvalue::Uint64(hasher.finish()))
+                    }
+                    None => Ok(Duckvalue::Null),
+                }
             },
         );
     }

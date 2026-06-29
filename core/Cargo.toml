@@ -20,16 +20,28 @@ arrow-schema = { version = "53", default-features = false, features = ["ffi"] }
 arrow-data = { version = "53", default-features = false, features = ["ffi"] }
 arrow-ipc = { version = "53", default-features = false }
 
-# NOTE: the embed framework (compile a WIT-free algorithm crate directly into
-# the core as a native scalar) lives in this crate, but the concrete embeddable
-# extensions (isin, ...) and their `embed-<name>` features stay ducklink-side —
-# this repo ships pure DuckDB with no path-deps back into ducklink/extensions.
+# Optional algorithm dep for the `embed-siphash` benchmark build only (off by
+# default; keyed SipHash-1-3, byte-identical to the siphash component).
+siphasher = { version = "1.0.3", optional = true }
+
+# NOTE: the embed framework (compile an extension's algorithm directly into the
+# core as a native scalar -- no WIT boundary) lives in this crate. The shipped
+# build embeds nothing (the embed-* features are off by default), so the repo
+# still ships pure DuckDB. The embeddable algorithms here are INLINED (no
+# path-deps back into ducklink/extensions): aba_validate + fnv1a_64 are tiny and
+# copied byte-for-byte from their components; siphash uses the `siphasher` crate.
+# These features exist to produce the near-native "embedded" cells of the
+# native-vs-wasm benchmark matrix (benches/native-vs-wasm in ducklink).
 
 [features]
 default = ["wasi"]
 wasi = ["fs_shims"]
 browser = []
 fs_shims = []
+# Embed an extension's scalar(s) into the core (benchmark builds; one per core).
+embed-aba = []
+embed-fnv1a = []
+embed-siphash = ["dep:siphasher"]
 
 [build-dependencies]
 cc = "1.0"
