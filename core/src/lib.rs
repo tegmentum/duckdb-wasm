@@ -5081,6 +5081,8 @@ unsafe fn execute_cast(
     let column = ScalarInputColumn {
         vector: input,
         logical: entry.source.clone(),
+        data: duckdb::duckdb_vector_get_data(input),
+        validity: duckdb::duckdb_vector_get_validity(input),
     };
     for row in 0..count {
         let value = read_scalar_argument(&column, row)?;
@@ -5615,6 +5617,25 @@ fn register_embedded_extensions() {
 struct ScalarInputColumn {
     vector: duckdb::duckdb_vector,
     logical: Logicaltype,
+    // Per-column hoist: the data + validity pointers are constant for the
+    // whole chunk, so they are fetched ONCE here (in `execute_scalar_function`)
+    // instead of once per CELL. The previous shape called
+    // `duckdb_vector_get_data` + `duckdb_vector_get_validity` (two FFI calls)
+    // for every (row, column) pair -- ~2 * rows * cols redundant FFI crossings
+    // per chunk. `read_scalar_argument` now reads from these cached pointers and
+    // decodes the validity bitmap inline (no per-row `duckdb_validity_row_is_valid`
+    // FFI call). Mirrors the native bridge's column-major `read_col_into` win.
+    data: *mut c_void,
+    validity: *mut u64,
+}
+
+/// Inline decode of DuckDB's validity bitmap (a `u64` array; bit `row` set =
+/// valid). Replaces the per-row `duckdb_validity_row_is_valid` FFI call so a
+/// validity check is a couple of arithmetic ops, not a boundary crossing. A
+/// null `validity` pointer means the vector has no NULLs (all rows valid).
+#[inline]
+unsafe fn validity_row_is_valid(validity: *const u64, row: usize) -> bool {
+    validity.is_null() || (*validity.add(row >> 6) >> (row & 63)) & 1 != 0
 }
 
 #[derive(Debug)]
@@ -6738,9 +6759,13 @@ unsafe fn execute_scalar_function(
     let mut columns = Vec::with_capacity(entry.definition.arguments.len());
     for (idx, logical) in entry.definition.arguments.iter().enumerate() {
         let vector = duckdb::duckdb_data_chunk_get_vector(input, idx as duckdb::idx_t);
+        // Hoist the data + validity pointers ONCE per column (constant for the
+        // whole chunk) instead of re-fetching them per cell in the row loop.
         columns.push(ScalarInputColumn {
             vector,
             logical: logical.clone(),
+            data: duckdb::duckdb_vector_get_data(vector),
+            validity: duckdb::duckdb_vector_get_validity(vector),
         });
     }
 
@@ -7140,9 +7165,12 @@ unsafe fn aggregate_state_update_impl(
     }
     let mut columns = Vec::with_capacity(entry.definition.arguments.len());
     for (idx, logical) in entry.definition.arguments.iter().enumerate() {
+        let vector = duckdb::duckdb_data_chunk_get_vector(input, idx as duckdb::idx_t);
         columns.push(ScalarInputColumn {
-            vector: duckdb::duckdb_data_chunk_get_vector(input, idx as duckdb::idx_t),
+            vector,
             logical: logical.clone(),
+            data: duckdb::duckdb_vector_get_data(vector),
+            validity: duckdb::duckdb_vector_get_validity(vector),
         });
     }
 
@@ -7277,36 +7305,35 @@ unsafe fn read_scalar_argument(
     column: &ScalarInputColumn,
     row: duckdb::idx_t,
 ) -> Result<Duckvalue, Duckerror> {
-    let validity = duckdb::duckdb_vector_get_validity(column.vector);
-    let is_valid = validity.is_null() || duckdb::duckdb_validity_row_is_valid(validity, row);
-    if !is_valid {
+    // Cached per-column validity pointer + inline bitmap decode (no per-cell FFI).
+    if !validity_row_is_valid(column.validity, row as usize) {
         return Ok(Duckvalue::Null);
     }
 
     match &column.logical {
         Logicaltype::Boolean => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut bool;
+            let data = column.data as *mut bool;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Boolean(value))
         }
         Logicaltype::Int64 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let data = column.data as *mut i64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Int64(value))
         }
         Logicaltype::Uint64 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u64;
+            let data = column.data as *mut u64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Uint64(value))
         }
         Logicaltype::Float64 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut f64;
+            let data = column.data as *mut f64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Float64(value))
         }
         Logicaltype::Text => {
             let data =
-                duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_string_t;
+                column.data as *mut duckdb::duckdb_string_t;
             let string_value = ptr::read(data.add(row as usize));
             let bytes = duckdb_string_to_vec(string_value);
             let text = String::from_utf8(bytes).map_err(|_| {
@@ -7316,73 +7343,73 @@ unsafe fn read_scalar_argument(
         }
         Logicaltype::Blob => {
             let data =
-                duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_string_t;
+                column.data as *mut duckdb::duckdb_string_t;
             let string_value = ptr::read(data.add(row as usize));
             Ok(Duckvalue::Blob(duckdb_string_to_vec(string_value)))
         }
         Logicaltype::Int32 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i32;
+            let data = column.data as *mut i32;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Int32(value))
         }
         Logicaltype::Timestamp => {
             // DUCKDB_TYPE_TIMESTAMP is physically an int64 of micros since 1970.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let data = column.data as *mut i64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Timestamp(value))
         }
         Logicaltype::Int8 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i8;
+            let data = column.data as *mut i8;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Int8(value))
         }
         Logicaltype::Int16 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i16;
+            let data = column.data as *mut i16;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Int16(value))
         }
         Logicaltype::Uint8 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u8;
+            let data = column.data as *mut u8;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Uint8(value))
         }
         Logicaltype::Uint16 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u16;
+            let data = column.data as *mut u16;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Uint16(value))
         }
         Logicaltype::Uint32 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut u32;
+            let data = column.data as *mut u32;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Uint32(value))
         }
         Logicaltype::Float32 => {
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut f32;
+            let data = column.data as *mut f32;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Float32(value))
         }
         Logicaltype::Date => {
             // DUCKDB_TYPE_DATE is physically an int32 of days since 1970-01-01.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i32;
+            let data = column.data as *mut i32;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Date(value))
         }
         Logicaltype::Time => {
             // DUCKDB_TYPE_TIME is physically an int64 of micros since midnight.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let data = column.data as *mut i64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Time(value))
         }
         Logicaltype::Timestamptz => {
             // DUCKDB_TYPE_TIMESTAMP_TZ is physically an int64 of micros since 1970 (UTC).
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i64;
+            let data = column.data as *mut i64;
             let value = *data.add(row as usize);
             Ok(Duckvalue::Timestamptz(value))
         }
         Logicaltype::Decimal => {
             // We materialize DECIMAL as decimal(38, S), whose physical storage is
             // an int128 of the unscaled value. Read the raw 128-bit integer.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut i128;
+            let data = column.data as *mut i128;
             let raw = *data.add(row as usize) as u128;
             Ok(Duckvalue::Decimal(Decimalvalue {
                 lower: raw as u64,
@@ -7393,7 +7420,7 @@ unsafe fn read_scalar_argument(
         }
         Logicaltype::Interval => {
             // DUCKDB_TYPE_INTERVAL is physically a {months:i32, days:i32, micros:i64}.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_interval;
+            let data = column.data as *mut duckdb::duckdb_interval;
             let iv = *data.add(row as usize);
             Ok(Duckvalue::Interval(Intervalvalue {
                 months: iv.months,
@@ -7405,7 +7432,7 @@ unsafe fn read_scalar_argument(
             // DUCKDB_TYPE_UUID is physically a hugeint with the high bit flipped
             // (so unsigned ordering matches). Flip it back to recover the logical
             // 128-bit UUID, then split into hi/lo halves.
-            let data = duckdb::duckdb_vector_get_data(column.vector) as *mut duckdb::duckdb_hugeint;
+            let data = column.data as *mut duckdb::duckdb_hugeint;
             let hh = *data.add(row as usize);
             let physical = ((hh.upper as u128) << 64) | hh.lower as u128;
             let logical = physical ^ (1u128 << 127);
