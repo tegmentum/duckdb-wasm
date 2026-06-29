@@ -7746,11 +7746,39 @@ unsafe fn build_colvec(
     })
 }
 
+/// True iff every one of the first `rows` logical rows in `validity` is invalid
+/// (NULL). An EMPTY bitmap means "all valid" (DuckDB's null validity pointer),
+/// so it is never all-null. Conservative: if the bitmap is shorter than `rows`
+/// (a row's byte is missing) we cannot prove that row is NULL, so we report
+/// `false` and let the normal typed path run.
+fn colvec_all_null(validity: &[u8], rows: usize) -> bool {
+    if rows == 0 || validity.is_empty() {
+        return false;
+    }
+    (0..rows).all(|row| {
+        validity
+            .get(row >> 3)
+            .map(|byte| (byte >> (row & 7)) & 1 == 0)
+            .unwrap_or(false)
+    })
+}
+
 /// Write a result `colvec` back into an output DuckDB vector. Fixed-width arms
 /// are a single bulk `copy_nonoverlapping` into `duckdb_vector_get_data`; var-
 /// width / composite arms reuse the validated per-cell `write_duckvalue_to_vector`
 /// writer. NULLs are applied last from the out-of-band validity bitmap (empty =>
 /// all valid, no mask touched).
+///
+/// The result column's physical type is the function's DECLARED return type
+/// (`logical`), NOT inferred from the carried column's first non-null value. An
+/// all-null var-width result has no value to infer a type from, so a guest (the
+/// hand-written row-bridge infers the column type from the first non-null result
+/// and falls back to `text` for an all-null column) may hand us a placeholder
+/// column whose variant differs from the declared return type — e.g. a `text`
+/// placeholder for a declared `blob` return. We detect the all-null case up
+/// front and write an all-NULL column of the DECLARED type, ignoring the
+/// (possibly mistyped) placeholder data buffer. Mixed-null and all-valid columns
+/// are untouched by this branch and stay byte-identical to the prior path.
 unsafe fn write_colvec_to_vector(
     vector: duckdb::duckdb_vector,
     logical: &Logicaltype,
@@ -7758,6 +7786,19 @@ unsafe fn write_colvec_to_vector(
 ) -> Result<(), Duckerror> {
     use column_types::Column;
     let rows = colvec.rows as usize;
+
+    // All-null fast path: trust the declared return type, write zero values and
+    // an all-invalid validity mask. This is also correct for fixed-width all-null
+    // (DuckDB leaves null cells' data untouched). `logical` governs the output
+    // vector DuckDB already created, so no data write is needed.
+    if colvec_all_null(&colvec.validity, rows) {
+        duckdb::duckdb_vector_ensure_validity_writable(vector);
+        let out_validity = duckdb::duckdb_vector_get_validity(vector);
+        for row in 0..rows {
+            duckdb::duckdb_validity_set_row_invalid(out_validity, row as duckdb::idx_t);
+        }
+        return Ok(());
+    }
 
     // 1. Data. Fixed-width => bulk memcpy; var-width/composite => per-cell.
     unsafe fn bulk<T>(vector: duckdb::duckdb_vector, src: &[T]) {
@@ -8775,5 +8816,106 @@ fn marshal_value_for_type(type_id: duckdb::duckdb_type, text: String) -> Duckval
             Err(_) => Duckvalue::Text(text),
         },
         _ => Duckvalue::Text(text),
+    }
+}
+
+#[cfg(test)]
+mod columnar_result_tests {
+    //! Regression coverage for the all-null var-width columnar result bug
+    //! (#187 pilot): an all-null `text`/`blob` result column carries no value
+    //! to infer a physical type from, so a guest may emit a placeholder column
+    //! whose variant differs from the declared return type. The result writer
+    //! must detect the all-null case and write an all-NULL column of the
+    //! DECLARED type instead of trusting the (mistyped) placeholder. The
+    //! decision lives in `colvec_all_null`, exercised here without any DuckDB
+    //! FFI so it runs as a pure-logic unit test.
+    use super::colvec_all_null;
+    use super::column_types::{Colvec, Column};
+
+    /// A packed all-invalid (every row NULL) validity bitmap for `rows` rows.
+    fn all_invalid(rows: usize) -> Vec<u8> {
+        vec![0u8; rows.div_ceil(8)]
+    }
+
+    /// A packed all-valid bitmap with row `null_row` cleared (NULL).
+    fn one_null(rows: usize, null_row: usize) -> Vec<u8> {
+        let mut v = vec![0xFFu8; rows.div_ceil(8)];
+        v[null_row >> 3] &= !(1u8 << (null_row & 7));
+        v
+    }
+
+    #[test]
+    fn all_null_text_column_is_detected() {
+        // What the hand-written row-bridge emits for an all-null result: a
+        // `text` placeholder (empty strings) with an all-invalid validity mask.
+        let rows = 5usize;
+        let colvec = Colvec {
+            data: Column::Text(vec![String::new(); rows]),
+            validity: all_invalid(rows),
+            rows: rows as u32,
+        };
+        assert!(
+            colvec_all_null(&colvec.validity, colvec.rows as usize),
+            "all-null text result must take the declared-type all-null path"
+        );
+    }
+
+    #[test]
+    fn all_null_blob_column_is_detected() {
+        // A declared-`blob` return whose guest correctly emits a `blob` column
+        // but with every row NULL still routes through the all-null path.
+        let rows = 5usize;
+        let colvec = Colvec {
+            data: Column::Blob(vec![Vec::new(); rows]),
+            validity: all_invalid(rows),
+            rows: rows as u32,
+        };
+        assert!(
+            colvec_all_null(&colvec.validity, colvec.rows as usize),
+            "all-null blob result must take the declared-type all-null path"
+        );
+    }
+
+    #[test]
+    fn empty_validity_is_all_valid_not_all_null() {
+        // The zero-alloc fast path: an empty bitmap means every row is valid,
+        // so it must NOT be treated as all-null (stays on the typed path).
+        assert!(!colvec_all_null(&[], 8));
+    }
+
+    #[test]
+    fn mixed_null_and_valid_is_not_all_null() {
+        // The already-working case: at least one valid row, so the carried
+        // variant is correctly typed and the typed path must run unchanged.
+        let rows = 10usize;
+        assert!(!colvec_all_null(&one_null(rows, 3), rows));
+    }
+
+    #[test]
+    fn fixed_width_all_null_is_detected() {
+        // The declared-type path also covers fixed-width all-null (e.g. int64
+        // NULL): detection is purely on validity, independent of the variant.
+        let rows = 4usize;
+        let colvec = Colvec {
+            data: Column::Int64(vec![0i64; rows]),
+            validity: all_invalid(rows),
+            rows: rows as u32,
+        };
+        assert!(colvec_all_null(&colvec.validity, colvec.rows as usize));
+    }
+
+    #[test]
+    fn zero_rows_is_not_all_null() {
+        // An empty result has no NULL rows to write; the normal (no-op) path
+        // handles it, so the all-null short-circuit must not fire.
+        assert!(!colvec_all_null(&[], 0));
+        assert!(!colvec_all_null(&[0u8], 0));
+    }
+
+    #[test]
+    fn short_bitmap_is_conservatively_not_all_null() {
+        // Defensive: a bitmap shorter than `rows` cannot prove the missing rows
+        // are NULL, so we decline the short-circuit and run the typed path.
+        assert!(!colvec_all_null(&[0u8], 16));
     }
 }
