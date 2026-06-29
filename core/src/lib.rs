@@ -6795,6 +6795,40 @@ unsafe fn execute_scalar_function(
         return Ok(());
     }
 
+    // Zero-argument scalars (e.g. ksuid(), cuid2(), passphrase(), the typetest
+    // tt_* constants): the columnar ABI carries the chunk row count in the
+    // INPUT columns, so with no argument columns the guest cannot know how many
+    // rows to produce (`call-scalar-batch-col` would return a 0-row colvec).
+    // The major-3 row-major batch conveyed the count via the outer list length;
+    // columnar lost that for the empty-args case. Rather than change the frozen
+    // major-4 contract, route zero-arg scalars through the cold per-row
+    // `call-scalar` path: the core owns `row_count`, calls once per row (correct
+    // for nondeterministic generators, which must produce a fresh value each
+    // row), and writes each result back. These functions are generators/
+    // constants used in small result sets, so the per-row crossing is a
+    // non-issue; the columnar hot path still serves every function that takes
+    // at least one argument.
+    if columns.is_empty() {
+        let invoke = callback_dispatch::Invokeinfo {
+            rowindex: Some(0),
+            iswindow: false,
+        };
+        for row in 0..row_count {
+            let result = callback_dispatch::call_scalar(
+                entry.definition.callback_handle,
+                &[],
+                invoke.clone(),
+            )?;
+            write_duckvalue_to_vector(
+                output,
+                &entry.definition.returns,
+                row as duckdb::idx_t,
+                result,
+            )?;
+        }
+        return Ok(());
+    }
+
     // major-4 COLUMNAR hot path: build one `colvec` per argument by bulk-memcpy
     // from each DuckDB vector (no per-cell read loop, no `Vec<Vec<duckvalue>>`
     // rowbatch), cross the canonical ABI ONCE with `call-scalar-batch-col`, and
