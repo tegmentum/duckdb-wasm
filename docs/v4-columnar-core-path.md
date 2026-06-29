@@ -95,3 +95,23 @@ read/write without crossing a boundary at all.
 The core builds only for `wasm32-wasip2` against the prebuilt libduckdb static
 lib (`WASI_SDK_PREFIX` + `DUCKDB_STATIC_LIB`); it is part of the coordinated,
 review-gated major-4 rebuild, not the perf-pass branch.
+
+## Status: LANDED (feat/wit-4.0.0)
+
+`execute_scalar_function` / `execute_cast` / aggregate finalize now build colvecs
+by bulk memcpy from the DuckDB vectors (`build_colvec`), cross via
+`call-scalar-batch-col` / `call-cast-col` / `call-aggregate-col`, and write the
+result column back (`write_colvec_to_vector`). The embedded (compile-into-core)
+path stays row-major (no WIT boundary). Core bindings regenerated @4.0.0; the
+wasm core **builds** (`cargo component build -p duckdb-component-core
+--target wasm32-wasip2 --release --features wasi`) and imports the columnar
+dispatch (no row-major batch). Verified end-to-end through `ducklink` (native
+host + @4.0.0 core + @4.0.0 components): `isin_validate` -> true/false/NULL;
+`harmonic_mean(1,2,4)` = 1.714286.
+
+Note: the host-interface WIT files (storage-host / optimizer-host / parser-host /
+table-stream-host / collation-host / files-host / pragma-host) were restored to
+the canonical `wit/duckdb-extension/` + `wit/core/duckdb-core.wit` world (they had
+drifted out of the canonical while surviving only in the stale generated
+`core/wit` + `core/src/bindings.rs`), so `sync-core-wit.sh` now reproduces the
+full core world.

@@ -28,6 +28,7 @@ mod tvm_spill;
 
 use bindings::duckdb::component::extension_loader_hooks;
 use bindings::duckdb::extension::callback_dispatch;
+use bindings::duckdb::extension::column_types;
 use bindings::duckdb::extension::pragma_host;
 use bindings::duckdb::extension::parser_host;
 use bindings::duckdb::extension::types::{
@@ -5084,11 +5085,16 @@ unsafe fn execute_cast(
         data: duckdb::duckdb_vector_get_data(input),
         validity: duckdb::duckdb_vector_get_validity(input),
     };
-    for row in 0..count {
-        let value = read_scalar_argument(&column, row)?;
-        let result = callback_dispatch::call_cast(entry.callback_handle, &value)?;
-        write_duckvalue_to_vector(output, &entry.target, row, result)?;
+    // major-4 COLUMNAR cast: one input column -> one output column, one crossing.
+    let arg = build_colvec(&column, count as usize)?;
+    let result = callback_dispatch::call_cast_col(entry.callback_handle, &arg)?;
+    if result.rows as u64 != count {
+        return Err(Duckerror::Internal(format!(
+            "cast returned {} rows for {} input rows",
+            result.rows, count
+        )));
     }
+    write_colvec_to_vector(output, &entry.target, result)?;
     Ok(())
 }
 
@@ -5487,7 +5493,7 @@ impl config_exports::Guest for ConfigHost {
     }
 }
 
-config_exports::__export_duckdb_extension_config_3_0_0_cabi!(
+config_exports::__export_duckdb_extension_config_4_0_0_cabi!(
     ConfigHost with_types_in bindings::exports::duckdb::extension::config
 );
 
@@ -5499,7 +5505,7 @@ impl logging_exports::Guest for LoggingHost {
     fn log_fields(_level: Loglevel, _message: String, _fields: Vec<Logfield>) {}
 }
 
-logging_exports::__export_duckdb_extension_logging_3_0_0_cabi!(
+logging_exports::__export_duckdb_extension_logging_4_0_0_cabi!(
     LoggingHost with_types_in bindings::exports::duckdb::extension::logging
 );
 
@@ -6327,7 +6333,7 @@ impl runtime_exports::Guest for RuntimeHost {
     }
 }
 
-runtime_exports::__export_duckdb_extension_runtime_3_0_0_cabi!(
+runtime_exports::__export_duckdb_extension_runtime_4_0_0_cabi!(
     RuntimeHost with_types_in bindings::exports::duckdb::extension::runtime
 );
 
@@ -6769,54 +6775,51 @@ unsafe fn execute_scalar_function(
         });
     }
 
-    // Build the whole chunk's arguments and dispatch in ONE batched WIT call
-    // (call-scalar-batch) rather than one call per row -- the per-row crossing
-    // dominated extension scalar cost (~1.1us/row measured). Semantically
-    // identical: row i's args are rows[i], the result is results[i].
-    let mut rows = Vec::with_capacity(row_count as usize);
-    for row in 0..row_count {
-        let mut args = Vec::with_capacity(columns.len());
-        for column in &columns {
-            args.push(read_scalar_argument(column, row)?);
+    if let Some(embedded) = entry.definition.embedded {
+        // Compiled-into-core extension: run the Rust function directly, no WIT
+        // boundary -- stay row-major (the columnar memcpy win is the WIT
+        // crossing, which this path skips entirely).
+        for row in 0..row_count {
+            let mut args = Vec::with_capacity(columns.len());
+            for column in &columns {
+                args.push(read_scalar_argument(column, row)?);
+            }
+            let result = embedded(&args)?;
+            write_duckvalue_to_vector(
+                output,
+                &entry.definition.returns,
+                row as duckdb::idx_t,
+                result,
+            )?;
         }
-        rows.push(args);
+        return Ok(());
     }
 
-    let results = if let Some(embedded) = entry.definition.embedded {
-        // Compiled-into-core extension: run the Rust function directly, no WIT.
-        let mut out = Vec::with_capacity(rows.len());
-        for args in &rows {
-            out.push(embedded(args)?);
-        }
-        out
-    } else {
-        let invoke = callback_dispatch::Invokeinfo {
-            rowindex: Some(0),
-            iswindow: false,
-        };
-        callback_dispatch::call_scalar_batch(
-            entry.definition.callback_handle,
-            rows.as_slice(),
-            invoke,
-        )
-        .map_err(|err| err)?
+    // major-4 COLUMNAR hot path: build one `colvec` per argument by bulk-memcpy
+    // from each DuckDB vector (no per-cell read loop, no `Vec<Vec<duckvalue>>`
+    // rowbatch), cross the canonical ABI ONCE with `call-scalar-batch-col`, and
+    // write the result column back by bulk-memcpy. ~82-110x cheaper boundary
+    // than the major-3 row-major `list<list<duckvalue>>` batch.
+    let mut args = Vec::with_capacity(columns.len());
+    for column in &columns {
+        args.push(build_colvec(column, row_count as usize)?);
+    }
+    let invoke = callback_dispatch::Invokeinfo {
+        rowindex: Some(0),
+        iswindow: false,
     };
-
-    if results.len() as u64 != row_count {
+    let result = callback_dispatch::call_scalar_batch_col(
+        entry.definition.callback_handle,
+        args.as_slice(),
+        invoke,
+    )?;
+    if result.rows as u64 != row_count {
         return Err(Duckerror::Internal(format!(
-            "scalar batch returned {} values for {} rows",
-            results.len(),
-            row_count
+            "scalar batch returned {} rows for {} input rows",
+            result.rows, row_count
         )));
     }
-    for (row, result) in results.into_iter().enumerate() {
-        write_duckvalue_to_vector(
-            output,
-            &entry.definition.returns,
-            row as duckdb::idx_t,
-            result,
-        )?;
-    }
+    write_colvec_to_vector(output, &entry.definition.returns, result)?;
 
     Ok(())
 }
@@ -7266,8 +7269,11 @@ unsafe fn aggregate_state_finalize_impl(
     for i in 0..count as usize {
         let slot = *states.add(i) as *mut *mut AggregateState;
         let rows = take_aggregate_rows(slot);
-        let value = callback_dispatch::call_aggregate(entry.definition.callback_handle, &rows)
-            .map_err(|err| err)?;
+        // major-4 COLUMNAR aggregate: pivot the buffered group to columns once,
+        // then cross with `call-aggregate-col` (single finalized value back).
+        let cols = aggregate_rows_to_colvecs(&rows, &entry.definition.arguments);
+        let value =
+            callback_dispatch::call_aggregate_col(entry.definition.callback_handle, &cols)?;
         write_duckvalue_to_vector(
             result,
             &entry.definition.returns,
@@ -7561,6 +7567,393 @@ unsafe fn read_vector_to_json_depth(
         }
         _ => J::Null,
     }
+}
+
+/// Copy DuckDB's validity mask into a packed `colvec` validity bitmap.
+///
+/// DuckDB's mask is a `u64` array (bit `row` set => valid); the `colvec`
+/// validity is a packed little-endian `u8` bitmap with the SAME convention, so
+/// the first `ceil(rows/8)` bytes of the mask ARE the bitmap (no per-bit work).
+/// A null mask pointer means "no NULLs": return an EMPTY bitmap (all valid),
+/// the zero-allocation fast path the contract defines.
+#[inline]
+unsafe fn copy_validity_bitmap(validity: *const u64, rows: usize) -> Vec<u8> {
+    if validity.is_null() || rows == 0 {
+        return Vec::new();
+    }
+    let bytes = (rows + 7) / 8;
+    slice::from_raw_parts(validity as *const u8, bytes).to_vec()
+}
+
+/// Build a columnar `colvec` for one argument column by reading the DuckDB
+/// vector. The major-4 HOT PATH: a fixed-width physical type is lifted as a
+/// single bulk `to_vec()` (one memcpy of the contiguous vector buffer) instead
+/// of the per-cell tagged-variant read loop. Var-width (text/blob) and the
+/// composite/escape-hatch arms (decimal/interval/uuid/complex) stay element-wise
+/// -- unavoidable for those, and identical in cost to the row-major path. NULL
+/// is carried out-of-band in the validity bitmap; for NULL rows the element-wise
+/// arms push a typed placeholder WITHOUT dereferencing the (invalid) cell.
+unsafe fn build_colvec(
+    column: &ScalarInputColumn,
+    rows: usize,
+) -> Result<callback_dispatch::Colvec, Duckerror> {
+    use column_types::Column;
+    let data = match &column.logical {
+        // ---- fixed-width: one bulk memcpy ----
+        Logicaltype::Boolean => {
+            Column::Boolean(slice::from_raw_parts(column.data as *const bool, rows).to_vec())
+        }
+        Logicaltype::Int64 => {
+            Column::Int64(slice::from_raw_parts(column.data as *const i64, rows).to_vec())
+        }
+        Logicaltype::Uint64 => {
+            Column::Uint64(slice::from_raw_parts(column.data as *const u64, rows).to_vec())
+        }
+        Logicaltype::Float64 => {
+            Column::Float64(slice::from_raw_parts(column.data as *const f64, rows).to_vec())
+        }
+        Logicaltype::Int32 => {
+            Column::Int32(slice::from_raw_parts(column.data as *const i32, rows).to_vec())
+        }
+        Logicaltype::Int16 => {
+            Column::Int16(slice::from_raw_parts(column.data as *const i16, rows).to_vec())
+        }
+        Logicaltype::Int8 => {
+            Column::Int8(slice::from_raw_parts(column.data as *const i8, rows).to_vec())
+        }
+        Logicaltype::Uint32 => {
+            Column::Uint32(slice::from_raw_parts(column.data as *const u32, rows).to_vec())
+        }
+        Logicaltype::Uint16 => {
+            Column::Uint16(slice::from_raw_parts(column.data as *const u16, rows).to_vec())
+        }
+        Logicaltype::Uint8 => {
+            Column::Uint8(slice::from_raw_parts(column.data as *const u8, rows).to_vec())
+        }
+        Logicaltype::Float32 => {
+            Column::Float32(slice::from_raw_parts(column.data as *const f32, rows).to_vec())
+        }
+        // DUCKDB_TYPE_TIMESTAMP / TIME / TIMESTAMP_TZ are physically int64.
+        Logicaltype::Timestamp => {
+            Column::Timestamp(slice::from_raw_parts(column.data as *const i64, rows).to_vec())
+        }
+        Logicaltype::Time => {
+            Column::Time(slice::from_raw_parts(column.data as *const i64, rows).to_vec())
+        }
+        Logicaltype::Timestamptz => {
+            Column::Timestamptz(slice::from_raw_parts(column.data as *const i64, rows).to_vec())
+        }
+        // DUCKDB_TYPE_DATE is physically int32.
+        Logicaltype::Date => {
+            Column::Date(slice::from_raw_parts(column.data as *const i32, rows).to_vec())
+        }
+        // ---- var-width / composite: element-wise (NULL-safe) ----
+        Logicaltype::Text => {
+            let p = column.data as *const duckdb::duckdb_string_t;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let bytes = duckdb_string_to_vec(ptr::read(p.add(row)));
+                    v.push(String::from_utf8(bytes).map_err(|_| {
+                        Duckerror::Invalidargument(
+                            "text argument contained invalid UTF-8 data".to_string(),
+                        )
+                    })?);
+                } else {
+                    v.push(String::new());
+                }
+            }
+            Column::Text(v)
+        }
+        Logicaltype::Blob => {
+            let p = column.data as *const duckdb::duckdb_string_t;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    v.push(duckdb_string_to_vec(ptr::read(p.add(row))));
+                } else {
+                    v.push(Vec::new());
+                }
+            }
+            Column::Blob(v)
+        }
+        Logicaltype::Decimal => {
+            let p = column.data as *const i128;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let raw = *p.add(row) as u128;
+                    v.push(column_types::Decimalvalue {
+                        lower: raw as u64,
+                        upper: (raw >> 64) as u64,
+                        width: DEFAULT_DECIMAL_WIDTH,
+                        scale: DEFAULT_DECIMAL_SCALE,
+                    });
+                } else {
+                    v.push(column_types::Decimalvalue { lower: 0, upper: 0, width: DEFAULT_DECIMAL_WIDTH, scale: DEFAULT_DECIMAL_SCALE });
+                }
+            }
+            Column::Decimal(v)
+        }
+        Logicaltype::Interval => {
+            let p = column.data as *const duckdb::duckdb_interval;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let iv = *p.add(row);
+                    v.push(column_types::Intervalvalue { months: iv.months, days: iv.days, micros: iv.micros });
+                } else {
+                    v.push(column_types::Intervalvalue { months: 0, days: 0, micros: 0 });
+                }
+            }
+            Column::Interval(v)
+        }
+        Logicaltype::Uuid => {
+            let p = column.data as *const duckdb::duckdb_hugeint;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let hh = *p.add(row);
+                    let physical = ((hh.upper as u128) << 64) | hh.lower as u128;
+                    let logical = physical ^ (1u128 << 127);
+                    v.push(column_types::Uuidvalue { hi: (logical >> 64) as u64, lo: logical as u64 });
+                } else {
+                    v.push(column_types::Uuidvalue { hi: 0, lo: 0 });
+                }
+            }
+            Column::Uuid(v)
+        }
+        Logicaltype::Complex(type_expr) => {
+            let col_type = duckdb::duckdb_vector_get_column_type(column.vector);
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let json = if validity_row_is_valid(column.validity, row) {
+                    read_vector_to_json(column.vector, col_type, row as duckdb::idx_t).to_string()
+                } else {
+                    "null".to_string()
+                };
+                v.push(column_types::Complexvalue { type_expr: type_expr.clone(), json });
+            }
+            let mut ct = col_type;
+            duckdb::duckdb_destroy_logical_type(&mut ct);
+            Column::Complex(v)
+        }
+    };
+    Ok(callback_dispatch::Colvec {
+        data,
+        validity: copy_validity_bitmap(column.validity, rows),
+        rows: rows as u32,
+    })
+}
+
+/// Write a result `colvec` back into an output DuckDB vector. Fixed-width arms
+/// are a single bulk `copy_nonoverlapping` into `duckdb_vector_get_data`; var-
+/// width / composite arms reuse the validated per-cell `write_duckvalue_to_vector`
+/// writer. NULLs are applied last from the out-of-band validity bitmap (empty =>
+/// all valid, no mask touched).
+unsafe fn write_colvec_to_vector(
+    vector: duckdb::duckdb_vector,
+    logical: &Logicaltype,
+    colvec: callback_dispatch::Colvec,
+) -> Result<(), Duckerror> {
+    use column_types::Column;
+    let rows = colvec.rows as usize;
+
+    // 1. Data. Fixed-width => bulk memcpy; var-width/composite => per-cell.
+    unsafe fn bulk<T>(vector: duckdb::duckdb_vector, src: &[T]) {
+        let dst = duckdb::duckdb_vector_get_data(vector) as *mut T;
+        copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    let type_err = |want: &str| {
+        Duckerror::Invalidargument(format!(
+            "columnar result type mismatch: column does not match declared return {want}"
+        ))
+    };
+    match colvec.data {
+        Column::Boolean(v) if matches!(logical, Logicaltype::Boolean) => bulk(vector, &v),
+        Column::Int64(v) if matches!(logical, Logicaltype::Int64) => bulk(vector, &v),
+        Column::Uint64(v) if matches!(logical, Logicaltype::Uint64) => bulk(vector, &v),
+        Column::Float64(v) if matches!(logical, Logicaltype::Float64) => bulk(vector, &v),
+        Column::Int32(v) if matches!(logical, Logicaltype::Int32) => bulk(vector, &v),
+        Column::Int16(v) if matches!(logical, Logicaltype::Int16) => bulk(vector, &v),
+        Column::Int8(v) if matches!(logical, Logicaltype::Int8) => bulk(vector, &v),
+        Column::Uint32(v) if matches!(logical, Logicaltype::Uint32) => bulk(vector, &v),
+        Column::Uint16(v) if matches!(logical, Logicaltype::Uint16) => bulk(vector, &v),
+        Column::Uint8(v) if matches!(logical, Logicaltype::Uint8) => bulk(vector, &v),
+        Column::Float32(v) if matches!(logical, Logicaltype::Float32) => bulk(vector, &v),
+        Column::Timestamp(v) if matches!(logical, Logicaltype::Timestamp) => bulk(vector, &v),
+        Column::Time(v) if matches!(logical, Logicaltype::Time) => bulk(vector, &v),
+        Column::Timestamptz(v) if matches!(logical, Logicaltype::Timestamptz) => bulk(vector, &v),
+        Column::Date(v) if matches!(logical, Logicaltype::Date) => bulk(vector, &v),
+        // var-width / composite: reuse the per-cell validated writer (it sets
+        // each written row valid; the validity pass below re-applies NULLs).
+        Column::Text(v) => {
+            for (row, s) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, Duckvalue::Text(s))?;
+            }
+        }
+        Column::Blob(v) => {
+            for (row, b) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, Duckvalue::Blob(b))?;
+            }
+        }
+        Column::Decimal(v) => {
+            for (row, d) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Decimal(Decimalvalue { lower: d.lower, upper: d.upper, width: d.width, scale: d.scale }),
+                )?;
+            }
+        }
+        Column::Interval(v) => {
+            for (row, d) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Interval(Intervalvalue { months: d.months, days: d.days, micros: d.micros }),
+                )?;
+            }
+        }
+        Column::Uuid(v) => {
+            for (row, d) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Uuid(Uuidvalue { hi: d.hi, lo: d.lo }),
+                )?;
+            }
+        }
+        Column::Complex(v) => {
+            for (row, c) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Complex(Complexvalue { type_expr: c.type_expr, json: c.json }),
+                )?;
+            }
+        }
+        _ => return Err(type_err("type")),
+    }
+
+    // 2. NULLs from the out-of-band bitmap (empty => all valid, nothing to do).
+    if !colvec.validity.is_empty() {
+        duckdb::duckdb_vector_ensure_validity_writable(vector);
+        let out_validity = duckdb::duckdb_vector_get_validity(vector);
+        for row in 0..rows {
+            let byte = colvec.validity[row >> 3];
+            if (byte >> (row & 7)) & 1 == 0 {
+                duckdb::duckdb_validity_set_row_invalid(out_validity, row as duckdb::idx_t);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Assemble one `colvec` per aggregate argument from the buffered group rows
+/// (`rows[i]` = one row's args). The aggregate buffers row-major internally (no
+/// boundary), so this is the column-pivot done ONCE at finalize before the
+/// single columnar `call-aggregate-col` crossing. NULLs (and any defensive type
+/// mismatch) are recorded out-of-band in the validity bitmap.
+fn aggregate_rows_to_colvecs(
+    rows: &[Vec<Duckvalue>],
+    arg_types: &[Logicaltype],
+) -> Vec<callback_dispatch::Colvec> {
+    use column_types::Column;
+    let n = rows.len();
+    let mut cols = Vec::with_capacity(arg_types.len());
+    for (col, logical) in arg_types.iter().enumerate() {
+        let mut validity: Vec<u8> = Vec::new();
+        // Lazily allocate an all-valid bitmap on the first NULL, then clear the
+        // row's bit. Free function (no capture) to keep the borrow simple.
+        fn mark_null(row: usize, rows_len: usize, validity: &mut Vec<u8>) {
+            if validity.is_empty() {
+                *validity = vec![0xFFu8; (rows_len + 7) / 8];
+            }
+            validity[row >> 3] &= !(1u8 << (row & 7));
+        }
+        let at = |r: usize| -> &Duckvalue { &rows[r][col] };
+        let data = match logical {
+            Logicaltype::Boolean => {
+                let mut v = vec![false; n];
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Boolean(x) => v[r] = *x,
+                        _ => mark_null(r, n, &mut validity),
+                    }
+                }
+                Column::Boolean(v)
+            }
+            Logicaltype::Int64 => {
+                let mut v = vec![0i64; n];
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Int64(x) => v[r] = *x,
+                        _ => mark_null(r, n, &mut validity),
+                    }
+                }
+                Column::Int64(v)
+            }
+            Logicaltype::Float64 => {
+                let mut v = vec![0.0f64; n];
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Float64(x) => v[r] = *x,
+                        _ => mark_null(r, n, &mut validity),
+                    }
+                }
+                Column::Float64(v)
+            }
+            Logicaltype::Text => {
+                let mut v = vec![String::new(); n];
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Text(s) => v[r] = s.clone(),
+                        _ => mark_null(r, n, &mut validity),
+                    }
+                }
+                Column::Text(v)
+            }
+            Logicaltype::Blob => {
+                let mut v = vec![Vec::<u8>::new(); n];
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Blob(b) => v[r] = b.clone(),
+                        _ => mark_null(r, n, &mut validity),
+                    }
+                }
+                Column::Blob(v)
+            }
+            // Any non-neutral arg type rides the escape hatch (aggregates use the
+            // neutral set in practice; this is defensive, never lossy there).
+            other => {
+                let type_expr = format!("{:?}", other);
+                let mut v = Vec::with_capacity(n);
+                for r in 0..n {
+                    match at(r) {
+                        Duckvalue::Null => {
+                            mark_null(r, n, &mut validity);
+                            v.push(column_types::Complexvalue {
+                                type_expr: type_expr.clone(),
+                                json: "null".to_string(),
+                            });
+                        }
+                        Duckvalue::Complex(c) => v.push(column_types::Complexvalue {
+                            type_expr: c.type_expr.clone(),
+                            json: c.json.clone(),
+                        }),
+                        dv => v.push(column_types::Complexvalue {
+                            type_expr: type_expr.clone(),
+                            json: format!("{:?}", dv),
+                        }),
+                    }
+                }
+                Column::Complex(v)
+            }
+        };
+        cols.push(callback_dispatch::Colvec {
+            data,
+            validity,
+            rows: n as u32,
+        });
+    }
+    cols
 }
 
 unsafe fn write_duckvalue_to_vector(
