@@ -1,0 +1,30 @@
+package duckdb:noop-provider@0.1.0;
+
+// Trivial noop provider that satisfies every non-WASI import ducklink_core.wasm
+// declares. Composing ducklink_core.wasm against this yields a database-only
+// component whose only remaining unresolved imports are WASI (satisfied by the
+// pylon polyfill / wasmtime at instantiate time).
+//
+// Behavior: every function is a well-typed no-op — returns empty lists,
+// none-options, or the neutral value for the return type. Nothing traps
+// unconditionally; every call succeeds so DuckDB's internal codepaths keep
+// running even when they poke at extension-host interfaces expecting no
+// registered extensions.
+//
+// Exports mirror ducklink_core.wasm's non-WASI imports 1:1.
+world noop {
+  export duckdb:extension/callback-dispatch@4.0.0;
+  export duckdb:extension/storage-host@4.0.0;
+  export duckdb:extension/index-host@4.0.0;
+  export duckdb:extension/collation-host@4.0.0;
+  export duckdb:extension/pragma-host@4.0.0;
+  export duckdb:extension/parser-host@4.0.0;
+  export duckdb:extension/optimizer-host@4.0.0;
+  export duckdb:extension/files-host@4.0.0;
+  export duckdb:extension/table-stream-host@4.0.0;
+  export duckdb:component/host-extension-loader;
+  export duckdb:component/extension-loader-hooks;
+  export tvm:memory/manager@0.1.0;
+  export tvm:memory/bytes@0.1.0;
+  export tvm:memory/types@0.1.0;
+}
