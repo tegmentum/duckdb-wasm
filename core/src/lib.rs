@@ -8918,8 +8918,12 @@ unsafe fn marshal_result(
 }
 
 /// Maps a DuckDB column type to the `duckvalue` variant used for its values.
-/// Numeric and boolean types map to typed variants; everything else (VARCHAR,
-/// BLOB, DATE/TIMESTAMP/DECIMAL/LIST/STRUCT, ...) renders as text.
+/// Numeric, boolean, and datetime/DECIMAL/UUID/INTERVAL types get typed
+/// Logicaltype variants so downstream consumers can convert the emitted
+/// text into their language-native Decimal/timedelta/UUID/date/datetime
+/// types (marshal_value_for_type still emits Text for these — the guest
+/// parses on receipt; keeps this Rust side minimal and avoids binding
+/// extra duckdb_value_* C APIs).
 fn marshal_logical_for_type(type_id: duckdb::duckdb_type) -> Logicaltype {
     match type_id {
         duckdb::DUCKDB_TYPE_BOOLEAN => Logicaltype::Boolean,
@@ -8933,6 +8937,13 @@ fn marshal_logical_for_type(type_id: duckdb::duckdb_type) -> Logicaltype {
         | duckdb::DUCKDB_TYPE_UBIGINT => Logicaltype::Uint64,
         duckdb::DUCKDB_TYPE_FLOAT | duckdb::DUCKDB_TYPE_DOUBLE => Logicaltype::Float64,
         duckdb::DUCKDB_TYPE_BLOB => Logicaltype::Blob,
+        duckdb::DUCKDB_TYPE_DATE => Logicaltype::Date,
+        duckdb::DUCKDB_TYPE_TIME => Logicaltype::Time,
+        duckdb::DUCKDB_TYPE_TIMESTAMP => Logicaltype::Timestamp,
+        duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => Logicaltype::Timestamptz,
+        duckdb::DUCKDB_TYPE_DECIMAL => Logicaltype::Decimal,
+        duckdb::DUCKDB_TYPE_INTERVAL => Logicaltype::Interval,
+        duckdb::DUCKDB_TYPE_UUID => Logicaltype::Uuid,
         _ => Logicaltype::Text,
     }
 }
