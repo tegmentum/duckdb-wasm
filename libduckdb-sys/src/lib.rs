@@ -34,6 +34,19 @@ pub struct duckdb_string_t {
     pub value: [u8; 16],
 }
 
+/// The result payload of `duckdb_value_string`: a heap-allocated buffer of
+/// `size` bytes at `data` (NOT necessarily nul-terminated — a UUID cast to
+/// string is 36 bytes with no trailing NUL). The buffer must be released with
+/// `duckdb_free`.
+///
+/// This is distinct from `duckdb_string_t` above, which is DuckDB's inlined
+/// vector-storage layout for VARCHAR cells.
+#[repr(C)]
+pub struct duckdb_string {
+    pub data: *mut c_char,
+    pub size: idx_t,
+}
+
 #[repr(C)]
 pub struct duckdb_blob {
     pub data: *mut c_void,
@@ -338,6 +351,13 @@ extern "C" {
     pub fn duckdb_value_is_null(result: *mut duckdb_result, col: idx_t, row: idx_t) -> bool;
 
     pub fn duckdb_value_varchar(result: *mut duckdb_result, col: idx_t, row: idx_t) -> *mut c_char;
+
+    /// Cast the cell at (col, row) to a text representation and return
+    /// {data, size}. Unlike `duckdb_value_varchar`, this path routes
+    /// UUID/HUGEINT/etc. columns through DuckDB's typed→string cast so the
+    /// canonical text form (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` for UUID)
+    /// comes back. The caller MUST free `data` with `duckdb_free`.
+    pub fn duckdb_value_string(result: *mut duckdb_result, col: idx_t, row: idx_t) -> duckdb_string;
 
     pub fn duckdb_value_blob(result: *mut duckdb_result, col: idx_t, row: idx_t) -> duckdb_blob;
 

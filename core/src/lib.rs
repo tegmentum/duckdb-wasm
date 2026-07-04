@@ -8876,6 +8876,29 @@ unsafe fn marshal_result(
         });
     }
 
+    // The deprecated columnar C-API materialization (`DeprecatedMaterializeResult`
+    // in duckdb src/main/capi/result-c.cpp) has NO `LogicalTypeId::UUID` branch
+    // in its per-column `deprecated_duckdb_translate_column` switch. Any UUID
+    // column causes materialization to fail whole-result — after which every
+    // `duckdb_value_*` call returns the fetch-default (null/empty). Both
+    // `duckdb_value_varchar` and `duckdb_value_string` are affected (they
+    // share `GetInternalCValue`'s switch table, which also lacks a UUID
+    // branch). A previous attempt bound `duckdb_value_hugeint` and read the
+    // raw 128-bit payload; that returned 00000000-0000-0000-0000-000000000000
+    // for the same reason — `FetchDefaultValue<hugeint_t>` is zeros.
+    //
+    // Fix: when any column is UUID, marshal the result via the chunk-based
+    // vector API (`duckdb_fetch_chunk` + `duckdb_vector_get_data`) which
+    // bypasses the deprecated materialization entirely. Non-UUID results
+    // keep the fast deprecated path.
+    let has_deprecated_gap = type_ids
+        .iter()
+        .any(|&t| t == duckdb::DUCKDB_TYPE_UUID);
+    if has_deprecated_gap {
+        let rows = marshal_result_via_chunks(result_mut, &type_ids)?;
+        return Ok((columns, rows));
+    }
+
     let mut rows = Vec::with_capacity(row_count as usize);
     for row_idx in 0..row_count {
         let mut row = Vec::with_capacity(column_count as usize);
@@ -8915,6 +8938,166 @@ unsafe fn marshal_result(
     }
 
     Ok((columns, rows))
+}
+
+/// Chunk-based marshal fallback for results containing a column type the
+/// deprecated C-API materialization doesn't handle (currently: UUID). Uses
+/// `duckdb_fetch_chunk` + the vector API, then per-cell type dispatch.
+///
+/// The type dispatch here is deliberately narrower than
+/// `read_scalar_argument`: this path formats values as text (matching what
+/// `duckdb_value_varchar` would have emitted on the fast path) so downstream
+/// consumers see the same `Duckvalue::Text(...)` shape as before. UUID gets
+/// the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` rendering via the
+/// physical→logical hugeint bit-flip (`^ (1 << 127)`).
+unsafe fn marshal_result_via_chunks(
+    result_mut: *mut duckdb::duckdb_result,
+    type_ids: &[duckdb::duckdb_type],
+) -> Result<Vec<Row>, DuckDbError> {
+    let column_count = type_ids.len();
+    let mut rows: Vec<Row> = Vec::new();
+    loop {
+        let mut chunk = duckdb::duckdb_fetch_chunk(*result_mut);
+        if chunk.is_null() {
+            break;
+        }
+        let chunk_size = duckdb::duckdb_data_chunk_get_size(chunk);
+        // Cache per-column vector pointers so we don't re-cross the FFI
+        // boundary for every cell.
+        let mut vectors: Vec<duckdb::duckdb_vector> = Vec::with_capacity(column_count);
+        let mut datas: Vec<*mut c_void> = Vec::with_capacity(column_count);
+        let mut validities: Vec<*mut u64> = Vec::with_capacity(column_count);
+        for col_idx in 0..column_count {
+            let v = duckdb::duckdb_data_chunk_get_vector(chunk, col_idx as duckdb::idx_t);
+            vectors.push(v);
+            datas.push(duckdb::duckdb_vector_get_data(v));
+            validities.push(duckdb::duckdb_vector_get_validity(v));
+        }
+        for row_idx in 0..chunk_size {
+            let mut row: Row = Vec::with_capacity(column_count);
+            for col_idx in 0..column_count {
+                if !validity_row_is_valid(validities[col_idx], row_idx as usize) {
+                    row.push(Duckvalue::Null);
+                    continue;
+                }
+                let type_id = type_ids[col_idx];
+                let cell = marshal_chunk_cell(type_id, vectors[col_idx], datas[col_idx], row_idx);
+                row.push(cell);
+            }
+            rows.push(row);
+        }
+        duckdb::duckdb_destroy_data_chunk(&mut chunk);
+    }
+    Ok(rows)
+}
+
+/// Read a single cell from a chunk vector and return a `Duckvalue` in the
+/// same shape the deprecated-path row marshal would have produced.
+unsafe fn marshal_chunk_cell(
+    type_id: duckdb::duckdb_type,
+    vector: duckdb::duckdb_vector,
+    data: *mut c_void,
+    row: duckdb::idx_t,
+) -> Duckvalue {
+    let row_us = row as usize;
+    match type_id {
+        duckdb::DUCKDB_TYPE_UUID => {
+            // Physical storage is hugeint with the high bit flipped so
+            // unsigned ordering matches logical ordering; flip it back to
+            // recover the logical 128-bit UUID and format canonically.
+            let p = data as *const duckdb::duckdb_hugeint;
+            let hh = *p.add(row_us);
+            let physical = ((hh.upper as u128) << 64) | hh.lower as u128;
+            let logical = physical ^ (1u128 << 127);
+            let text = format_uuid_from_u128(logical);
+            marshal_value_for_type(type_id, text)
+        }
+        duckdb::DUCKDB_TYPE_BOOLEAN => {
+            let v = *(data as *const bool).add(row_us);
+            Duckvalue::Boolean(v)
+        }
+        duckdb::DUCKDB_TYPE_TINYINT => {
+            let v = *(data as *const i8).add(row_us);
+            Duckvalue::Int64(v as i64)
+        }
+        duckdb::DUCKDB_TYPE_SMALLINT => {
+            let v = *(data as *const i16).add(row_us);
+            Duckvalue::Int64(v as i64)
+        }
+        duckdb::DUCKDB_TYPE_INTEGER => {
+            let v = *(data as *const i32).add(row_us);
+            Duckvalue::Int64(v as i64)
+        }
+        duckdb::DUCKDB_TYPE_BIGINT => {
+            let v = *(data as *const i64).add(row_us);
+            Duckvalue::Int64(v)
+        }
+        duckdb::DUCKDB_TYPE_UTINYINT => {
+            let v = *(data as *const u8).add(row_us);
+            Duckvalue::Uint64(v as u64)
+        }
+        duckdb::DUCKDB_TYPE_USMALLINT => {
+            let v = *(data as *const u16).add(row_us);
+            Duckvalue::Uint64(v as u64)
+        }
+        duckdb::DUCKDB_TYPE_UINTEGER => {
+            let v = *(data as *const u32).add(row_us);
+            Duckvalue::Uint64(v as u64)
+        }
+        duckdb::DUCKDB_TYPE_UBIGINT => {
+            let v = *(data as *const u64).add(row_us);
+            Duckvalue::Uint64(v)
+        }
+        duckdb::DUCKDB_TYPE_FLOAT => {
+            let v = *(data as *const f32).add(row_us);
+            Duckvalue::Float64(v as f64)
+        }
+        duckdb::DUCKDB_TYPE_DOUBLE => {
+            let v = *(data as *const f64).add(row_us);
+            Duckvalue::Float64(v)
+        }
+        duckdb::DUCKDB_TYPE_VARCHAR => {
+            let p = data as *mut duckdb::duckdb_string_t;
+            let s = std::ptr::read(p.add(row_us));
+            let bytes = duckdb_string_to_vec(s);
+            Duckvalue::Text(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        duckdb::DUCKDB_TYPE_BLOB => {
+            let p = data as *mut duckdb::duckdb_string_t;
+            let s = std::ptr::read(p.add(row_us));
+            Duckvalue::Blob(duckdb_string_to_vec(s))
+        }
+        // Fallback: format via the vector-to-JSON walker so LIST / STRUCT /
+        // MAP / TIMESTAMP_TZ / etc. still produce something meaningful. This
+        // is coarser than the deprecated `duckdb_value_varchar` path but the
+        // only columns we currently reach through this fallback are UUID
+        // (handled above) and any other type that co-occurs with UUID in a
+        // single result.
+        _ => {
+            let col_type = duckdb::duckdb_vector_get_column_type(vector);
+            let json = read_vector_to_json(vector, col_type, row);
+            let mut ct = col_type;
+            duckdb::duckdb_destroy_logical_type(&mut ct);
+            match json {
+                serde_json::Value::String(s) => marshal_value_for_type(type_id, s),
+                other => marshal_value_for_type(type_id, other.to_string()),
+            }
+        }
+    }
+}
+
+/// Format a logical 128-bit UUID as the canonical
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` string.
+fn format_uuid_from_u128(u: u128) -> String {
+    let b = u.to_be_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3],
+        b[4], b[5],
+        b[6], b[7],
+        b[8], b[9],
+        b[10], b[11], b[12], b[13], b[14], b[15],
+    )
 }
 
 /// Maps a DuckDB column type to the `duckvalue` variant used for its values.
