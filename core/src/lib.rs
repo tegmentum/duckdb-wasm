@@ -8877,23 +8877,29 @@ unsafe fn marshal_result(
     }
 
     // The deprecated columnar C-API materialization (`DeprecatedMaterializeResult`
-    // in duckdb src/main/capi/result-c.cpp) has NO `LogicalTypeId::UUID` branch
-    // in its per-column `deprecated_duckdb_translate_column` switch. Any UUID
-    // column causes materialization to fail whole-result — after which every
-    // `duckdb_value_*` call returns the fetch-default (null/empty). Both
-    // `duckdb_value_varchar` and `duckdb_value_string` are affected (they
-    // share `GetInternalCValue`'s switch table, which also lacks a UUID
-    // branch). A previous attempt bound `duckdb_value_hugeint` and read the
-    // raw 128-bit payload; that returned 00000000-0000-0000-0000-000000000000
-    // for the same reason — `FetchDefaultValue<hugeint_t>` is zeros.
+    // in duckdb src/main/capi/result-c.cpp) has NO branches for a handful of
+    // logical types in its per-column `deprecated_duckdb_translate_column`
+    // switch: UUID, TIMESTAMP_TZ, TIMESTAMP_NS, TIME_TZ (and the other
+    // TIMESTAMP_{S,MS} precisions). Any such column causes materialization
+    // to fail whole-result — after which every `duckdb_value_*` call returns
+    // the fetch-default (null/empty). Both `duckdb_value_varchar` and
+    // `duckdb_value_string` are affected (they share `GetInternalCValue`'s
+    // switch table, which also lacks branches for these types). A previous
+    // UUID attempt bound `duckdb_value_hugeint` and read the raw 128-bit
+    // payload; that returned 00000000-0000-0000-0000-000000000000 for the
+    // same reason — `FetchDefaultValue<hugeint_t>` is zeros.
     //
-    // Fix: when any column is UUID, marshal the result via the chunk-based
-    // vector API (`duckdb_fetch_chunk` + `duckdb_vector_get_data`) which
-    // bypasses the deprecated materialization entirely. Non-UUID results
-    // keep the fast deprecated path.
-    let has_deprecated_gap = type_ids
-        .iter()
-        .any(|&t| t == duckdb::DUCKDB_TYPE_UUID);
+    // Fix: when any column is one of these types, marshal the result via
+    // the chunk-based vector API (`duckdb_fetch_chunk` +
+    // `duckdb_vector_get_data`) which bypasses the deprecated
+    // materialization entirely. Other results keep the fast deprecated
+    // path.
+    let has_deprecated_gap = type_ids.iter().any(|&t| {
+        t == duckdb::DUCKDB_TYPE_UUID
+            || t == duckdb::DUCKDB_TYPE_TIMESTAMP_TZ
+            || t == duckdb::DUCKDB_TYPE_TIMESTAMP_NS
+            || t == duckdb::DUCKDB_TYPE_TIME_TZ
+    });
     if has_deprecated_gap {
         let rows = marshal_result_via_chunks(result_mut, &type_ids)?;
         return Ok((columns, rows));
@@ -9012,6 +9018,32 @@ unsafe fn marshal_chunk_cell(
             let text = format_uuid_from_u128(logical);
             marshal_value_for_type(type_id, text)
         }
+        duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => {
+            // Physical: i64 microseconds since 1970-01-01 UTC. DuckDB stores
+            // TZ-adjusted timestamps as UTC-referenced micros; the session
+            // TIME_ZONE only affects rendering. Emit ISO 8601 with a "+00:00"
+            // offset so downstream Python parses it as a tz-aware datetime.
+            let micros = *(data as *const i64).add(row_us);
+            let text = format_timestamp_tz_micros(micros);
+            marshal_value_for_type(type_id, text)
+        }
+        duckdb::DUCKDB_TYPE_TIMESTAMP_NS => {
+            // Physical: i64 nanoseconds since 1970-01-01. Split into
+            // (micros, nanos_rem) so we can reuse `duckdb_from_timestamp`
+            // for the calendar part, then append the trailing 3 nanosecond
+            // digits.
+            let nanos = *(data as *const i64).add(row_us);
+            let text = format_timestamp_nanos(nanos);
+            marshal_value_for_type(type_id, text)
+        }
+        duckdb::DUCKDB_TYPE_TIME_TZ => {
+            // Physical: 64-bit packed `duckdb_time_tz` (40 bits micros +
+            // 24 bits int32 offset). Decompose via the C-API helper.
+            let bits = *(data as *const u64).add(row_us);
+            let t = duckdb::duckdb_from_time_tz(duckdb::duckdb_time_tz { bits });
+            let text = format_time_tz(&t);
+            marshal_value_for_type(type_id, text)
+        }
         duckdb::DUCKDB_TYPE_BOOLEAN => {
             let v = *(data as *const bool).add(row_us);
             Duckvalue::Boolean(v)
@@ -9100,6 +9132,73 @@ fn format_uuid_from_u128(u: u128) -> String {
     )
 }
 
+/// Format an i64 micros-since-epoch TIMESTAMP_TZ value as ISO 8601 with a
+/// "+00:00" UTC offset. DuckDB stores TIMESTAMP WITH TIME ZONE values as
+/// UTC-referenced micros regardless of the session time zone, so the wire
+/// text is always the UTC instant plus an explicit offset (session TZ is a
+/// display-only concept). Downstream Python parses this into a tz-aware
+/// datetime via `datetime.fromisoformat`.
+fn format_timestamp_tz_micros(micros: i64) -> String {
+    let ts = unsafe { duckdb::duckdb_from_timestamp(duckdb::duckdb_timestamp { micros }) };
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}+00:00",
+        ts.date.year,
+        ts.date.month as i32,
+        ts.date.day as i32,
+        ts.time.hour as i32,
+        ts.time.min as i32,
+        ts.time.sec as i32,
+        ts.time.micros,
+    )
+}
+
+/// Format an i64 nanos-since-epoch TIMESTAMP_NS value as ISO 8601 with a
+/// nine-digit fractional-second field. Splits nanos into (micros,
+/// nanos_remainder) so we can reuse `duckdb_from_timestamp` for the calendar
+/// decomposition, then hand-append the last three nanosecond digits.
+///
+/// Negative nanos (pre-epoch) use floor-division so the remainder is always
+/// in [0, 999]; the calendar side sees the correct floor of micros and the
+/// nanosecond suffix stays non-negative.
+fn format_timestamp_nanos(nanos: i64) -> String {
+    let micros = nanos.div_euclid(1_000);
+    let nanos_rem = nanos.rem_euclid(1_000) as u32;
+    let ts = unsafe { duckdb::duckdb_from_timestamp(duckdb::duckdb_timestamp { micros }) };
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}{:03}",
+        ts.date.year,
+        ts.date.month as i32,
+        ts.date.day as i32,
+        ts.time.hour as i32,
+        ts.time.min as i32,
+        ts.time.sec as i32,
+        ts.time.micros,
+        nanos_rem,
+    )
+}
+
+/// Format a decomposed `duckdb_time_tz_struct` as `HH:MM:SS.uuuuuu±HH:MM`.
+/// The offset is signed seconds east of UTC (DuckDB's convention matches
+/// `duckdb::interval::TimeZoneOffset`). We render minutes-precision to match
+/// what `datetime.fromisoformat` accepts (and truncate stray seconds — no
+/// real-world TIME_TZ has sub-minute offsets).
+fn format_time_tz(t: &duckdb::duckdb_time_tz_struct) -> String {
+    let sign = if t.offset < 0 { '-' } else { '+' };
+    let off_abs = t.offset.unsigned_abs();
+    let off_hh = off_abs / 3600;
+    let off_mm = (off_abs % 3600) / 60;
+    format!(
+        "{:02}:{:02}:{:02}.{:06}{}{:02}:{:02}",
+        t.time.hour as i32,
+        t.time.min as i32,
+        t.time.sec as i32,
+        t.time.micros,
+        sign,
+        off_hh,
+        off_mm,
+    )
+}
+
 /// Maps a DuckDB column type to the `duckvalue` variant used for its values.
 /// Numeric, boolean, and datetime/DECIMAL/UUID/INTERVAL types get typed
 /// Logicaltype variants so downstream consumers can convert the emitted
@@ -9127,6 +9226,14 @@ fn marshal_logical_for_type(type_id: duckdb::duckdb_type) -> Logicaltype {
         duckdb::DUCKDB_TYPE_DECIMAL => Logicaltype::Decimal,
         duckdb::DUCKDB_TYPE_INTERVAL => Logicaltype::Interval,
         duckdb::DUCKDB_TYPE_UUID => Logicaltype::Uuid,
+        // TIMESTAMP_NS / TIME_TZ have no dedicated `logicaltype` variant in
+        // the WIT contract (`variant logicaltype` at
+        // wit/duckdb-extension/types.wit); surface them through the
+        // `complex(string)` escape hatch so the guest's type_code carries
+        // the specific name for coercion dispatch. The value payload itself
+        // is still text (formatted by the chunk marshal path).
+        duckdb::DUCKDB_TYPE_TIMESTAMP_NS => Logicaltype::Complex("TIMESTAMP_NS".to_string()),
+        duckdb::DUCKDB_TYPE_TIME_TZ => Logicaltype::Complex("TIME_TZ".to_string()),
         _ => Logicaltype::Text,
     }
 }

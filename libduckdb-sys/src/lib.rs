@@ -147,7 +147,11 @@ pub const DUCKDB_TYPE_BLOB: duckdb_type = 18;
 pub const DUCKDB_TYPE_DECIMAL: duckdb_type = 19;
 pub const DUCKDB_TYPE_LIST: duckdb_type = 24;
 pub const DUCKDB_TYPE_STRUCT: duckdb_type = 25;
+pub const DUCKDB_TYPE_TIMESTAMP_S: duckdb_type = 20;
+pub const DUCKDB_TYPE_TIMESTAMP_MS: duckdb_type = 21;
+pub const DUCKDB_TYPE_TIMESTAMP_NS: duckdb_type = 22;
 pub const DUCKDB_TYPE_UUID: duckdb_type = 27;
+pub const DUCKDB_TYPE_TIME_TZ: duckdb_type = 30;
 pub const DUCKDB_TYPE_TIMESTAMP_TZ: duckdb_type = 31;
 pub const DUCKDB_TYPE_GEOMETRY: duckdb_type = 40;
 
@@ -168,6 +172,41 @@ pub struct duckdb_date {
 #[derive(Debug, Copy, Clone)]
 pub struct duckdb_time {
     pub micros: i64,
+}
+/// DuckDB's TIME_TZ physical storage: 40 bits micros-since-midnight (high) +
+/// 24 bits int32 offset (low). Decompose via `duckdb_from_time_tz` which
+/// returns the fully-unpacked `duckdb_time_tz_struct`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_time_tz {
+    pub bits: u64,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_date_struct {
+    pub year: i32,
+    pub month: i8,
+    pub day: i8,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_time_struct {
+    pub hour: i8,
+    pub min: i8,
+    pub sec: i8,
+    pub micros: i32,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_time_tz_struct {
+    pub time: duckdb_time_struct,
+    pub offset: i32,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_timestamp_struct {
+    pub date: duckdb_date_struct,
+    pub time: duckdb_time_struct,
 }
 /// DuckDB's HUGEINT representation: value = (upper as i128) << 64 | lower.
 /// Also used as the physical backing of UUID (with the high bit flipped).
@@ -238,6 +277,13 @@ extern "C" {
     ) -> duckdb_state;
 
     pub fn duckdb_destroy_result(result: *mut duckdb_result);
+
+    // Time/timestamp decomposition helpers (used by the chunk-based marshal
+    // path to format TIMESTAMP_TZ / TIMESTAMP_NS / TIME_TZ values). The
+    // deprecated columnar C-API has no branches for these types, so the
+    // chunk path must read the physical vector and format the text itself.
+    pub fn duckdb_from_timestamp(ts: duckdb_timestamp) -> duckdb_timestamp_struct;
+    pub fn duckdb_from_time_tz(bits: duckdb_time_tz) -> duckdb_time_tz_struct;
 
     pub fn duckdb_prepare(
         connection: duckdb_connection,
