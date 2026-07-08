@@ -4857,13 +4857,28 @@ fn process_pending_registrations(
         clog!("[duckdb-core] no registrations returned for '{extension}'");
     }
     for entry in pending.scalars.into_iter().collect::<Vec<_>>() {
-        register_pending_scalar(entry)?;
+        // Mirror the macro/replacement-scan/logical-type/cast
+        // pattern below: a single scalar registration failure
+        // (e.g. name collision with a builtin, or a signature
+        // duckdb_register_scalar_function rejects) shouldn't tear
+        // down the whole extension load. DuckDB's loader hook
+        // returning `false` here would surface as the unhelpful
+        // "extension loading disabled through a compile time flag"
+        // error, masking the real cause. Log and continue so the
+        // rest of the surface still becomes callable.
+        if let Err(err) = register_pending_scalar(entry) {
+            clog!("[duckdb-core] scalar registration failed (continuing): {err:?}");
+        }
     }
     for entry in pending.tables.into_iter().collect::<Vec<_>>() {
-        register_pending_table(entry)?;
+        if let Err(err) = register_pending_table(entry) {
+            clog!("[duckdb-core] table-function registration failed (continuing): {err:?}");
+        }
     }
     for entry in pending.aggregates.into_iter().collect::<Vec<_>>() {
-        register_pending_aggregate(entry)?;
+        if let Err(err) = register_pending_aggregate(entry) {
+            clog!("[duckdb-core] aggregate registration failed (continuing): {err:?}");
+        }
     }
     for entry in pending.macros.into_iter().collect::<Vec<_>>() {
         // A macro failure must not fail the whole extension load (which would
