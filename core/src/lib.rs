@@ -843,6 +843,373 @@ pub extern "C" fn wasm_storage_scan_close(scan: u32) {
 }
 
 //===----------------------------------------------------------------------===//
+// M2c WRITE bridge: transactions + DDL + DML.
+//
+// The C++ WasmTransactionManager, WasmSchemaEntry::CreateTable, and
+// WasmPhysical{Insert,Update,Delete} operators call these extern-C fns; each
+// routes to the host-provided `storage-host` write imports, which the host
+// forwards to the writable storage component's `storage-write-dispatch`
+// export via ExtensionInstance's `storage_*` trampolines. Errors surface via
+// the shared `wasm_storage_last_error()` reader (single per-thread slot; the
+// scan bridge writes into the same slot).
+//
+// ABI mirror of `wasm_storage_bridge.h`: values cross the boundary as tagged
+// `WasmWriteValue` cells in row-major order (`values[r * ncols + c]`); column
+// definitions cross as `WasmWriteColumn` (name + duckdb_type code). Length-
+// prefixed rowid arrays are borrowed for the call.
+//===----------------------------------------------------------------------===//
+
+/// C-ABI mirror of `WasmWriteColumn` in wasm_storage_bridge.h.
+#[repr(C)]
+pub struct WasmWriteColumn {
+    name: *const c_char,
+    type_code: u32,
+}
+
+/// C-ABI mirror of `WasmWriteValue` in wasm_storage_bridge.h. Fields carry
+/// only the arm selected by `value_type`; the rest are inert.
+#[repr(C)]
+pub struct WasmWriteValue {
+    value_type: u8,
+    i64_val: i64,
+    f64_val: f64,
+    text: *const c_char,
+    blob: *const u8,
+    blob_len: u32,
+}
+
+/// Maps a `duckdb_type` enum code back into a bindings-side Logicaltype for
+/// CREATE TABLE column definitions. Inverse of `storage_logicaltype_to_code`.
+fn storage_code_to_logicaltype(code: u32) -> Logicaltype {
+    match code {
+        1 => Logicaltype::Boolean,
+        2 => Logicaltype::Int8,
+        3 => Logicaltype::Int16,
+        4 => Logicaltype::Int32,
+        5 => Logicaltype::Int64,
+        6 => Logicaltype::Uint8,
+        7 => Logicaltype::Uint16,
+        8 => Logicaltype::Uint32,
+        9 => Logicaltype::Uint64,
+        10 => Logicaltype::Float32,
+        11 => Logicaltype::Float64,
+        12 => Logicaltype::Timestamp,
+        13 => Logicaltype::Date,
+        14 => Logicaltype::Time,
+        15 => Logicaltype::Interval,
+        17 => Logicaltype::Text,
+        18 => Logicaltype::Blob,
+        19 => Logicaltype::Decimal,
+        27 => Logicaltype::Uuid,
+        31 => Logicaltype::Timestamptz,
+        // Fallback: TEXT is the safest widening for an unknown enumeration.
+        _ => Logicaltype::Text,
+    }
+}
+
+/// Decode one tagged C-ABI cell into a bindings-side `Duckvalue`. Unknown
+/// value_type falls through to NULL; TEXT/BLOB pointers are borrowed for the
+/// call (the resulting `String` / `Vec<u8>` copies bytes out).
+unsafe fn storage_write_value_to_duckvalue(v: &WasmWriteValue) -> Duckvalue {
+    match v.value_type {
+        1 => Duckvalue::Boolean(v.i64_val != 0),
+        2 => Duckvalue::Int64(v.i64_val),
+        3 => Duckvalue::Float64(v.f64_val),
+        4 => {
+            if v.text.is_null() {
+                Duckvalue::Text(String::new())
+            } else {
+                Duckvalue::Text(CStr::from_ptr(v.text).to_string_lossy().into_owned())
+            }
+        }
+        5 => {
+            if v.blob.is_null() || v.blob_len == 0 {
+                Duckvalue::Blob(Vec::new())
+            } else {
+                let slice = slice::from_raw_parts(v.blob, v.blob_len as usize);
+                Duckvalue::Blob(slice.to_vec())
+            }
+        }
+        _ => Duckvalue::Null,
+    }
+}
+
+/// Reshape a flat row-major cell buffer into `Vec<Vec<Duckvalue>>` matching
+/// the WIT list-of-lists row shape.
+unsafe fn storage_write_reshape_rows(
+    values: *const WasmWriteValue,
+    nrows: u32,
+    ncols: u32,
+) -> Vec<Vec<Duckvalue>> {
+    if values.is_null() || nrows == 0 || ncols == 0 {
+        return Vec::new();
+    }
+    let total = (nrows as usize) * (ncols as usize);
+    let slice = slice::from_raw_parts(values, total);
+    let mut out: Vec<Vec<Duckvalue>> = Vec::with_capacity(nrows as usize);
+    for r in 0..(nrows as usize) {
+        let mut row = Vec::with_capacity(ncols as usize);
+        for c in 0..(ncols as usize) {
+            row.push(storage_write_value_to_duckvalue(&slice[r * (ncols as usize) + c]));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Begin a component-side write transaction on `catalog`. Returns the txn
+/// handle, or 0 on error (message in `wasm_storage_last_error`).
+#[no_mangle]
+pub extern "C" fn wasm_storage_write_begin_transaction(catalog: u32) -> u32 {
+    use bindings::duckdb::extension::storage_host as sh;
+    match sh::storage_begin_transaction(catalog) {
+        Ok(txn) => txn,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            0
+        }
+    }
+}
+
+/// Commit an open transaction. 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wasm_storage_write_commit_transaction(txn: u32) -> i32 {
+    use bindings::duckdb::extension::storage_host as sh;
+    match sh::storage_commit_transaction(txn) {
+        Ok(()) => 0,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Roll back an open transaction. 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wasm_storage_write_rollback_transaction(txn: u32) -> i32 {
+    use bindings::duckdb::extension::storage_host as sh;
+    match sh::storage_rollback_transaction(txn) {
+        Ok(()) => 0,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// CREATE TABLE inside a write transaction. `cols` is `ncols` entries of
+/// `WasmWriteColumn`; each entry names one column and its duckdb_type code.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_write_create_table(
+    txn: u32,
+    table: *const c_char,
+    cols: *const WasmWriteColumn,
+    ncols: u32,
+) -> i32 {
+    use bindings::duckdb::extension::storage_host as sh;
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_write_create_table: null table".to_string());
+        return -1;
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            storage_set_last_error(
+                "wasm_storage_write_create_table: table not UTF-8".to_string(),
+            );
+            return -1;
+        }
+    };
+
+    let cols_slice: &[WasmWriteColumn] = if cols.is_null() || ncols == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(cols, ncols as usize)
+    };
+    let mut columndefs: Vec<bindings::duckdb::extension::storage_host::Columndef> =
+        Vec::with_capacity(cols_slice.len());
+    for col in cols_slice {
+        if col.name.is_null() {
+            storage_set_last_error(
+                "wasm_storage_write_create_table: null column name".to_string(),
+            );
+            return -1;
+        }
+        let name = match CStr::from_ptr(col.name).to_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                storage_set_last_error(
+                    "wasm_storage_write_create_table: column name not UTF-8".to_string(),
+                );
+                return -1;
+            }
+        };
+        columndefs.push(bindings::duckdb::extension::storage_host::Columndef {
+            name,
+            logical: storage_code_to_logicaltype(col.type_code),
+        });
+    }
+
+    clog!(
+        "[storage-write] core create-table txn={} table={:?} ncols={}",
+        txn,
+        table_str,
+        columndefs.len()
+    );
+
+    match sh::storage_create_table(txn, &table_str, &columndefs) {
+        Ok(()) => 0,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Append rows. `values` is `nrows * ncols` cells in row-major order (row `r`
+/// is `values[r * ncols .. (r + 1) * ncols]`). Returns rows inserted (>=0), or
+/// -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_write_insert_rows(
+    txn: u32,
+    table: *const c_char,
+    values: *const WasmWriteValue,
+    nrows: u32,
+    ncols: u32,
+) -> i64 {
+    use bindings::duckdb::extension::storage_host as sh;
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_write_insert_rows: null table".to_string());
+        return -1;
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            storage_set_last_error("wasm_storage_write_insert_rows: table not UTF-8".to_string());
+            return -1;
+        }
+    };
+    let rows = storage_write_reshape_rows(values, nrows, ncols);
+
+    clog!(
+        "[storage-write] core insert-rows txn={} table={:?} nrows={} ncols={}",
+        txn,
+        table_str,
+        nrows,
+        ncols
+    );
+
+    match sh::storage_insert_rows(txn, &table_str, &rows) {
+        Ok(count) => count as i64,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Delete rows by rowid. Returns rows deleted (>=0), or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_write_delete_rows(
+    txn: u32,
+    table: *const c_char,
+    rowids: *const i64,
+    nrowids: u32,
+) -> i64 {
+    use bindings::duckdb::extension::storage_host as sh;
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_write_delete_rows: null table".to_string());
+        return -1;
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            storage_set_last_error("wasm_storage_write_delete_rows: table not UTF-8".to_string());
+            return -1;
+        }
+    };
+    let rowid_slice: &[i64] = if rowids.is_null() || nrowids == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(rowids, nrowids as usize)
+    };
+    let rowid_vec: Vec<i64> = rowid_slice.to_vec();
+
+    clog!(
+        "[storage-write] core delete-rows txn={} table={:?} n={}",
+        txn,
+        table_str,
+        rowid_vec.len()
+    );
+
+    match sh::storage_delete_rows(txn, &table_str, &rowid_vec) {
+        Ok(count) => count as i64,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+/// Update rows by rowid. `values` is `nrows * ncols` cells in row-major order,
+/// parallel to `rowids`. Returns rows updated (>=0), or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_storage_write_update_rows(
+    txn: u32,
+    table: *const c_char,
+    rowids: *const i64,
+    values: *const WasmWriteValue,
+    nrows: u32,
+    ncols: u32,
+) -> i64 {
+    use bindings::duckdb::extension::storage_host as sh;
+    if table.is_null() {
+        storage_set_last_error("wasm_storage_write_update_rows: null table".to_string());
+        return -1;
+    }
+    let table_str = match CStr::from_ptr(table).to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => {
+            storage_set_last_error("wasm_storage_write_update_rows: table not UTF-8".to_string());
+            return -1;
+        }
+    };
+    let rowid_slice: &[i64] = if rowids.is_null() || nrows == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(rowids, nrows as usize)
+    };
+    let rowid_vec: Vec<i64> = rowid_slice.to_vec();
+    let rows = storage_write_reshape_rows(values, nrows, ncols);
+
+    if rowid_vec.len() != rows.len() {
+        storage_set_last_error(format!(
+            "wasm_storage_write_update_rows: rowids ({}) / rows ({}) mismatch",
+            rowid_vec.len(),
+            rows.len()
+        ));
+        return -1;
+    }
+
+    clog!(
+        "[storage-write] core update-rows txn={} table={:?} nrows={} ncols={}",
+        txn,
+        table_str,
+        nrows,
+        ncols
+    );
+
+    match sh::storage_update_rows(txn, &table_str, &rowid_vec, &rows) {
+        Ok(count) => count as i64,
+        Err(err) => {
+            storage_set_last_error(storage_format_error(&err));
+            -1
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
 // 3.1.0 additive minor: streaming + FILTER-PUSHDOWN table-fn bridge.
 //
 // The C++ streaming TableFunction (cpp/wasm_table_stream.cpp) calls these
