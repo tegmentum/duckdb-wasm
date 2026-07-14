@@ -84,6 +84,92 @@ bool wasm_storage_scan_fill(uint32_t scan, void *chunk);
 // Close + free a scan cursor.
 void wasm_storage_scan_close(uint32_t scan);
 
+//===----------------------------------------------------------------------===//
+// M2c WRITE surface: transactions + DDL + DML.
+//
+// The C++ WasmTransactionManager / WasmSchemaEntry::CreateTable /
+// WasmPhysical{Insert,Update,Delete} call these extern-C fns; each routes to
+// the host-provided `duckdb:extension/storage-host` write imports, which the
+// host forwards to the writable storage component's `storage-write-dispatch`
+// export (transactions + DDL + DML — mirror of storage-dispatch on the read
+// side).
+//
+// C ABI conventions (mirroring the scan surface above):
+//   * `wasm_storage_write_begin_transaction` returns the component-side
+//     transaction handle, 0 on error (message in `wasm_storage_last_error`).
+//   * `wasm_storage_write_{commit,rollback}_transaction` return 0 on success,
+//     -1 on error.
+//   * `wasm_storage_write_create_table` returns 0 on success, -1 on error.
+//     `cols` is a heap-borrowed `WasmWriteColumn` array of length `ncols`; each
+//     entry names one column and its `duckdb_type` code (mirroring the
+//     enumeration bridge's `name\t<typecode>` line format).
+//   * `wasm_storage_write_{insert,delete,update}_rows` return the count of
+//     rows affected (>=0) or -1 on error. DataChunk marshalling uses the
+//     tagged-value shape below (`WasmWriteValue`); the caller flattens the
+//     input chunk into row-major cells before dispatch.
+//===----------------------------------------------------------------------===//
+
+// Column-definition entry for CREATE TABLE. `name` is a borrowed C string
+// valid for the duration of the call; `type_code` is the `duckdb_type` enum
+// value (see the `WasmTypeCodeToLogical` switch in wasm_storage.cpp).
+typedef struct WasmWriteColumn {
+	const char *name;
+	uint32_t type_code;
+} WasmWriteColumn;
+
+// Value-type tags for one DML cell. Mirrors the storage-host `duckvalue`
+// variants the writer bridge accepts; unshippable arms surface as
+// WASM_WRITE_VAL_NONE (interpreted as SQL NULL).
+#define WASM_WRITE_VAL_NONE 0
+#define WASM_WRITE_VAL_BOOLEAN 1
+#define WASM_WRITE_VAL_INT64 2
+#define WASM_WRITE_VAL_FLOAT64 3
+#define WASM_WRITE_VAL_TEXT 4
+#define WASM_WRITE_VAL_BLOB 5
+
+// One DML cell crossing the C ABI. `text` (for TEXT) is borrowed, NUL-
+// terminated, valid for the duration of the call. `blob` is borrowed for the
+// call; `blob_len` is meaningful only for WASM_WRITE_VAL_BLOB.
+typedef struct WasmWriteValue {
+	uint8_t value_type; // WASM_WRITE_VAL_*
+	int64_t i64;        // WASM_WRITE_VAL_INT64 / WASM_WRITE_VAL_BOOLEAN (0/1)
+	double f64;         // WASM_WRITE_VAL_FLOAT64
+	const char *text;   // WASM_WRITE_VAL_TEXT
+	const uint8_t *blob; // WASM_WRITE_VAL_BLOB
+	uint32_t blob_len;  // WASM_WRITE_VAL_BLOB
+} WasmWriteValue;
+
+// Open a component-side transaction on `catalog`; returns a txn handle, or 0
+// on error (message in `wasm_storage_last_error`).
+uint32_t wasm_storage_write_begin_transaction(uint32_t catalog);
+
+// Commit / rollback an open transaction. 0 on success, -1 on error.
+int32_t wasm_storage_write_commit_transaction(uint32_t txn);
+int32_t wasm_storage_write_rollback_transaction(uint32_t txn);
+
+// CREATE TABLE. `cols` is `ncols` entries. 0 on success, -1 on error.
+int32_t wasm_storage_write_create_table(uint32_t txn, const char *table,
+                                        const WasmWriteColumn *cols, uint32_t ncols);
+
+// Append rows. `values` is `nrows * ncols` cells in row-major order (i.e. row
+// r's cells are `values[r * ncols .. (r + 1) * ncols]`). Returns the number of
+// rows inserted (>=0), or -1 on error.
+int64_t wasm_storage_write_insert_rows(uint32_t txn, const char *table,
+                                       const WasmWriteValue *values,
+                                       uint32_t nrows, uint32_t ncols);
+
+// Delete rows by row-id. Returns rows deleted (>=0), or -1 on error.
+int64_t wasm_storage_write_delete_rows(uint32_t txn, const char *table,
+                                       const int64_t *rowids, uint32_t nrowids);
+
+// Update rows by row-id. `values` is `nrows * ncols` cells in row-major order,
+// parallel to `rowids` (which is `nrows` long). Returns rows updated (>=0), or
+// -1 on error.
+int64_t wasm_storage_write_update_rows(uint32_t txn, const char *table,
+                                       const int64_t *rowids,
+                                       const WasmWriteValue *values,
+                                       uint32_t nrows, uint32_t ncols);
+
 #ifdef __cplusplus
 }
 #endif
