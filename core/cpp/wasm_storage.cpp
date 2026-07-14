@@ -2,6 +2,10 @@
 // wasm_storage.cpp
 //
 // M2a: read-only foreign-catalog StorageExtension for the wasm core.
+// M2b: engine-driven projection + filter-pushdown scan (below).
+// M2c: WRITE surface — transactions + DDL + DML routed to the writable
+//      storage component's `storage-write-dispatch` export through the
+//      `storage-host` write imports.
 //
 // `ATTACH 'file.sqlite' (TYPE sqlitewasm) AS db;` dispatches here. This TU
 // subclasses the DuckDB-internal Catalog / SchemaCatalogEntry / TableCatalogEntry
@@ -9,9 +13,6 @@
 // to enumerate the foreign DB's schema. The metadata round-trips to the
 // sqlitewasm WIT component through the extern-C bridge (wasm_storage_*, defined
 // in Rust core/src/lib.rs), which routes to the host's storage-host import.
-//
-// SCAN is NOT implemented yet (M2b): WasmTableEntry::GetScanFunction throws
-// NotImplementedException.
 //
 // Compiled in-core (DUCKDB_BUILD_LIBRARY) with the exact wasi-sdk flags
 // extracted from sqlite_scanner's build (see core/build.rs).
@@ -44,6 +45,18 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/column_list.hpp"
 
 #include "wasm_storage_bridge.h"
 
@@ -122,6 +135,164 @@ static LogicalType WasmTypeCodeToLogical(uint32_t code) {
 	}
 }
 
+//! Inverse of WasmTypeCodeToLogical -- narrow a LogicalType back to the
+//! `duckdb_type` enum code the bridge uses. Reads only the top-level id (rich
+//! types collapse to a base code, mirroring how the read side reports them).
+static uint32_t WasmLogicalToTypeCode(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return 1;
+	case LogicalTypeId::TINYINT:
+		return 2;
+	case LogicalTypeId::SMALLINT:
+		return 3;
+	case LogicalTypeId::INTEGER:
+		return 4;
+	case LogicalTypeId::BIGINT:
+		return 5;
+	case LogicalTypeId::UTINYINT:
+		return 6;
+	case LogicalTypeId::USMALLINT:
+		return 7;
+	case LogicalTypeId::UINTEGER:
+		return 8;
+	case LogicalTypeId::UBIGINT:
+		return 9;
+	case LogicalTypeId::FLOAT:
+		return 10;
+	case LogicalTypeId::DOUBLE:
+		return 11;
+	case LogicalTypeId::TIMESTAMP:
+		return 12;
+	case LogicalTypeId::DATE:
+		return 13;
+	case LogicalTypeId::TIME:
+		return 14;
+	case LogicalTypeId::INTERVAL:
+		return 15;
+	case LogicalTypeId::VARCHAR:
+		return 17;
+	case LogicalTypeId::BLOB:
+		return 18;
+	case LogicalTypeId::DECIMAL:
+		return 19;
+	case LogicalTypeId::UUID:
+		return 27;
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return 31;
+	default:
+		// Fallback to VARCHAR — the Rust side's storage_code_to_logicaltype
+		// widens unknown codes to Text as well, so this round-trips cleanly.
+		return 17;
+	}
+}
+
+//! Marshals one flat-vector cell at row `r` into a bridge write-value cell.
+//! `text_storage` and `blob_storage` keep the borrowed pointers alive for the
+//! duration of the enclosing bridge call. Fields not selected by value_type
+//! are left inert (zero-initialized by the caller).
+static void WasmMarshalWriteCell(Vector &vec, idx_t r, WasmWriteValue &out,
+                                 std::string &text_storage, std::string &blob_storage) {
+	auto &validity = FlatVector::Validity(vec);
+	if (!validity.RowIsValid(r)) {
+		out.value_type = WASM_WRITE_VAL_NONE;
+		return;
+	}
+	auto &type = vec.GetType();
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN: {
+		auto data = FlatVector::GetData<bool>(vec);
+		out.value_type = WASM_WRITE_VAL_BOOLEAN;
+		out.i64 = data[r] ? 1 : 0;
+		return;
+	}
+	case LogicalTypeId::TINYINT: {
+		auto data = FlatVector::GetData<int8_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::SMALLINT: {
+		auto data = FlatVector::GetData<int16_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::INTEGER: {
+		auto data = FlatVector::GetData<int32_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::BIGINT: {
+		auto data = FlatVector::GetData<int64_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = data[r];
+		return;
+	}
+	case LogicalTypeId::UTINYINT: {
+		auto data = FlatVector::GetData<uint8_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::USMALLINT: {
+		auto data = FlatVector::GetData<uint16_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::UINTEGER: {
+		auto data = FlatVector::GetData<uint32_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::UBIGINT: {
+		auto data = FlatVector::GetData<uint64_t>(vec);
+		out.value_type = WASM_WRITE_VAL_INT64;
+		// Best-effort narrow; large values are truncated (the tag is signed).
+		out.i64 = static_cast<int64_t>(data[r]);
+		return;
+	}
+	case LogicalTypeId::FLOAT: {
+		auto data = FlatVector::GetData<float>(vec);
+		out.value_type = WASM_WRITE_VAL_FLOAT64;
+		out.f64 = static_cast<double>(data[r]);
+		return;
+	}
+	case LogicalTypeId::DOUBLE: {
+		auto data = FlatVector::GetData<double>(vec);
+		out.value_type = WASM_WRITE_VAL_FLOAT64;
+		out.f64 = data[r];
+		return;
+	}
+	case LogicalTypeId::VARCHAR: {
+		auto data = FlatVector::GetData<string_t>(vec);
+		text_storage = data[r].GetString();
+		out.value_type = WASM_WRITE_VAL_TEXT;
+		out.text = text_storage.c_str();
+		return;
+	}
+	case LogicalTypeId::BLOB: {
+		auto data = FlatVector::GetData<string_t>(vec);
+		blob_storage.assign(data[r].GetDataUnsafe(), data[r].GetSize());
+		out.value_type = WASM_WRITE_VAL_BLOB;
+		out.blob = reinterpret_cast<const uint8_t *>(blob_storage.data());
+		out.blob_len = static_cast<uint32_t>(blob_storage.size());
+		return;
+	}
+	default:
+		// Fallback: render the value as TEXT via the Value ToString path.
+		// Covers DATE / TIMESTAMP / DECIMAL / UUID etc. -- the writer
+		// component can re-parse them from the string form.
+		text_storage = vec.GetValue(r).ToString();
+		out.value_type = WASM_WRITE_VAL_TEXT;
+		out.text = text_storage.c_str();
+		return;
+	}
+}
+
 //! Splits a '\n'-joined bridge string into its lines (empty input -> empty).
 static vector<std::string> WasmSplitLines(const char *raw) {
 	vector<std::string> out;
@@ -189,10 +360,8 @@ public:
 	//! Lazily builds + caches WasmTableEntry instances by name.
 	optional_ptr<CatalogEntry> GetOrLoadTable(const string &table_name);
 
-	// --- read-only: all mutators throw ---
-	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override {
-		throw BinderException("wasm storage is read-only: cannot create tables");
-	}
+	// --- write: CreateTable routes to the bridge; other DDL is still stubbed ---
+	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override;
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) override {
 		throw BinderException("wasm storage is read-only");
 	}
@@ -239,6 +408,10 @@ public:
 
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction,
 	                                       const EntryLookupInfo &lookup_info) override;
+
+	//! Adopts a locally-built WasmTableEntry (used by CreateTable after the
+	//! bridge acknowledges the CREATE). Idempotent by name.
+	CatalogEntry &InsertTable(unique_ptr<CatalogEntry> entry, const string &table_name);
 
 private:
 	mutex entry_lock;
@@ -301,23 +474,17 @@ public:
 
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan) override {
-		throw NotImplementedException("wasm storage is read-only: CREATE TABLE AS not supported");
+		throw NotImplementedException("wasm storage: CREATE TABLE AS not supported yet");
 	}
 	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
-	                             optional_ptr<PhysicalOperator> plan) override {
-		throw NotImplementedException("wasm storage is read-only: INSERT not supported");
-	}
+	                             optional_ptr<PhysicalOperator> plan) override;
 	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
-	                             PhysicalOperator &plan) override {
-		throw NotImplementedException("wasm storage is read-only: DELETE not supported");
-	}
+	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
-	                             PhysicalOperator &plan) override {
-		throw NotImplementedException("wasm storage is read-only: UPDATE not supported");
-	}
+	                             PhysicalOperator &plan) override;
 	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
 	                                            unique_ptr<LogicalOperator> plan) override {
-		throw NotImplementedException("wasm storage is read-only: CREATE INDEX not supported");
+		throw NotImplementedException("wasm storage: CREATE INDEX not supported yet");
 	}
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override {
@@ -424,12 +591,51 @@ optional_ptr<CatalogEntry> WasmSchemaEntry::LookupEntry(CatalogTransaction trans
 
 //===----------------------------------------------------------------------===//
 // WasmTransaction
+//
+// Holds the component-side transaction handle returned by
+// `wasm_storage_write_begin_transaction`. The physical operators pull the
+// handle out via `WasmTransaction::Get(context, catalog)` and pass it to
+// insert/update/delete/create-table on every Sink call.
 //===----------------------------------------------------------------------===//
 
 class WasmTransaction : public Transaction {
 public:
-	WasmTransaction(TransactionManager &manager, ClientContext &context) : Transaction(manager, context) {
+	WasmTransaction(TransactionManager &manager, ClientContext &context, uint32_t catalog_handle_p)
+	    : Transaction(manager, context), catalog_handle(catalog_handle_p), txn_handle(0), started(false) {
 	}
+
+	//! Lazily open the component-side transaction on first write.
+	uint32_t EnsureStarted() {
+		if (!started) {
+			txn_handle = wasm_storage_write_begin_transaction(catalog_handle);
+			if (txn_handle == 0) {
+				throw IOException("wasm storage begin-transaction failed: %s", WasmStorageLastError());
+			}
+			started = true;
+		}
+		return txn_handle;
+	}
+
+	uint32_t TxnHandle() const {
+		return txn_handle;
+	}
+
+	bool IsStarted() const {
+		return started;
+	}
+
+	uint32_t CatalogHandle() const {
+		return catalog_handle;
+	}
+
+	static WasmTransaction &Get(ClientContext &context, Catalog &catalog) {
+		return Transaction::Get(context, catalog).Cast<WasmTransaction>();
+	}
+
+private:
+	uint32_t catalog_handle;
+	uint32_t txn_handle;
+	bool started;
 };
 
 //===----------------------------------------------------------------------===//
@@ -443,7 +649,7 @@ public:
 	}
 
 	Transaction &StartTransaction(ClientContext &context) override {
-		auto transaction = make_uniq<WasmTransaction>(*this, context);
+		auto transaction = make_uniq<WasmTransaction>(*this, context, wasm_catalog.GetCatalogHandle());
 		auto &result = *transaction;
 		lock_guard<mutex> l(transaction_lock);
 		transactions[result] = std::move(transaction);
@@ -451,18 +657,38 @@ public:
 	}
 
 	ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override {
+		auto &wtxn = transaction.Cast<WasmTransaction>();
+		if (wtxn.IsStarted()) {
+			int rc = wasm_storage_write_commit_transaction(wtxn.TxnHandle());
+			if (rc != 0) {
+				lock_guard<mutex> l(transaction_lock);
+				transactions.erase(transaction);
+				return ErrorData(ExceptionType::IO,
+				                 std::string("wasm storage commit failed: ") + WasmStorageLastError());
+			}
+		}
 		lock_guard<mutex> l(transaction_lock);
 		transactions.erase(transaction);
 		return ErrorData();
 	}
 
 	void RollbackTransaction(Transaction &transaction) override {
+		auto &wtxn = transaction.Cast<WasmTransaction>();
+		if (wtxn.IsStarted()) {
+			// Best-effort: log & drop on error (RollbackTransaction has no
+			// error channel).
+			int rc = wasm_storage_write_rollback_transaction(wtxn.TxnHandle());
+			if (rc != 0) {
+				fprintf(stderr, "wasm storage rollback failed: %s\n", WasmStorageLastError().c_str());
+			}
+		}
 		lock_guard<mutex> l(transaction_lock);
 		transactions.erase(transaction);
 	}
 
 	void Checkpoint(ClientContext &context, bool force = false) override {
-		// read-only: nothing to checkpoint.
+		// The writable component owns its own persistence; the wasm host
+		// exposes no checkpoint hook, so this is a no-op.
 	}
 
 private:
@@ -470,6 +696,75 @@ private:
 	mutex transaction_lock;
 	reference_map_t<Transaction, unique_ptr<WasmTransaction>> transactions;
 };
+
+//===----------------------------------------------------------------------===//
+// WasmSchemaEntry::CreateTable + InsertTable
+//
+// The bridge's `wasm_storage_write_create_table` opens (or reuses) the
+// component-side transaction on `catalog`, forwards the CREATE, and returns
+// success. On success we materialize a WasmTableEntry so subsequent reads /
+// writes can bind to it without waiting for the next storage-list-tables
+// refresh.
+//===----------------------------------------------------------------------===//
+
+CatalogEntry &WasmSchemaEntry::InsertTable(unique_ptr<CatalogEntry> entry, const string &table_name) {
+	lock_guard<mutex> guard(entry_lock);
+	auto &ref = *entry;
+	tables[table_name] = std::move(entry);
+	return ref;
+}
+
+optional_ptr<CatalogEntry> WasmSchemaEntry::CreateTable(CatalogTransaction transaction,
+                                                        BoundCreateTableInfo &info) {
+	auto &wasm_catalog = catalog.Cast<WasmCatalog>();
+	auto &base_info = info.Base();
+
+	// Reject options we can't honor. The write bridge accepts a plain CREATE.
+	if (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+		throw NotImplementedException("wasm storage: CREATE OR REPLACE TABLE not supported yet");
+	}
+
+	// Ensure a component-side transaction exists (the ExtensionInstance
+	// trampolines require an open txn handle).
+	if (!transaction.transaction) {
+		throw InternalException("wasm storage: CreateTable requires a transaction");
+	}
+	auto &wtxn = transaction.transaction->Cast<WasmTransaction>();
+	uint32_t txn = wtxn.EnsureStarted();
+
+	// Marshal the column list into the bridge's WasmWriteColumn array.
+	vector<WasmWriteColumn> cols;
+	vector<std::string> name_storage;
+	cols.reserve(base_info.columns.LogicalColumnCount());
+	name_storage.reserve(base_info.columns.LogicalColumnCount());
+	for (idx_t i = 0; i < base_info.columns.LogicalColumnCount(); i++) {
+		auto &col = base_info.columns.GetColumn(LogicalIndex(i));
+		name_storage.emplace_back(col.GetName());
+		WasmWriteColumn entry;
+		entry.name = name_storage.back().c_str();
+		entry.type_code = WasmLogicalToTypeCode(col.GetType());
+		cols.push_back(entry);
+	}
+
+	int rc = wasm_storage_write_create_table(txn, base_info.table.c_str(),
+	                                          cols.empty() ? nullptr : cols.data(),
+	                                          static_cast<uint32_t>(cols.size()));
+	if (rc != 0) {
+		throw IOException("wasm storage create-table failed for '%s': %s", base_info.table,
+		                  WasmStorageLastError());
+	}
+
+	// Materialize a WasmTableEntry mirroring the columns we shipped.
+	CreateTableInfo materialized(*this, base_info.table);
+	for (idx_t i = 0; i < base_info.columns.LogicalColumnCount(); i++) {
+		auto &col = base_info.columns.GetColumn(LogicalIndex(i));
+		ColumnDefinition new_col(col.GetName(), col.GetType());
+		materialized.columns.AddColumn(std::move(new_col));
+	}
+	auto table_entry = make_uniq<WasmTableEntry>(catalog, *this, materialized);
+	auto &inserted = InsertTable(std::move(table_entry), base_info.table);
+	return optional_ptr<CatalogEntry>(&inserted);
+}
 
 //===----------------------------------------------------------------------===//
 // StorageExtension wiring
@@ -773,6 +1068,332 @@ TableFunction WasmTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 
 	bind_data = std::move(data);
 	return function;
+}
+
+//===----------------------------------------------------------------------===//
+// M2c write physical operators.
+//
+// Modeled on sqlite_scanner's SQLite{Insert,Update,Delete} (build/duckdb-wasi/
+// _deps/sqlite_scanner_extension_fc-src/src/storage/sqlite_{insert,update,
+// delete}.cpp). Each subclasses PhysicalOperator, consumes DataChunks in
+// Sink(), and reports the total row count in GetData(). The Sink path pulls
+// the txn handle out of the WasmTransaction attached to the ClientContext and
+// forwards each row batch to the bridge as row-major tagged cells; DuckDB
+// serializes writes per catalog, so no cross-thread state is needed.
+//===----------------------------------------------------------------------===//
+
+//! Global sink state shared by all three operators. Holds the resolved
+//! WasmTableEntry pointer and a running row-affected counter surfaced in
+//! GetData().
+class WasmWriteGlobalState : public GlobalSinkState {
+public:
+	explicit WasmWriteGlobalState(WasmTableEntry &table_p) : table(table_p), affected(0) {
+	}
+
+	WasmTableEntry &table;
+	idx_t affected;
+};
+
+//===----------------------------------------------------------------------===//
+// WasmPhysicalInsert
+//===----------------------------------------------------------------------===//
+
+class WasmPhysicalInsert : public PhysicalOperator {
+public:
+	WasmPhysicalInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(table) {
+	}
+
+	// --- Sink interface ---
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<WasmWriteGlobalState>(table.Cast<WasmTableEntry>());
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<WasmWriteGlobalState>();
+		if (chunk.size() == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		chunk.Flatten();
+
+		auto &wcatalog = gstate.table.catalog.Cast<WasmCatalog>();
+		auto &wtxn = WasmTransaction::Get(context.client, gstate.table.catalog);
+		uint32_t txn = wtxn.EnsureStarted();
+		(void)wcatalog; // txn already carries the catalog handle
+
+		idx_t nrows = chunk.size();
+		idx_t ncols = chunk.ColumnCount();
+		if (ncols == 0) {
+			// No columns to insert -- still report an affected count so
+			// GetData() returns the right total.
+			gstate.affected += nrows;
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+
+		vector<WasmWriteValue> flat(nrows * ncols);
+		// Text/blob cell contents must outlive the bridge call; park them here.
+		vector<std::string> text_park(nrows * ncols);
+		vector<std::string> blob_park(nrows * ncols);
+		for (idx_t r = 0; r < nrows; r++) {
+			for (idx_t c = 0; c < ncols; c++) {
+				idx_t slot = r * ncols + c;
+				flat[slot] = WasmWriteValue{};
+				WasmMarshalWriteCell(chunk.data[c], r, flat[slot], text_park[slot], blob_park[slot]);
+			}
+		}
+
+		int64_t rc = wasm_storage_write_insert_rows(txn, gstate.table.name.c_str(), flat.data(),
+		                                             static_cast<uint32_t>(nrows),
+		                                             static_cast<uint32_t>(ncols));
+		if (rc < 0) {
+			throw IOException("wasm storage insert-rows failed for '%s': %s", gstate.table.name,
+			                  WasmStorageLastError());
+		}
+		gstate.affected += static_cast<idx_t>(rc);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	// --- Source interface (produces the "N rows inserted" tuple) ---
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &gstate = sink_state->Cast<WasmWriteGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.affected)));
+		return SourceResultType::FINISHED;
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+
+	string GetName() const override {
+		return "WASM_INSERT";
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		result["Table Name"] = table.name;
+		return result;
+	}
+
+private:
+	TableCatalogEntry &table;
+};
+
+//===----------------------------------------------------------------------===//
+// WasmPhysicalDelete
+//===----------------------------------------------------------------------===//
+
+class WasmPhysicalDelete : public PhysicalOperator {
+public:
+	WasmPhysicalDelete(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table, idx_t rowid_index_p)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(table),
+	      rowid_index(rowid_index_p) {
+	}
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<WasmWriteGlobalState>(table.Cast<WasmTableEntry>());
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<WasmWriteGlobalState>();
+		if (chunk.size() == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		chunk.Flatten();
+
+		auto &wtxn = WasmTransaction::Get(context.client, gstate.table.catalog);
+		uint32_t txn = wtxn.EnsureStarted();
+
+		auto &rowid_vec = chunk.data[rowid_index];
+		auto rowid_data = FlatVector::GetData<int64_t>(rowid_vec);
+		vector<int64_t> rowids(rowid_data, rowid_data + chunk.size());
+
+		int64_t rc = wasm_storage_write_delete_rows(txn, gstate.table.name.c_str(), rowids.data(),
+		                                             static_cast<uint32_t>(rowids.size()));
+		if (rc < 0) {
+			throw IOException("wasm storage delete-rows failed for '%s': %s", gstate.table.name,
+			                  WasmStorageLastError());
+		}
+		gstate.affected += static_cast<idx_t>(rc);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &gstate = sink_state->Cast<WasmWriteGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.affected)));
+		return SourceResultType::FINISHED;
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+
+	string GetName() const override {
+		return "WASM_DELETE";
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		result["Table Name"] = table.name;
+		return result;
+	}
+
+private:
+	TableCatalogEntry &table;
+	idx_t rowid_index;
+};
+
+//===----------------------------------------------------------------------===//
+// WasmPhysicalUpdate
+//
+// DuckDB feeds UPDATE via a plan whose child chunks contain:
+//   * update_columns[0..N)  the new column values, in the order of the
+//                            LogicalUpdate::columns list (physical indices).
+//   * chunk.data[ChildTypes.size()-1]  the rowid column (last).
+// We ship each row as `rowid` + `[new_col_0..N)`; the writer bridge maps rows
+// by rowid.
+//===----------------------------------------------------------------------===//
+
+class WasmPhysicalUpdate : public PhysicalOperator {
+public:
+	WasmPhysicalUpdate(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
+	                   vector<PhysicalIndex> columns_p)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(table),
+	      columns(std::move(columns_p)) {
+	}
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<WasmWriteGlobalState>(table.Cast<WasmTableEntry>());
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<WasmWriteGlobalState>();
+		if (chunk.size() == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		chunk.Flatten();
+
+		auto &wtxn = WasmTransaction::Get(context.client, gstate.table.catalog);
+		uint32_t txn = wtxn.EnsureStarted();
+
+		idx_t nrows = chunk.size();
+		idx_t ncols = chunk.ColumnCount();
+		if (ncols == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		// Rowid is the last column; update columns precede it.
+		idx_t update_cols = ncols - 1;
+		auto &rowid_vec = chunk.data[ncols - 1];
+		auto rowid_data = FlatVector::GetData<int64_t>(rowid_vec);
+		vector<int64_t> rowids(rowid_data, rowid_data + nrows);
+
+		vector<WasmWriteValue> flat(nrows * update_cols);
+		vector<std::string> text_park(nrows * update_cols);
+		vector<std::string> blob_park(nrows * update_cols);
+		for (idx_t r = 0; r < nrows; r++) {
+			for (idx_t c = 0; c < update_cols; c++) {
+				idx_t slot = r * update_cols + c;
+				flat[slot] = WasmWriteValue{};
+				WasmMarshalWriteCell(chunk.data[c], r, flat[slot], text_park[slot], blob_park[slot]);
+			}
+		}
+
+		int64_t rc = wasm_storage_write_update_rows(txn, gstate.table.name.c_str(), rowids.data(),
+		                                             update_cols == 0 ? nullptr : flat.data(),
+		                                             static_cast<uint32_t>(nrows),
+		                                             static_cast<uint32_t>(update_cols));
+		if (rc < 0) {
+			throw IOException("wasm storage update-rows failed for '%s': %s", gstate.table.name,
+			                  WasmStorageLastError());
+		}
+		gstate.affected += static_cast<idx_t>(rc);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &gstate = sink_state->Cast<WasmWriteGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.affected)));
+		return SourceResultType::FINISHED;
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+
+	string GetName() const override {
+		return "WASM_UPDATE";
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		result["Table Name"] = table.name;
+		return result;
+	}
+
+private:
+	TableCatalogEntry &table;
+	vector<PhysicalIndex> columns;
+};
+
+//===----------------------------------------------------------------------===//
+// WasmCatalog::Plan{Insert,Update,Delete}
+//
+// The wasm write path currently rejects RETURNING / ON CONFLICT (sqlite_scanner
+// takes the same restriction — see sqlite_insert.cpp:186 & sqlite_update.cpp:110).
+//===----------------------------------------------------------------------===//
+
+PhysicalOperator &WasmCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                          optional_ptr<PhysicalOperator> plan) {
+	if (op.return_chunk) {
+		throw BinderException("wasm storage: RETURNING clause is not supported for INSERT yet");
+	}
+	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw BinderException("wasm storage: ON CONFLICT is not supported for INSERT yet");
+	}
+	D_ASSERT(plan);
+	auto &insert = planner.Make<WasmPhysicalInsert>(op, op.table);
+	insert.children.push_back(*plan);
+	return insert;
+}
+
+PhysicalOperator &WasmCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                          PhysicalOperator &plan) {
+	if (op.return_chunk) {
+		throw BinderException("wasm storage: RETURNING clause is not supported for DELETE yet");
+	}
+	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
+	auto &delete_op = planner.Make<WasmPhysicalDelete>(op, op.table, bound_ref.index);
+	delete_op.children.push_back(plan);
+	return delete_op;
+}
+
+PhysicalOperator &WasmCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                          PhysicalOperator &plan) {
+	if (op.return_chunk) {
+		throw BinderException("wasm storage: RETURNING clause is not supported for UPDATE yet");
+	}
+	for (auto &expr : op.expressions) {
+		if (expr->type == ExpressionType::VALUE_DEFAULT) {
+			throw BinderException("wasm storage: SET DEFAULT is not supported for UPDATE yet");
+		}
+	}
+	auto &update = planner.Make<WasmPhysicalUpdate>(op, op.table, std::move(op.columns));
+	update.children.push_back(plan);
+	return update;
 }
 
 } // namespace duckdb
