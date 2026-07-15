@@ -623,6 +623,7 @@ extern "C" {
 
     pub fn duckdb_data_chunk_get_size(chunk: duckdb_data_chunk) -> idx_t;
     pub fn duckdb_data_chunk_set_size(chunk: duckdb_data_chunk, size: idx_t);
+    pub fn duckdb_data_chunk_get_column_count(chunk: duckdb_data_chunk) -> idx_t;
     pub fn duckdb_data_chunk_get_vector(chunk: duckdb_data_chunk, col_idx: idx_t) -> duckdb_vector;
     pub fn duckdb_vector_get_column_type(vector: duckdb_vector) -> duckdb_logical_type;
     pub fn duckdb_vector_get_data(vector: duckdb_vector) -> *mut c_void;

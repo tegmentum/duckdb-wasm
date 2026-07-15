@@ -697,9 +697,17 @@ pub unsafe extern "C" fn wasm_storage_scan_open(
         slice::from_raw_parts(projection, nproj as usize)
     };
 
-    // Projected column types in emit order (empty projection => natural order).
+    // Projected column types in emit order. An EMPTY projection means the
+    // caller (e.g. DuckDB dispatching `count(*)`) doesn't want any data
+    // columns -- just row cardinality; honor that literally rather than
+    // materializing all columns. The scan-fill loop then sees `column_types`
+    // == [] and skips vector writes entirely (bounded via
+    // duckdb_data_chunk_get_column_count). Materializing all columns here
+    // instead would mis-write the phantom rowid slot DuckDB attaches to the
+    // output DataChunk, tripping `Expected vector of type VARCHAR, but found
+    // vector of type INT64`.
     let column_types: Vec<Logicaltype> = if projection_slice.is_empty() {
-        all_cols.iter().map(|c| c.logical.clone()).collect()
+        Vec::new()
     } else {
         let mut out = Vec::with_capacity(projection_slice.len());
         for &idx in projection_slice {
@@ -810,7 +818,16 @@ pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -
 
     duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
     let ncols = column_types.len();
-    for col_idx in 0..ncols {
+    // For `count(*)`-style queries DuckDB projects ZERO columns from the
+    // storage scan (only cardinality is required) yet the caller-supplied
+    // `output` DataChunk may still expose a phantom column (e.g. the rowid
+    // slot). Writing our scan-side vector into that slot mis-types it and
+    // trips DuckDB's `Expected vector of type X, but found Y` assertion.
+    // Bound the fill loop by the *output*'s column count so we never spill
+    // past the columns DuckDB actually wants populated.
+    let output_ncols = duckdb::duckdb_data_chunk_get_column_count(output) as usize;
+    let fill_cols = ncols.min(output_ncols);
+    for col_idx in 0..fill_cols {
         let vector = duckdb::duckdb_data_chunk_get_vector(output, col_idx as duckdb::idx_t);
         let logical = &column_types[col_idx];
         for (row, row_values) in rows.iter().enumerate() {
