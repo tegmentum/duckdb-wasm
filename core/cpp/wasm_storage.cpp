@@ -807,6 +807,13 @@ struct WasmScanInfo : public TableFunctionInfo {
 	string table_name;
 	vector<string> names;
 	vector<LogicalType> types;
+	//! Owning WasmTableEntry (as TableCatalogEntry, since WasmTableEntry is not
+	//! yet complete at this file scope point). Threaded through WasmScanBind
+	//! into WasmScanBindData::table so LogicalGet::GetTable() (via the
+	//! `get_bind_info` callback) can resolve the base table during
+	//! UPDATE/DELETE binding. Modeled on sqlite_scanner (SQLiteTableEntry sets
+	//! `result->table = this;` in GetScanFunction; SqliteBindInfo echoes it).
+	optional_ptr<TableCatalogEntry> table;
 };
 
 //! Per-bind data: the table's catalog handle + name + column list, used by init
@@ -816,6 +823,8 @@ struct WasmScanBindData : public TableFunctionData {
 	string table_name;
 	vector<string> names;
 	vector<LogicalType> types;
+	//! See WasmScanInfo::table.
+	optional_ptr<TableCatalogEntry> table;
 };
 
 struct WasmScanGlobalState : public GlobalTableFunctionState {
@@ -934,7 +943,25 @@ static unique_ptr<FunctionData> WasmScanBind(ClientContext &context, TableFuncti
 	result->table_name = info.table_name;
 	result->names = info.names;
 	result->types = info.types;
+	// Thread the base-table pointer through so `get_bind_info` (below) can
+	// surface it to LogicalGet::GetTable() during UPDATE/DELETE binding.
+	result->table = info.table;
 	return std::move(result);
+}
+
+//! Mirrors sqlite_scanner::SqliteBindInfo (sqlite_scanner.cpp:333). DuckDB's
+//! LogicalGet::GetTable() looks up the base TableCatalogEntry through
+//! `function.get_bind_info(bind_data).table`; without this callback the
+//! Binder's UPDATE/DELETE resolution ("Can only update/delete base table")
+//! rejects the plan because the LogicalGet's table function is our custom
+//! `wasm_storage_scan` rather than DuckDB's built-in seq scan.
+static BindInfo WasmScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+	BindInfo info(ScanType::EXTERNAL);
+	if (bind_data_p) {
+		auto &bind_data = bind_data_p->Cast<WasmScanBindData>();
+		info.table = bind_data.table;
+	}
+	return info;
 }
 
 static unique_ptr<GlobalTableFunctionState> WasmScanInitGlobal(ClientContext &context,
@@ -1049,6 +1076,10 @@ TableFunction WasmTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 	auto info = make_shared_ptr<WasmScanInfo>();
 	info->catalog_handle = wasm_catalog.GetCatalogHandle();
 	info->table_name = name;
+	// Stash the base TableCatalogEntry so LogicalGet::GetTable() can resolve
+	// it through the `get_bind_info` callback (see WasmScanBindInfo above).
+	// Required for UPDATE/DELETE binding.
+	info->table = this;
 	auto &cols = GetColumns();
 	for (auto &col : cols.Logical()) {
 		info->names.push_back(col.Name());
@@ -1060,10 +1091,12 @@ TableFunction WasmTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 	data->table_name = info->table_name;
 	data->names = info->names;
 	data->types = info->types;
+	data->table = this;
 
 	TableFunction function("wasm_storage_scan", {}, WasmScanFunction, WasmScanBind, WasmScanInitGlobal);
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
+	function.get_bind_info = WasmScanBindInfo;
 	function.function_info = std::move(info);
 
 	bind_data = std::move(data);
