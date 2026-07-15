@@ -845,7 +845,12 @@ struct WasmScanGlobalState : public GlobalTableFunctionState {
 };
 
 //! Resolve a projected column position (an index INTO column_ids) back to the
-//! real table column index, skipping virtual/rowid columns.
+//! real table column index. Returns TRUE and writes the real column to
+//! `out_real_column` for a normal column; returns FALSE for a rowid slot
+//! (COLUMN_IDENTIFIER_ROW_ID) — the caller records those OUTPUT-vector
+//! positions separately and forwards them to the bridge as `rowid_slots`,
+//! so the guest's trailing rowid values are routed to the right DuckDB slot
+//! at scan-fill time.
 static bool WasmResolveTableColumn(const vector<column_t> &column_ids, idx_t projected_pos,
                                    uint32_t &out_real_column) {
 	if (projected_pos >= column_ids.size()) {
@@ -857,6 +862,15 @@ static bool WasmResolveTableColumn(const vector<column_t> &column_ids, idx_t pro
 	}
 	out_real_column = static_cast<uint32_t>(cid);
 	return true;
+}
+
+//! True iff `projected_pos` in `column_ids` names the virtual rowid column
+//! (COLUMN_IDENTIFIER_ROW_ID). Complements `WasmResolveTableColumn`.
+static bool WasmIsRowidSlot(const vector<column_t> &column_ids, idx_t projected_pos) {
+	if (projected_pos >= column_ids.size()) {
+		return false;
+	}
+	return column_ids[projected_pos] == COLUMN_IDENTIFIER_ROW_ID;
 }
 
 //! Map a DuckDB comparison ExpressionType to a bridge compare-op code.
@@ -970,15 +984,24 @@ static unique_ptr<GlobalTableFunctionState> WasmScanInitGlobal(ClientContext &co
 	auto state = make_uniq<WasmScanGlobalState>();
 
 	// Projection: column_ids in emit order; map to real table column indices,
-	// dropping virtual/rowid columns.
+	// and CAPTURE the OUTPUT-vector positions of rowid slots separately (so the
+	// bridge can be told to ask the guest for rowids AND we can route the
+	// guest's trailing rowid cell(s) into those DuckDB output vectors at
+	// scan-fill time). `projection` stays exclusively real table column
+	// indices; `rowid_slots` records the parallel-indexed positions in the
+	// caller-side DataChunk that must receive rowid values.
 	vector<uint32_t> projection;
+	vector<uint32_t> rowid_slots;
 	projection.reserve(input.column_ids.size());
 	for (idx_t i = 0; i < input.column_ids.size(); i++) {
 		uint32_t real_col;
 		if (WasmResolveTableColumn(input.column_ids, i, real_col)) {
 			projection.push_back(real_col);
+		} else if (WasmIsRowidSlot(input.column_ids, i)) {
+			rowid_slots.push_back(static_cast<uint32_t>(i));
 		}
 	}
+	const bool wants_rowid = !rowid_slots.empty();
 
 	// Filters: input.filters maps (index INTO column_ids) -> TableFilter. Resolve
 	// the key back to the real table column index before shipping.
@@ -1036,10 +1059,14 @@ static unique_ptr<GlobalTableFunctionState> WasmScanInitGlobal(ClientContext &co
 
 	const uint32_t *proj_ptr = projection.empty() ? nullptr : projection.data();
 	const WasmScanFilter *filt_ptr = filters.empty() ? nullptr : filters.data();
+	const uint32_t *rowid_slots_ptr = rowid_slots.empty() ? nullptr : rowid_slots.data();
 	uint32_t scan = wasm_storage_scan_open(bind_data.catalog_handle, bind_data.table_name.c_str(),
 	                                        proj_ptr, static_cast<uint32_t>(projection.size()),
 	                                        filt_ptr, static_cast<uint32_t>(filters.size()),
-	                                        /*limit=*/-1);
+	                                        /*limit=*/-1,
+	                                        wants_rowid ? 1 : 0,
+	                                        rowid_slots_ptr,
+	                                        static_cast<uint32_t>(rowid_slots.size()));
 	if (scan == 0) {
 		throw IOException("wasm storage scan-open failed for '%s': %s", bind_data.table_name,
 		                  WasmStorageLastError());
@@ -1289,11 +1316,13 @@ private:
 // WasmPhysicalUpdate
 //
 // DuckDB feeds UPDATE via a plan whose child chunks contain:
-//   * update_columns[0..N)  the new column values, in the order of the
-//                            LogicalUpdate::columns list (physical indices).
+//   * update_columns[0..N)  the new column values, in the order of
+//                            LogicalUpdate::columns (physical/schema indices,
+//                            captured here at plan time and forwarded as the
+//                            `updated_columns` bridge arg).
 //   * chunk.data[ChildTypes.size()-1]  the rowid column (last).
-// We ship each row as `rowid` + `[new_col_0..N)`; the writer bridge maps rows
-// by rowid.
+// We ship each row as `rowid` + the SET cells; the writer bridge maps each
+// row's cells to the target columns using `updated_columns`.
 //===----------------------------------------------------------------------===//
 
 class WasmPhysicalUpdate : public PhysicalOperator {
@@ -1323,11 +1352,25 @@ public:
 		if (ncols == 0) {
 			return SinkResultType::NEED_MORE_INPUT;
 		}
-		// Rowid is the last column; update columns precede it.
+		// Rowid is the last column; update columns precede it. The number of
+		// SET cells is `ncols - 1` and must match `columns.size()` (== the
+		// LogicalUpdate::columns list captured at plan time). Marshal the
+		// PhysicalIndex list into a flat schema-index vector for the bridge.
 		idx_t update_cols = ncols - 1;
+		if (update_cols != columns.size()) {
+			throw InternalException(
+			    "wasm storage update: chunk update-set width %llu != plan columns %llu",
+			    static_cast<uint64_t>(update_cols), static_cast<uint64_t>(columns.size()));
+		}
 		auto &rowid_vec = chunk.data[ncols - 1];
 		auto rowid_data = FlatVector::GetData<int64_t>(rowid_vec);
 		vector<int64_t> rowids(rowid_data, rowid_data + nrows);
+
+		vector<uint32_t> updated_columns;
+		updated_columns.reserve(update_cols);
+		for (idx_t c = 0; c < update_cols; c++) {
+			updated_columns.push_back(static_cast<uint32_t>(columns[c].index));
+		}
 
 		vector<WasmWriteValue> flat(nrows * update_cols);
 		vector<std::string> text_park(nrows * update_cols);
@@ -1341,6 +1384,7 @@ public:
 		}
 
 		int64_t rc = wasm_storage_write_update_rows(txn, gstate.table.name.c_str(), rowids.data(),
+		                                             update_cols == 0 ? nullptr : updated_columns.data(),
 		                                             update_cols == 0 ? nullptr : flat.data(),
 		                                             static_cast<uint32_t>(nrows),
 		                                             static_cast<uint32_t>(update_cols));

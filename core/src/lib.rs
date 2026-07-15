@@ -591,10 +591,26 @@ pub unsafe extern "C" fn wasm_index_search(
 // columns and selecting the projected indices.
 //===----------------------------------------------------------------------===//
 
-/// Per-scan state: the projected columns' logical types (emit order), used to
-/// drive `write_duckvalue_to_vector` for each output column.
+/// Per-scan state: the projected columns' logical types (in guest emit order,
+/// i.e. ONLY real columns) and — for UPDATE/DELETE plans — the OUTPUT-vector
+/// slots that must receive rowid values (the guest supplies rowids as the
+/// trailing s64 cell of each row when `wants_rowid == true`). Both are
+/// captured at scan-open and consumed by `wasm_storage_scan_fill` to route
+/// values into the right DuckDB output vectors.
 struct WasmScanState {
+    /// Logical types of the REAL columns the guest returns, in the order the
+    /// guest emits them (same order as the projection sent in scan-open).
     column_types: Vec<Logicaltype>,
+    /// OUTPUT-vector positions (indices into the DuckDB DataChunk) where a
+    /// rowid value must be written. Populated when the C++ scan-init detected
+    /// one or more `COLUMN_IDENTIFIER_ROW_ID` slots in `column_ids`. Empty
+    /// unless the plan is UPDATE/DELETE (or another consumer that projects
+    /// rowid alongside real columns).
+    rowid_slots: Vec<u32>,
+    /// True iff `wants_rowid` was set at scan-open — the guest appends an
+    /// s64 rowid as the trailing cell of each row it returns. Kept explicit
+    /// so scan-fill doesn't need to re-derive it from `rowid_slots.is_empty()`.
+    wants_rowid: bool,
 }
 
 static STORAGE_SCANS: OnceLock<Mutex<HashMap<u32, WasmScanState>>> = OnceLock::new();
@@ -656,7 +672,11 @@ pub struct WasmScanFilter {
 }
 
 /// Open a scan cursor honoring `projection` (real table column indices, emit
-/// order; nproj==0 => all) and `filters`. Returns a scan handle, 0 on error.
+/// order; nproj==0 => all) and `filters`. When `wants_rowid != 0` the guest
+/// is asked to append a stable per-row s64 rowid as the FINAL cell of each
+/// row returned by scan-next; `rowid_slots` / `n_rowid_slots` names the
+/// DuckDB OUTPUT-vector positions the fill loop then routes those rowid
+/// values into. Returns a scan handle, 0 on error.
 #[no_mangle]
 pub unsafe extern "C" fn wasm_storage_scan_open(
     catalog: u32,
@@ -666,6 +686,9 @@ pub unsafe extern "C" fn wasm_storage_scan_open(
     filters: *const WasmScanFilter,
     nfilt: u32,
     limit: i64,
+    wants_rowid: u8,
+    rowid_slots: *const u32,
+    n_rowid_slots: u32,
 ) -> u32 {
     use bindings::duckdb::extension::storage_host as sh;
 
@@ -745,25 +768,44 @@ pub unsafe extern "C" fn wasm_storage_scan_open(
         });
     }
 
+    let wants_rowid_bool = wants_rowid != 0;
+    let rowid_slots_vec: Vec<u32> = if rowid_slots.is_null() || n_rowid_slots == 0 {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(rowid_slots, n_rowid_slots as usize).to_vec()
+    };
+
     let request = sh::ScanRequest {
         table: table_str,
         projection: projection_slice.to_vec(),
         filters: scan_filters,
         limit: if limit < 0 { None } else { Some(limit as u64) },
+        wants_rowid: wants_rowid_bool,
     };
 
     clog!(
-        "[storage-scan] core scan-open catalog={} projection={:?} nfilt={}",
+        "[storage-scan] core scan-open catalog={} projection={:?} nfilt={} wants_rowid={} rowid_slots={:?}",
         catalog,
         request.projection,
-        request.filters.len()
+        request.filters.len(),
+        wants_rowid_bool,
+        rowid_slots_vec,
     );
 
     match sh::storage_scan_open(catalog, &request) {
         Ok(scan) => {
             storage_scans()
                 .lock()
-                .map(|mut m| m.insert(scan, WasmScanState { column_types }))
+                .map(|mut m| {
+                    m.insert(
+                        scan,
+                        WasmScanState {
+                            column_types,
+                            rowid_slots: rowid_slots_vec,
+                            wants_rowid: wants_rowid_bool,
+                        },
+                    )
+                })
                 .ok();
             scan
         }
@@ -786,21 +828,26 @@ pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -
         return false;
     }
 
-    // Snapshot the projected column types (avoid holding the lock across the
-    // host call + vector writes).
-    let column_types: Vec<Logicaltype> = match storage_scans().lock() {
-        Ok(m) => match m.get(&scan) {
-            Some(state) => state.column_types.clone(),
-            None => {
-                storage_set_last_error(format!("wasm_storage_scan_fill: unknown scan {scan}"));
+    // Snapshot the projected column types + rowid routing (avoid holding the
+    // lock across the host call + vector writes).
+    let (column_types, rowid_slots, wants_rowid): (Vec<Logicaltype>, Vec<u32>, bool) =
+        match storage_scans().lock() {
+            Ok(m) => match m.get(&scan) {
+                Some(state) => (
+                    state.column_types.clone(),
+                    state.rowid_slots.clone(),
+                    state.wants_rowid,
+                ),
+                None => {
+                    storage_set_last_error(format!("wasm_storage_scan_fill: unknown scan {scan}"));
+                    return false;
+                }
+            },
+            Err(_) => {
+                storage_set_last_error("wasm_storage_scan_fill: scan map poisoned".to_string());
                 return false;
             }
-        },
-        Err(_) => {
-            storage_set_last_error("wasm_storage_scan_fill: scan map poisoned".to_string());
-            return false;
-        }
-    };
+        };
 
     // Pull up to one standard vector worth of rows.
     let rows = match sh::storage_scan_next(scan, 2048) {
@@ -817,7 +864,8 @@ pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -
     }
 
     duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
-    let ncols = column_types.len();
+    let real_cols = column_types.len();
+    let expected_cells = real_cols + if wants_rowid { 1 } else { 0 };
     // For `count(*)`-style queries DuckDB projects ZERO columns from the
     // storage scan (only cardinality is required) yet the caller-supplied
     // `output` DataChunk may still expose a phantom column (e.g. the rowid
@@ -826,23 +874,103 @@ pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -
     // Bound the fill loop by the *output*'s column count so we never spill
     // past the columns DuckDB actually wants populated.
     let output_ncols = duckdb::duckdb_data_chunk_get_column_count(output) as usize;
-    let fill_cols = ncols.min(output_ncols);
-    for col_idx in 0..fill_cols {
-        let vector = duckdb::duckdb_data_chunk_get_vector(output, col_idx as duckdb::idx_t);
-        let logical = &column_types[col_idx];
-        for (row, row_values) in rows.iter().enumerate() {
-            if row_values.len() != ncols {
-                storage_set_last_error(format!(
-                    "wasm_storage_scan_fill: row {row} has {} cols, expected {ncols}",
-                    row_values.len()
-                ));
-                return false;
+
+    // Sanity-check row width. For `count(*)`-style scans (empty projection
+    // from DuckDB, wants_rowid=false) some guests still emit a natural-order
+    // row (they interpret empty-projection as "all columns"); we IGNORE any
+    // cells past what we actually consume, matching the pre-M2c fill loop's
+    // lenient `min(ncols, output_ncols)` shape. For projected scans and for
+    // rowid-carrying UPDATE/DELETE scans we require an EXACT match so an
+    // off-by-one on the guest surfaces as a scan error, not silent data
+    // corruption.
+    let strict_width = real_cols > 0 || wants_rowid;
+    for (row, row_values) in rows.iter().enumerate() {
+        let ok = if strict_width {
+            row_values.len() == expected_cells
+        } else {
+            true
+        };
+        if !ok {
+            storage_set_last_error(format!(
+                "wasm_storage_scan_fill: row {row} has {} cells, expected {expected_cells} \
+                 (real_cols={real_cols}, wants_rowid={wants_rowid})",
+                row_values.len()
+            ));
+            return false;
+        }
+    }
+
+    // Real columns: the guest emits them as the first `real_cols` cells of
+    // each row in projection order. Route each real column to its DuckDB
+    // output slot — that slot is the slot corresponding to this projection
+    // position, skipping any rowid slots the plan interleaved.
+    //
+    // With `rowid_slots` recording OUTPUT-vector positions of rowid, we can
+    // compute the real slot for the i-th projected column as the i-th index
+    // in [0..output_ncols) that isn't in `rowid_slots`.
+    let is_rowid_slot = |slot: u32| -> bool { rowid_slots.iter().any(|s| *s == slot) };
+    let mut real_slot_for_proj: Vec<u32> = Vec::with_capacity(real_cols);
+    for slot in 0..output_ncols as u32 {
+        if !is_rowid_slot(slot) {
+            real_slot_for_proj.push(slot);
+            if real_slot_for_proj.len() == real_cols {
+                break;
             }
-            let value = row_values[col_idx].clone();
+        }
+    }
+
+    for (proj_idx, logical) in column_types.iter().enumerate() {
+        let slot = match real_slot_for_proj.get(proj_idx) {
+            Some(&s) => s,
+            None => break, // more real columns than the output wants (count(*))
+        };
+        let vector = duckdb::duckdb_data_chunk_get_vector(output, slot as duckdb::idx_t);
+        for (row, row_values) in rows.iter().enumerate() {
+            let value = row_values[proj_idx].clone();
             if let Err(err) = write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, value)
             {
                 storage_set_last_error(format_duckerror(&err));
                 return false;
+            }
+        }
+    }
+
+    // Rowid slots: the guest emits the rowid as the FINAL cell of each row.
+    // Write that value into every DuckDB output slot the plan flagged as a
+    // rowid slot. The rowid cell MUST be a Duckvalue::Int64; anything else
+    // is a guest ABI bug we surface as a scan error.
+    if wants_rowid {
+        for &slot in &rowid_slots {
+            if slot as usize >= output_ncols {
+                storage_set_last_error(format!(
+                    "wasm_storage_scan_fill: rowid slot {slot} out of range \
+                     (output_ncols={output_ncols})"
+                ));
+                return false;
+            }
+            let vector = duckdb::duckdb_data_chunk_get_vector(output, slot as duckdb::idx_t);
+            let logical_bigint = Logicaltype::Int64;
+            for (row, row_values) in rows.iter().enumerate() {
+                let rowid_cell = row_values[real_cols].clone();
+                match &rowid_cell {
+                    Duckvalue::Int64(_) => {}
+                    other => {
+                        storage_set_last_error(format!(
+                            "wasm_storage_scan_fill: row {row} trailing rowid cell is \
+                             {other:?}, expected Duckvalue::Int64"
+                        ));
+                        return false;
+                    }
+                }
+                if let Err(err) = write_duckvalue_to_vector(
+                    vector,
+                    &logical_bigint,
+                    row as duckdb::idx_t,
+                    rowid_cell,
+                ) {
+                    storage_set_last_error(format_duckerror(&err));
+                    return false;
+                }
             }
         }
     }
@@ -1169,13 +1297,17 @@ pub unsafe extern "C" fn wasm_storage_write_delete_rows(
     }
 }
 
-/// Update rows by rowid. `values` is `nrows * ncols` cells in row-major order,
-/// parallel to `rowids`. Returns rows updated (>=0), or -1 on error.
+/// Update rows by rowid. `values` is `nrows * ncols` PARTIAL-ROW cells in
+/// row-major order, parallel to `rowids`. `updated_columns` (of length
+/// `ncols`) names the schema-index each cell targets — cell `values[r*ncols+c]`
+/// sets column `updated_columns[c]` of row `rowids[r]`. Returns rows updated
+/// (>=0), or -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn wasm_storage_write_update_rows(
     txn: u32,
     table: *const c_char,
     rowids: *const i64,
+    updated_columns: *const u32,
     values: *const WasmWriteValue,
     nrows: u32,
     ncols: u32,
@@ -1198,6 +1330,11 @@ pub unsafe extern "C" fn wasm_storage_write_update_rows(
         slice::from_raw_parts(rowids, nrows as usize)
     };
     let rowid_vec: Vec<i64> = rowid_slice.to_vec();
+    let updated_columns_vec: Vec<u32> = if updated_columns.is_null() || ncols == 0 {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(updated_columns, ncols as usize).to_vec()
+    };
     let rows = storage_write_reshape_rows(values, nrows, ncols);
 
     if rowid_vec.len() != rows.len() {
@@ -1208,16 +1345,25 @@ pub unsafe extern "C" fn wasm_storage_write_update_rows(
         ));
         return -1;
     }
+    if updated_columns_vec.len() != ncols as usize {
+        storage_set_last_error(format!(
+            "wasm_storage_write_update_rows: updated_columns ({}) / ncols ({}) mismatch",
+            updated_columns_vec.len(),
+            ncols
+        ));
+        return -1;
+    }
 
     clog!(
-        "[storage-write] core update-rows txn={} table={:?} nrows={} ncols={}",
+        "[storage-write] core update-rows txn={} table={:?} nrows={} ncols={} updated_columns={:?}",
         txn,
         table_str,
         nrows,
-        ncols
+        ncols,
+        updated_columns_vec,
     );
 
-    match sh::storage_update_rows(txn, &table_str, &rowid_vec, &rows) {
+    match sh::storage_update_rows(txn, &table_str, &rowid_vec, &updated_columns_vec, &rows) {
         Ok(count) => count as i64,
         Err(err) => {
             storage_set_last_error(storage_format_error(&err));

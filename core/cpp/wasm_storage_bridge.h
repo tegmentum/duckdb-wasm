@@ -69,11 +69,18 @@ typedef struct WasmScanFilter {
 
 // Open a scan cursor over `(catalog, table)` honoring the projection (real
 // table column indices, in emit order; nproj==0 => all columns) and filters.
-// `limit < 0` means no limit. Returns a scan handle, or 0 on error (message in
-// wasm_storage_last_error).
+// `limit < 0` means no limit. When `wants_rowid` is non-zero the guest is
+// asked to emit a stable per-row s64 rowid as the FINAL cell of each row
+// returned by scan-next (in addition to the projected cells); the caller
+// (scan-fill) then routes those rowid values to the DuckDB output slots
+// whose column_id was `COLUMN_IDENTIFIER_ROW_ID`. `rowid_slots` /
+// `nrowid_slots` names those OUTPUT-vector positions (in emit order); may be
+// NULL / 0 iff `wants_rowid == 0`. Returns a scan handle, or 0 on error
+// (message in wasm_storage_last_error).
 uint32_t wasm_storage_scan_open(uint32_t catalog, const char *table, const uint32_t *projection,
                                 uint32_t nproj, const WasmScanFilter *filters, uint32_t nfilt,
-                                int64_t limit);
+                                int64_t limit, uint8_t wants_rowid,
+                                const uint32_t *rowid_slots, uint32_t nrowid_slots);
 
 // Pull the next batch of rows into `chunk` (a `duckdb_data_chunk` raw handle).
 // Columns are filled in projection order matching the table function's output
@@ -162,11 +169,16 @@ int64_t wasm_storage_write_insert_rows(uint32_t txn, const char *table,
 int64_t wasm_storage_write_delete_rows(uint32_t txn, const char *table,
                                        const int64_t *rowids, uint32_t nrowids);
 
-// Update rows by row-id. `values` is `nrows * ncols` cells in row-major order,
-// parallel to `rowids` (which is `nrows` long). Returns rows updated (>=0), or
-// -1 on error.
+// Update rows by row-id. `values` is `nrows * ncols` PARTIAL-ROW cells in
+// row-major order, parallel to `rowids` (which is `nrows` long). `ncols` is
+// the update-set width (== length of `updated_columns`) — the schema-index
+// list of the columns being SET, provided by DuckDB's LogicalUpdate::columns
+// captured at plan time. `values[r*ncols + c]` is the new value of schema
+// column `updated_columns[c]` on the row identified by `rowids[r]`. Returns
+// rows updated (>=0), or -1 on error.
 int64_t wasm_storage_write_update_rows(uint32_t txn, const char *table,
                                        const int64_t *rowids,
+                                       const uint32_t *updated_columns,
                                        const WasmWriteValue *values,
                                        uint32_t nrows, uint32_t ncols);
 
