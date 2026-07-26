@@ -4,30 +4,15 @@ fn main() {
         return;
     }
 
-    build_wasm_cpp("wasm_storage.cpp");
-    // httpfs M1: the stub FileSystem subsystem (cpp/wasm_files.cpp). Compiled +
-    // linked the same way as wasm_storage.cpp.
-    build_wasm_cpp("wasm_files.cpp");
-    // Item 2: collation registration (cpp/wasm_collation.cpp). Wraps an
-    // already-registered sort-key scalar in a DuckDB collation. Same flags.
-    build_wasm_cpp("wasm_collation.cpp");
-    // Item 3 / M1: custom-index de-risk (cpp/wasm_index.cpp). A BoundIndex
-    // subclass registered as a custom INDEX TYPE so `CREATE INDEX ... USING
-    // wasm_hnsw` routes to it. Same flags.
-    build_wasm_cpp("wasm_index.cpp");
-    // Item 3 / M2b: the optimizer rule (cpp/wasm_index_optimizer.cpp) that
-    // auto-rewrites `ORDER BY array_distance(col, const) LIMIT k` into a
-    // wasm-index scan. Same flags; shares wasm_index.hpp with wasm_index.cpp.
-    build_wasm_cpp("wasm_index_optimizer.cpp");
-    // 2.3.0 / v3: the component-driven optimizer rule (cpp/wasm_component_optimizer.cpp)
-    // that flattens the plan to JSON, offers it to declared optimizer components,
-    // and re-plans the returned rewrite SQL. Same wasi-sdk flags.
-    build_wasm_cpp("wasm_component_optimizer.cpp");
-    // 3.1.0 additive minor: the streaming + FILTER-PUSHDOWN TableFunction
-    // (cpp/wasm_table_stream.cpp) for a component that declared a filterable table
-    // fn. Reads the pushed TableFilter set, maps it to the neutral ts-filter
-    // descriptor, and drives the component via table-stream-host. Same flags.
-    build_wasm_cpp("wasm_table_stream.cpp");
+    // NOTE: at duckdb:extension@5.0.0 the wasm core drops the 7 C++ TUs that
+    // subclassed DuckDB's internal StorageExtension / BoundIndex /
+    // OptimizerExtension / TableFunction / FileSystem classes (wasm_storage.cpp,
+    // wasm_index.cpp, wasm_index_optimizer.cpp, wasm_collation.cpp,
+    // wasm_component_optimizer.cpp, wasm_files.cpp, wasm_table_stream.cpp) and
+    // the corresponding `*_host` Rust bridges in src/lib.rs. Storage / index /
+    // files / collation registration now lives on the host, driven directly
+    // against extension components — the core is a plain-SQL libduckdb again.
+    // See docs/wasm-ecosystem-at-5-adr.md (Decision 1, Decision 4, Amendment A1).
 
     // DuckDB's libpg_query parser (base_yyparse) is deeply recursive and runs at
     // database-open time: statically-linked extensions (e.g. json) register
@@ -113,93 +98,8 @@ fn main() {
     }
 }
 
-/// Compiles a single cpp/<name> in-core (DUCKDB_BUILD_LIBRARY) with the EXACT
-/// wasi-sdk clang++ flags extracted from sqlite_scanner's sqlite_storage.cpp
-/// build, so the resulting object's C++ ABI / exception model matches the
-/// prebuilt libduckdb-wasi.a it links against. The object is linked into the
-/// core component via `cargo:rustc-link-arg`. Used for wasm_storage.cpp (the
-/// StorageExtension stub) and wasm_files.cpp (the httpfs M1 FileSystem stub).
-fn build_wasm_cpp(file_name: &str) {
-    use std::path::PathBuf;
-    use std::process::Command;
-
-    let wasi_sdk = std::env::var("WASI_SDK_PREFIX")
-        .unwrap_or_else(|_| panic!("Set WASI_SDK_PREFIX (source scripts/setup-env.sh) to build {file_name}"));
-    let duckdb_src = std::env::var("DUCKDB_SOURCE_DIR")
-        .unwrap_or_else(|_| panic!("Set DUCKDB_SOURCE_DIR (source scripts/setup-env.sh) to build {file_name}"));
-
-    let clangxx = format!("{wasi_sdk}/bin/clang++");
-    let sysroot = format!("{wasi_sdk}/share/wasi-sysroot");
-
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let src = PathBuf::from(&manifest).join("cpp").join(file_name);
-    println!("cargo:rerun-if-changed={}", src.display());
-    println!("cargo:rerun-if-env-changed=WASI_SDK_PREFIX");
-    println!("cargo:rerun-if-env-changed=DUCKDB_SOURCE_DIR");
-
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let obj = PathBuf::from(&out_dir).join(format!("{file_name}.obj"));
-
-    // Force-include shim path: relative to this crate, mirroring the CMake build.
-    let shim = PathBuf::from(&manifest).join("../cmake/toolchains/wasi-shim.hpp");
-    let shim = shim.canonicalize().unwrap_or(shim);
-    let override_inc = PathBuf::from(&manifest).join("../cmake/wasi-override/include");
-    let override_inc = override_inc.canonicalize().unwrap_or(override_inc);
-
-    // Third-party include roots required because duckdb.hpp pulls in fmt etc.
-    let tp = |p: &str| format!("{duckdb_src}/third_party/{p}");
-    let mut cmd = Command::new(&clangxx);
-    cmd.arg(format!("--sysroot={sysroot}"))
-        .arg("-DDUCKDB_BUILD_LIBRARY")
-        .arg(format!("-I{duckdb_src}/src/include"))
-        .arg(format!("-I{}", tp("fsst")))
-        .arg(format!("-I{}", tp("fmt/include")))
-        .arg(format!("-I{}", tp("hyperloglog")))
-        .arg(format!("-I{}", tp("fastpforlib")))
-        .arg(format!("-I{}", tp("skiplist")))
-        .arg(format!("-I{}", tp("ska_sort")))
-        .arg(format!("-I{}", tp("fast_float")))
-        .arg(format!("-I{}", tp("re2")))
-        .arg(format!("-I{}", tp("miniz")))
-        .arg(format!("-I{}", tp("utf8proc/include")))
-        .arg(format!("-I{}", tp("concurrentqueue")))
-        .arg(format!("-I{}", tp("pcg")))
-        .arg(format!("-I{}", tp("pdqsort")))
-        .arg(format!("-I{}", tp("tdigest")))
-        .arg(format!("-I{}", tp("mbedtls/include")))
-        .arg(format!("-I{}", tp("httplib")))
-        .arg(format!("-I{}", tp("jaro_winkler")))
-        .arg(format!("-I{}", tp("vergesort")))
-        .arg(format!("-I{}", tp("yyjson/include")))
-        .arg(format!("-I{}", tp("zstd/include")))
-        .arg("--target=wasm32-wasip2")
-        .arg(format!("--sysroot={sysroot}"))
-        .arg("-stdlib=libc++")
-        .arg("-fwasm-exceptions")
-        .arg("-mllvm")
-        .arg("-wasm-use-legacy-eh=false")
-        .arg("-D_WASI_EMULATED_MMAN")
-        .arg("-D_WASI_EMULATED_SIGNAL")
-        .arg("-DDISABLE_DUCKDB_REMOTE_INSTALL")
-        .arg("-DDUCKDB_DISABLE_EXTENSION_LOAD")
-        .arg("-DDUCKDB_NO_THREADS")
-        .arg("-DDUCKDB_SKIP_HTTP")
-        .arg(format!("-I{}", override_inc.display()))
-        .arg(format!("-include{}", shim.display()))
-        .arg("-O3")
-        .arg("-DNDEBUG")
-        .arg("-std=c++11")
-        .arg("-fPIC")
-        .arg("-o")
-        .arg(&obj)
-        .arg("-c")
-        .arg(&src);
-
-    let status = cmd.status().expect("failed to spawn wasi-sdk clang++");
-    if !status.success() {
-        panic!("clang++ failed to compile {file_name}: {status}");
-    }
-
-    // Link the object directly into the core component.
-    println!("cargo:rustc-link-arg={}", obj.display());
-}
+// NOTE: `build_wasm_cpp` (the wasi-sdk clang++ trampoline for the deleted
+// in-core C++ TUs) was removed alongside the 7 C++ files at @5.0.0. The core
+// no longer subclasses DuckDB's internal StorageExtension / BoundIndex /
+// OptimizerExtension / TableFunction / FileSystem — those responsibilities
+// live on the host now. See docs/wasm-ecosystem-at-5-adr.md.

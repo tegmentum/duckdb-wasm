@@ -154,6 +154,10 @@ pub const DUCKDB_TYPE_UUID: duckdb_type = 27;
 pub const DUCKDB_TYPE_TIME_TZ: duckdb_type = 30;
 pub const DUCKDB_TYPE_TIMESTAMP_TZ: duckdb_type = 31;
 pub const DUCKDB_TYPE_GEOMETRY: duckdb_type = 40;
+// major-5 additions: 128-bit integer physical types (added to keep the
+// wasm core's Logicaltype::Hugeint / Uhugeint arms wired to real C-API
+// constants; DuckDB numbers them 32 (HUGEINT alias) / 32-adjacent).
+pub const DUCKDB_TYPE_UHUGEINT: duckdb_type = 32;
 
 /// DuckDB's TIMESTAMP representation: microseconds since 1970-01-01.
 #[repr(C)]
@@ -215,6 +219,14 @@ pub struct duckdb_timestamp_struct {
 pub struct duckdb_hugeint {
     pub lower: u64,
     pub upper: i64,
+}
+/// DuckDB's UHUGEINT: 128-bit unsigned integer. Same layout as `duckdb_hugeint`
+/// but with an unsigned high half.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct duckdb_uhugeint {
+    pub lower: u64,
+    pub upper: u64,
 }
 /// DuckDB's INTERVAL representation: months + days + microseconds.
 #[repr(C)]
@@ -477,6 +489,7 @@ extern "C" {
     pub fn duckdb_get_time(val: duckdb_value) -> duckdb_time;
     pub fn duckdb_get_uint64(val: duckdb_value) -> u64;
     pub fn duckdb_get_hugeint(val: duckdb_value) -> duckdb_hugeint;
+    pub fn duckdb_get_uhugeint(val: duckdb_value) -> duckdb_uhugeint;
     pub fn duckdb_get_decimal(val: duckdb_value) -> duckdb_decimal;
     pub fn duckdb_get_interval(val: duckdb_value) -> duckdb_interval;
     pub fn duckdb_get_float(val: duckdb_value) -> f32;

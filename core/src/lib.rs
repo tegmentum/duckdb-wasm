@@ -29,11 +29,9 @@ mod tvm_spill;
 use bindings::duckdb::component::extension_loader_hooks;
 use bindings::duckdb::extension::callback_dispatch;
 use bindings::duckdb::extension::column_types;
-use bindings::duckdb::extension::pragma_host;
-use bindings::duckdb::extension::parser_host;
 use bindings::duckdb::extension::types::{
-    Complexvalue, Configerror, Decimalvalue, Duckvalue, Funcflags, Intervalvalue, Logfield,
-    Logicaltype, Loglevel, Uuidvalue,
+    Complexvalue, Configerror, Decimalshape, Decimalvalue, Duckvalue, Funcflags, Hugeintvalue,
+    Intervalvalue, Logfield, Logicaltype, Loglevel, Uhugeintvalue, Uuidvalue,
 };
 use bindings::exports::duckdb::component::database as exported_database;
 use bindings::exports::duckdb::extension::{
@@ -66,1660 +64,19 @@ static TABLE_FUNCTION_DEFINITIONS: OnceLock<Mutex<Vec<Arc<TableFunctionDefinitio
 static NEXT_AGGREGATE_FUNCTION_ID: AtomicU32 = AtomicU32::new(1);
 static AGGREGATE_FUNCTION_DEFINITIONS: OnceLock<Mutex<Vec<Arc<AggregateFunctionDefinition>>>> =
     OnceLock::new();
-/// ATTACH `TYPE` names for which a wasm StorageExtension has already been
-/// registered on a given database (avoids re-registering on every query). Keyed
-/// loosely by type-name across all databases; the C++ side also guards via
-/// `StorageExtension::Find`, so a stale entry is harmless.
-static STORAGE_REGISTERED_TYPES: OnceLock<Mutex<std::collections::HashSet<String>>> =
-    OnceLock::new();
-/// Collation names for which a wasm collation has already been registered (avoids
-/// re-registering on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
-static COLLATION_REGISTERED_NAMES: OnceLock<Mutex<std::collections::HashSet<String>>> =
-    OnceLock::new();
-/// 3.1.0 additive minor: names of streaming/filter-pushdown table functions for
-/// which a C++ TableFunction has already been registered (avoids re-registering
-/// on every query). The C++ side also guards via IGNORE_ON_CONFLICT.
-static FILTERABLE_TABLES_REGISTERED: OnceLock<Mutex<std::collections::HashSet<String>>> =
-    OnceLock::new();
-/// Item 4: pragmas components have declared (via `runtime.pragma-registry.register-call`),
-/// pulled through the `pragma-host.pragma-list` import. Maps the PRAGMA name the
-/// user types to the callback-dispatch handle for `callback-dispatch.call-pragma`.
-/// The DuckDB C API has no pragma-creation function, so the core intercepts
-/// `PRAGMA <name>(...)` in its query path: it dispatches the pragma (the component
-/// RETURNS a SQL script as text -- no mid-callback re-entry into SQL) and then runs
-/// that script on the same connection.
-static DECLARED_PRAGMAS: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
-/// 2.3.0 / v3: parser extensions components have declared (via
-/// `parser.register-parser-extension`), pulled through `parser-host.parser-list`.
-/// When the built-in parser rejects a statement, the core offers it to each
-/// declared parser (`parser-host.call-parse`); the component returns a string->SQL
-/// rewrite the core runs in its place. (name, callback-handle).
-static DECLARED_PARSERS: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
 /// Registered replacement scans (file extension -> table function name).
 static REPLACEMENT_SCANS: OnceLock<Mutex<Vec<ReplacementScanSpec>>> = OnceLock::new();
 /// Databases that already have the global replacement-scan callback installed.
 static REPLACEMENT_SCAN_DATABASES: OnceLock<Mutex<Vec<DatabaseHandle>>> = OnceLock::new();
 
-// M1: implemented in core/cpp/wasm_storage.cpp. Registers a stub
-// StorageExtension for a given ATTACH `TYPE` (currently hardcoded "sqlitewasm")
-// on the freshly-opened database. Defined in C++ so it can subclass DuckDB's
-// internal StorageExtension and link against the prebuilt libduckdb-wasi.a.
-extern "C" {
-    fn wasm_register_storage_extension(db: duckdb::duckdb_database, type_name: *const c_char);
-}
 
-// httpfs M1 (de-risk): implemented in core/cpp/wasm_files.cpp. Registers a stub
-// FileSystem subsystem on the database's VirtualFileSystem that claims
-// http:// / https:// paths and throws a recognizable IOException from OpenFile.
-// Idempotent on the C++ side (process-wide once-guard + dup-name try/catch), so
-// always-register per query is safe; this M1 path proves the mechanism. A
-// dynamic gate on a files-capable component is M2.
-extern "C" {
-    fn wasm_register_file_system(db: duckdb::duckdb_database);
-}
+// NOTE (@5.0.0): The 7 wasm-core C++ subclass shims (storage / index /
+// collation / files / component-optimizer / index-optimizer / table-stream)
+// and their extern-C bridges + storage/index/collation/files/table-stream
+// *_host imports were removed. Storage / index / files / collation now
+// route through the host directly against extension components via the
+// per-extension *-dispatch surface. See docs/wasm-ecosystem-at-5-adr.md.
 
-// Item 3 / M1 (custom-index de-risk): implemented in core/cpp/wasm_index.cpp.
-// Registers a custom INDEX TYPE on the database's index-type set so
-// `CREATE INDEX ... USING <type>` routes to a WasmBoundIndex stub. Idempotent on
-// the C++ side (process-wide once-guard + FindByName dup-check), so always-
-// registering per query before any CREATE INDEX binds is safe. M1 fixes the type
-// name to "wasm_hnsw"; the dynamic per-component pull is M2.
-extern "C" {
-    fn wasm_register_index_type(db: duckdb::duckdb_database, type_name: *const c_char);
-}
-
-// Item 2: implemented in core/cpp/wasm_collation.cpp. Wraps an already-registered
-// sort-key scalar (`transform_scalar`, text -> sort-key text) in a DuckDB
-// collation named `name`, so `ORDER BY x COLLATE name` resolves to it. The C++
-// side is idempotent (CreateCollation with IGNORE_ON_CONFLICT), and we also
-// dedup-guard already-registered collations here. Registration is mid-session
-// safe: the binder reads collations from the system catalog at bind time.
-extern "C" {
-    fn wasm_register_collation(
-        db: duckdb::duckdb_database,
-        name: *const c_char,
-        transform_scalar: *const c_char,
-        combinable: bool,
-    );
-}
-
-// 2.3.0 / v3: implemented in core/cpp/wasm_component_optimizer.cpp. Registers a
-// component-driven OptimizerExtension on the database that flattens the bound
-// logical plan to JSON, offers it to declared optimizer rules (via the
-// `wasm_optimizer_rewrite` bridge below -> `optimizer-host`), and re-plans the
-// returned rewrite SQL in place. Idempotent (process-wide once-guard); registered
-// only when optimizer rules exist.
-extern "C" {
-    fn wasm_register_component_optimizer(db: duckdb::duckdb_database);
-}
-
-// 3.1.0 additive minor: implemented in core/cpp/wasm_table_stream.cpp. Registers a
-// real streaming TableFunction (filter_pushdown = true) named `name` for a
-// component that declared a filterable table fn (via the component-facing
-// `table-stream.register-filterable-table` marker, surfaced through
-// `table-stream-host.filterable-table-list`). At scan time it reads the SQL
-// WHERE's pushed TableFilter set, maps it to the neutral ts-filter descriptor,
-// and drives the component via the `wasm_table_stream_*` bridge below ->
-// `table-stream-host` -> the component's `call-table-open-filtered`. Idempotent
-// (system-catalog CreateTableFunction with IGNORE_ON_CONFLICT). `arg_type_codes`
-// is a comma-joined list of duckdb_type codes; `cols_spec` is '\n'-joined
-// `name\t<code>` lines. Returns 0 on success.
-extern "C" {
-    fn wasm_register_filterable_table_function(
-        db: duckdb::duckdb_database,
-        name: *const c_char,
-        handle: u32,
-        arg_type_codes: *const c_char,
-        cols_spec: *const c_char,
-    ) -> i32;
-}
-
-// M2a: read-only foreign-catalog bridge. The C++ WasmCatalog / WasmSchemaEntry /
-// WasmTableEntry call these extern-C fns; each routes to the host-provided
-// `duckdb:extension/storage-host` import, which the host forwards to the
-// sqlitewasm component's `storage-dispatch` export (mirroring how call-table is
-// routed via callback-dispatch).
-//
-// C ABI choices (kept simple + leak-free; wasm is single-threaded):
-//   * attach returns a u32 component-side catalog handle (0 == error).
-//   * list-tables / table-columns return a malloc'd, NUL-terminated string the
-//     caller MUST free with `wasm_storage_free`. Tables are '\n'-joined names.
-//     Columns are '\n'-joined `name\t<duckdb_type_code>` lines (the type code is
-//     a `duckdb_type` enum value: BOOLEAN=1, BIGINT=5, UBIGINT=9, DOUBLE=11,
-//     VARCHAR=17, BLOB=18). A NULL return signals an error.
-//   * on error, the C++ side reads `wasm_storage_last_error()` for a message.
-
-static STORAGE_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
-
-fn storage_set_last_error(msg: String) {
-    let cell = STORAGE_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cell.lock() {
-        *guard = CString::new(msg).ok();
-    }
-}
-
-/// Maps a storage-host `Duckerror` into a single human-readable string.
-fn storage_format_error(err: &bindings::duckdb::extension::storage_host::Duckerror) -> String {
-    use bindings::duckdb::extension::storage_host::Duckerror as E;
-    match err {
-        E::Invalidargument(m) => format!("invalid argument: {m}"),
-        E::Unsupported(m) => format!("unsupported: {m}"),
-        E::Invalidstate(m) => format!("invalid state: {m}"),
-        E::Io(m) => format!("io error: {m}"),
-        E::Internal(m) => format!("internal error: {m}"),
-    }
-}
-
-/// Maps a `types::Logicaltype` to the corresponding `duckdb_type` enum code that
-/// the C++ side turns back into a `LogicalType`.
-fn storage_logicaltype_to_code(ty: &Logicaltype) -> u32 {
-    match ty {
-        Logicaltype::Boolean => 1,  // DUCKDB_TYPE_BOOLEAN
-        Logicaltype::Int64 => 5,    // DUCKDB_TYPE_BIGINT
-        Logicaltype::Uint64 => 9,   // DUCKDB_TYPE_UBIGINT
-        Logicaltype::Float64 => 11, // DUCKDB_TYPE_DOUBLE
-        Logicaltype::Text => 17,    // DUCKDB_TYPE_VARCHAR
-        Logicaltype::Blob => 18,    // DUCKDB_TYPE_BLOB
-        Logicaltype::Int32 => 4,    // DUCKDB_TYPE_INTEGER
-        Logicaltype::Timestamp => 12, // DUCKDB_TYPE_TIMESTAMP
-        Logicaltype::Int8 => 2,     // DUCKDB_TYPE_TINYINT
-        Logicaltype::Int16 => 3,    // DUCKDB_TYPE_SMALLINT
-        Logicaltype::Uint8 => 6,    // DUCKDB_TYPE_UTINYINT
-        Logicaltype::Uint16 => 7,   // DUCKDB_TYPE_USMALLINT
-        Logicaltype::Uint32 => 8,   // DUCKDB_TYPE_UINTEGER
-        Logicaltype::Float32 => 10, // DUCKDB_TYPE_FLOAT
-        Logicaltype::Date => 13,    // DUCKDB_TYPE_DATE
-        Logicaltype::Time => 14,    // DUCKDB_TYPE_TIME
-        Logicaltype::Timestamptz => 31, // DUCKDB_TYPE_TIMESTAMP_TZ
-        Logicaltype::Decimal => 19, // DUCKDB_TYPE_DECIMAL
-        Logicaltype::Interval => 15, // DUCKDB_TYPE_INTERVAL
-        Logicaltype::Uuid => 27,    // DUCKDB_TYPE_UUID
-        // ESCAPE-HATCH: storage scan-column codes can't carry a nested type
-        // expression; report LIST (the common nested case) as a best-effort code.
-        Logicaltype::Complex(_) => 24, // DUCKDB_TYPE_LIST
-    }
-}
-
-/// Returns the most recent storage-bridge error message (or an empty C string),
-/// owned by the core; the pointer stays valid until the next bridge call.
-#[no_mangle]
-pub extern "C" fn wasm_storage_last_error() -> *const c_char {
-    let cell = STORAGE_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    match cell.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(s) => s.as_ptr(),
-            None => b"\0".as_ptr() as *const c_char,
-        },
-        Err(_) => b"\0".as_ptr() as *const c_char,
-    }
-}
-
-/// Frees a string previously returned by a `wasm_storage_*` enumeration fn.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(CString::from_raw(ptr));
-    }
-}
-
-/// Opens the foreign catalog named by `dsn` (an ATTACH path). Returns a
-/// component-side catalog handle, or 0 on error (message in `wasm_storage_last_error`).
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_attach(dsn: *const c_char) -> u32 {
-    if dsn.is_null() {
-        storage_set_last_error("wasm_storage_attach: null dsn".to_string());
-        return 0;
-    }
-    let dsn_str = match CStr::from_ptr(dsn).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            storage_set_last_error("wasm_storage_attach: dsn is not valid UTF-8".to_string());
-            return 0;
-        }
-    };
-    match bindings::duckdb::extension::storage_host::storage_attach(dsn_str) {
-        Ok(handle) => handle,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            0
-        }
-    }
-}
-
-/// Enumerates `catalog`'s base tables as a '\n'-joined, NUL-terminated string.
-/// Caller frees with `wasm_storage_free`. NULL on error.
-#[no_mangle]
-pub extern "C" fn wasm_storage_list_tables(catalog: u32) -> *mut c_char {
-    match bindings::duckdb::extension::storage_host::storage_list_tables(catalog) {
-        Ok(tables) => {
-            let joined = tables.join("\n");
-            match CString::new(joined) {
-                Ok(c) => c.into_raw(),
-                Err(_) => {
-                    storage_set_last_error(
-                        "wasm_storage_list_tables: table name contains NUL".to_string(),
-                    );
-                    ptr::null_mut()
-                }
-            }
-        }
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Enumerates `table`'s columns as '\n'-joined `name\t<typecode>` lines.
-/// Caller frees with `wasm_storage_free`. NULL on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_table_columns(
-    catalog: u32,
-    table: *const c_char,
-) -> *mut c_char {
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_table_columns: null table".to_string());
-        return ptr::null_mut();
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            storage_set_last_error(
-                "wasm_storage_table_columns: table name is not valid UTF-8".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
-    match bindings::duckdb::extension::storage_host::storage_table_columns(catalog, table_str) {
-        Ok(columns) => {
-            let mut lines: Vec<String> = Vec::with_capacity(columns.len());
-            for col in columns {
-                if col.name.contains('\n') || col.name.contains('\t') {
-                    storage_set_last_error(
-                        "wasm_storage_table_columns: column name contains separator".to_string(),
-                    );
-                    return ptr::null_mut();
-                }
-                lines.push(format!(
-                    "{}\t{}",
-                    col.name,
-                    storage_logicaltype_to_code(&col.logical)
-                ));
-            }
-            let joined = lines.join("\n");
-            match CString::new(joined) {
-                Ok(c) => c.into_raw(),
-                Err(_) => {
-                    storage_set_last_error(
-                        "wasm_storage_table_columns: column name contains NUL".to_string(),
-                    );
-                    ptr::null_mut()
-                }
-            }
-        }
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            ptr::null_mut()
-        }
-    }
-}
-
-//===----------------------------------------------------------------------===//
-// Item 3 / M2a: custom-index build bridge.
-//
-// The C++ WasmBoundIndex / WasmCreateIndexPlan call these extern-C fns; each
-// routes to the host-provided `duckdb:extension/index-host` import, which the
-// host forwards to the index component's `index-dispatch` export. The build is
-// driven create -> append -> build; explicit search is exposed component-side as
-// a table function (hnsw_search), so the core does not call index-search.
-//
-// C ABI: create returns a component-side index-handle (0 == error); append/build
-// return 0 on success, -1 on error (message in wasm_index_last_error). Vectors
-// cross the ABI flattened: `vectors_flat` is n_rows*dims contiguous f32.
-//===----------------------------------------------------------------------===//
-
-static INDEX_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
-
-fn index_set_last_error(msg: String) {
-    let cell = INDEX_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cell.lock() {
-        *guard = CString::new(msg).ok();
-    }
-}
-
-fn index_format_error(err: &bindings::duckdb::extension::index_host::Duckerror) -> String {
-    use bindings::duckdb::extension::index_host::Duckerror as E;
-    match err {
-        E::Invalidargument(m) => format!("invalid argument: {m}"),
-        E::Unsupported(m) => format!("unsupported: {m}"),
-        E::Invalidstate(m) => format!("invalid state: {m}"),
-        E::Io(m) => format!("io error: {m}"),
-        E::Internal(m) => format!("internal error: {m}"),
-    }
-}
-
-/// Returns the most recent index-bridge error message (or an empty C string),
-/// owned by the core; valid until the next bridge call.
-#[no_mangle]
-pub extern "C" fn wasm_index_last_error() -> *const c_char {
-    let cell = INDEX_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    match cell.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(s) => s.as_ptr(),
-            None => b"\0".as_ptr() as *const c_char,
-        },
-        Err(_) => b"\0".as_ptr() as *const c_char,
-    }
-}
-
-/// Allocate an empty index builder for `(type_name, index_name)` over a
-/// FLOAT[dims] key. Returns the component-side index-handle, 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_index_create(
-    type_name: *const c_char,
-    index_name: *const c_char,
-    dims: u32,
-) -> u32 {
-    if type_name.is_null() || index_name.is_null() {
-        index_set_last_error("wasm_index_create: null argument".to_string());
-        return 0;
-    }
-    let type_str = match CStr::from_ptr(type_name).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            index_set_last_error("wasm_index_create: type not UTF-8".to_string());
-            return 0;
-        }
-    };
-    let name_str = match CStr::from_ptr(index_name).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            index_set_last_error("wasm_index_create: name not UTF-8".to_string());
-            return 0;
-        }
-    };
-    match bindings::duckdb::extension::index_host::index_create(type_str, name_str, dims) {
-        Ok(handle) => handle,
-        Err(err) => {
-            index_set_last_error(index_format_error(&err));
-            0
-        }
-    }
-}
-
-/// Append `n_rows` rows: `rowids` is n_rows i64; `vectors_flat` is n_rows*dims
-/// contiguous f32. Returns 0 on success, -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_index_append(
-    handle: u32,
-    rowids: *const i64,
-    n_rows: u32,
-    vectors_flat: *const f32,
-    dims: u32,
-) -> i32 {
-    if (n_rows > 0) && (rowids.is_null() || vectors_flat.is_null()) {
-        index_set_last_error("wasm_index_append: null buffer".to_string());
-        return -1;
-    }
-    let n = n_rows as usize;
-    let d = dims as usize;
-    let rowid_slice = if n == 0 { &[][..] } else { slice::from_raw_parts(rowids, n) };
-    let flat = if n == 0 { &[][..] } else { slice::from_raw_parts(vectors_flat, n * d) };
-    let rowids_vec: Vec<i64> = rowid_slice.to_vec();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
-    for i in 0..n {
-        vectors.push(flat[i * d..(i + 1) * d].to_vec());
-    }
-    match bindings::duckdb::extension::index_host::index_append(handle, &rowids_vec, &vectors) {
-        Ok(()) => 0,
-        Err(err) => {
-            index_set_last_error(index_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Finalize the index build. Returns 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn wasm_index_build(handle: u32) -> i32 {
-    match bindings::duckdb::extension::index_host::index_build(handle) {
-        Ok(()) => 0,
-        Err(err) => {
-            index_set_last_error(index_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Drop the index. Returns 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn wasm_index_drop(handle: u32) -> i32 {
-    match bindings::duckdb::extension::index_host::index_drop(handle) {
-        Ok(()) => 0,
-        Err(err) => {
-            index_set_last_error(index_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Item 3 / M2b: kNN search bridge used by the OPTIMIZER rule (not the build
-/// pipeline). The C++ `wasm_index_optimizer.cpp` rewrites
-/// `ORDER BY array_distance(col, const) LIMIT k` into an index scan; at optimize
-/// time it calls this to ask the component for the k nearest rowids of `query`,
-/// then constrains the table scan to exactly those rowids. Routes to the
-/// host-provided `index-host.index-search` import (handle -> built map in the
-/// component), mirroring how the explicit `hnsw_search` table function reaches
-/// the SAME built index.
-///
-/// `query` is `dims` contiguous f32. On success, writes up to `k` rowids into
-/// the caller-provided `out_rowids` buffer (length >= k) and returns the count
-/// written (0..=k). Returns -1 on error (message in `wasm_index_last_error`).
-/// 2.3.0 / v3: offer the flattened plan JSON to every declared component optimizer
-/// rule (via `optimizer-host`); return the first rule's rewrite SQL as a malloc'd
-/// C string (freed by `wasm_optimizer_free`), or NULL if none rewrote it. Called
-/// by the C++ WasmComponentOptimizer at optimize time.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_optimizer_rewrite(plan_json: *const c_char) -> *mut c_char {
-    if plan_json.is_null() {
-        return ptr::null_mut();
-    }
-    let pj = match CStr::from_ptr(plan_json).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return ptr::null_mut(),
-    };
-    let specs = bindings::duckdb::extension::optimizer_host::optimizer_list();
-    for spec in specs {
-        match bindings::duckdb::extension::optimizer_host::call_optimize(spec.callback_handle, &pj)
-        {
-            Ok(Some(sql)) => {
-                return CString::new(sql)
-                    .map(|c| c.into_raw())
-                    .unwrap_or(ptr::null_mut());
-            }
-            _ => continue,
-        }
-    }
-    ptr::null_mut()
-}
-
-/// Free a C string returned by `wasm_optimizer_rewrite`.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_optimizer_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(CString::from_raw(ptr));
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn wasm_index_search(
-    handle: u32,
-    query: *const f32,
-    dims: u32,
-    k: u32,
-    out_rowids: *mut i64,
-) -> i32 {
-    if query.is_null() || out_rowids.is_null() {
-        index_set_last_error("wasm_index_search: null buffer".to_string());
-        return -1;
-    }
-    let q = slice::from_raw_parts(query, dims as usize).to_vec();
-    match bindings::duckdb::extension::index_host::index_search(handle, &q, k) {
-        Ok(hits) => {
-            let n = std::cmp::min(hits.len(), k as usize);
-            let out = slice::from_raw_parts_mut(out_rowids, n);
-            for (i, hit) in hits.iter().take(n).enumerate() {
-                out[i] = hit.rowid;
-            }
-            n as i32
-        }
-        Err(err) => {
-            index_set_last_error(index_format_error(&err));
-            -1
-        }
-    }
-}
-
-//===----------------------------------------------------------------------===//
-// M2b scan bridge: projection + filter pushdown.
-//
-// The C++ TableFunction owns a scan handle (returned by `wasm_storage_scan_open`)
-// and pulls rows with `wasm_storage_scan_fill` into a DataChunk until EOF. The
-// component returns rows in PROJECTION order (each row = one Duckvalue per
-// projected column); to write them into the output vectors we need the projected
-// columns' logical types, which we capture at open by re-enumerating the table's
-// columns and selecting the projected indices.
-//===----------------------------------------------------------------------===//
-
-/// Per-scan state: the projected columns' logical types (in guest emit order,
-/// i.e. ONLY real columns) and — for UPDATE/DELETE plans — the OUTPUT-vector
-/// slots that must receive rowid values (the guest supplies rowids as the
-/// trailing s64 cell of each row when `wants_rowid == true`). Both are
-/// captured at scan-open and consumed by `wasm_storage_scan_fill` to route
-/// values into the right DuckDB output vectors.
-struct WasmScanState {
-    /// Logical types of the REAL columns the guest returns, in the order the
-    /// guest emits them (same order as the projection sent in scan-open).
-    column_types: Vec<Logicaltype>,
-    /// OUTPUT-vector positions (indices into the DuckDB DataChunk) where a
-    /// rowid value must be written. Populated when the C++ scan-init detected
-    /// one or more `COLUMN_IDENTIFIER_ROW_ID` slots in `column_ids`. Empty
-    /// unless the plan is UPDATE/DELETE (or another consumer that projects
-    /// rowid alongside real columns).
-    rowid_slots: Vec<u32>,
-    /// True iff `wants_rowid` was set at scan-open — the guest appends an
-    /// s64 rowid as the trailing cell of each row it returns. Kept explicit
-    /// so scan-fill doesn't need to re-derive it from `rowid_slots.is_empty()`.
-    wants_rowid: bool,
-}
-
-static STORAGE_SCANS: OnceLock<Mutex<HashMap<u32, WasmScanState>>> = OnceLock::new();
-
-fn storage_scans() -> &'static Mutex<HashMap<u32, WasmScanState>> {
-    STORAGE_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Maps a C-ABI compare-op code (WASM_SCAN_OP_*) to the storage-host CompareOp.
-fn storage_scan_op_from_code(
-    op: u8,
-) -> Option<bindings::duckdb::extension::storage_host::CompareOp> {
-    use bindings::duckdb::extension::storage_host::CompareOp as Op;
-    Some(match op {
-        0 => Op::Eq,
-        1 => Op::Ne,
-        2 => Op::Lt,
-        3 => Op::Le,
-        4 => Op::Gt,
-        5 => Op::Ge,
-        6 => Op::IsNull,
-        7 => Op::IsNotNull,
-        _ => return None,
-    })
-}
-
-/// Builds a storage-host Duckvalue from the tagged C-ABI filter fields.
-unsafe fn storage_scan_value_from_filter(
-    value_type: u8,
-    i64v: i64,
-    f64v: f64,
-    text: *const c_char,
-) -> Duckvalue {
-    match value_type {
-        1 => Duckvalue::Boolean(i64v != 0), // WASM_SCAN_VAL_BOOLEAN
-        2 => Duckvalue::Int64(i64v),        // WASM_SCAN_VAL_INT64
-        3 => Duckvalue::Float64(f64v),      // WASM_SCAN_VAL_FLOAT64
-        4 => {
-            // WASM_SCAN_VAL_TEXT
-            if text.is_null() {
-                Duckvalue::Text(String::new())
-            } else {
-                Duckvalue::Text(CStr::from_ptr(text).to_string_lossy().into_owned())
-            }
-        }
-        _ => Duckvalue::Null, // WASM_SCAN_VAL_NONE (is-null / is-not-null)
-    }
-}
-
-/// C-ABI mirror of `WasmScanFilter` in wasm_storage_bridge.h.
-#[repr(C)]
-pub struct WasmScanFilter {
-    column: u32,
-    op: u8,
-    value_type: u8,
-    i64: i64,
-    f64: f64,
-    text: *const c_char,
-}
-
-/// Open a scan cursor honoring `projection` (real table column indices, emit
-/// order; nproj==0 => all) and `filters`. When `wants_rowid != 0` the guest
-/// is asked to append a stable per-row s64 rowid as the FINAL cell of each
-/// row returned by scan-next; `rowid_slots` / `n_rowid_slots` names the
-/// DuckDB OUTPUT-vector positions the fill loop then routes those rowid
-/// values into. Returns a scan handle, 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_scan_open(
-    catalog: u32,
-    table: *const c_char,
-    projection: *const u32,
-    nproj: u32,
-    filters: *const WasmScanFilter,
-    nfilt: u32,
-    limit: i64,
-    wants_rowid: u8,
-    rowid_slots: *const u32,
-    n_rowid_slots: u32,
-) -> u32 {
-    use bindings::duckdb::extension::storage_host as sh;
-
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_scan_open: null table".to_string());
-        return 0;
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            storage_set_last_error("wasm_storage_scan_open: table not UTF-8".to_string());
-            return 0;
-        }
-    };
-
-    // Enumerate the full column list so we can (a) record the projected column
-    // types for scan-fill and (b) validate indices.
-    let all_cols = match sh::storage_table_columns(catalog, &table_str) {
-        Ok(cols) => cols,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            return 0;
-        }
-    };
-
-    let projection_slice: &[u32] = if projection.is_null() || nproj == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(projection, nproj as usize)
-    };
-
-    // Projected column types in emit order. An EMPTY projection means the
-    // caller (e.g. DuckDB dispatching `count(*)`) doesn't want any data
-    // columns -- just row cardinality; honor that literally rather than
-    // materializing all columns. The scan-fill loop then sees `column_types`
-    // == [] and skips vector writes entirely (bounded via
-    // duckdb_data_chunk_get_column_count). Materializing all columns here
-    // instead would mis-write the phantom rowid slot DuckDB attaches to the
-    // output DataChunk, tripping `Expected vector of type VARCHAR, but found
-    // vector of type INT64`.
-    let column_types: Vec<Logicaltype> = if projection_slice.is_empty() {
-        Vec::new()
-    } else {
-        let mut out = Vec::with_capacity(projection_slice.len());
-        for &idx in projection_slice {
-            match all_cols.get(idx as usize) {
-                Some(c) => out.push(c.logical.clone()),
-                None => {
-                    storage_set_last_error(format!(
-                        "wasm_storage_scan_open: projection index {idx} out of range ({} columns)",
-                        all_cols.len()
-                    ));
-                    return 0;
-                }
-            }
-        }
-        out
-    };
-
-    let filters_slice: &[WasmScanFilter] = if filters.is_null() || nfilt == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(filters, nfilt as usize)
-    };
-
-    let mut scan_filters: Vec<sh::ScanFilter> = Vec::with_capacity(filters_slice.len());
-    for f in filters_slice {
-        let op = match storage_scan_op_from_code(f.op) {
-            Some(op) => op,
-            None => continue, // unknown op: skip (best-effort)
-        };
-        let value = storage_scan_value_from_filter(f.value_type, f.i64, f.f64, f.text);
-        scan_filters.push(sh::ScanFilter {
-            column: f.column,
-            op,
-            value,
-        });
-    }
-
-    let wants_rowid_bool = wants_rowid != 0;
-    let rowid_slots_vec: Vec<u32> = if rowid_slots.is_null() || n_rowid_slots == 0 {
-        Vec::new()
-    } else {
-        slice::from_raw_parts(rowid_slots, n_rowid_slots as usize).to_vec()
-    };
-
-    let request = sh::ScanRequest {
-        table: table_str,
-        projection: projection_slice.to_vec(),
-        filters: scan_filters,
-        limit: if limit < 0 { None } else { Some(limit as u64) },
-        wants_rowid: wants_rowid_bool,
-    };
-
-    clog!(
-        "[storage-scan] core scan-open catalog={} projection={:?} nfilt={} wants_rowid={} rowid_slots={:?}",
-        catalog,
-        request.projection,
-        request.filters.len(),
-        wants_rowid_bool,
-        rowid_slots_vec,
-    );
-
-    match sh::storage_scan_open(catalog, &request) {
-        Ok(scan) => {
-            storage_scans()
-                .lock()
-                .map(|mut m| {
-                    m.insert(
-                        scan,
-                        WasmScanState {
-                            column_types,
-                            rowid_slots: rowid_slots_vec,
-                            wants_rowid: wants_rowid_bool,
-                        },
-                    )
-                })
-                .ok();
-            scan
-        }
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            0
-        }
-    }
-}
-
-/// Pull the next batch into `chunk` (a `duckdb_data_chunk` raw handle). Returns
-/// true if rows were written, false at EOF (or on error, with last-error set).
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_scan_fill(scan: u32, chunk: *mut c_void) -> bool {
-    use bindings::duckdb::extension::storage_host as sh;
-
-    let output = chunk as duckdb::duckdb_data_chunk;
-    if output.is_null() {
-        storage_set_last_error("wasm_storage_scan_fill: null chunk".to_string());
-        return false;
-    }
-
-    // Snapshot the projected column types + rowid routing (avoid holding the
-    // lock across the host call + vector writes).
-    let (column_types, rowid_slots, wants_rowid): (Vec<Logicaltype>, Vec<u32>, bool) =
-        match storage_scans().lock() {
-            Ok(m) => match m.get(&scan) {
-                Some(state) => (
-                    state.column_types.clone(),
-                    state.rowid_slots.clone(),
-                    state.wants_rowid,
-                ),
-                None => {
-                    storage_set_last_error(format!("wasm_storage_scan_fill: unknown scan {scan}"));
-                    return false;
-                }
-            },
-            Err(_) => {
-                storage_set_last_error("wasm_storage_scan_fill: scan map poisoned".to_string());
-                return false;
-            }
-        };
-
-    // Pull up to one standard vector worth of rows.
-    let rows = match sh::storage_scan_next(scan, 2048) {
-        Ok(rows) => rows,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            return false;
-        }
-    };
-
-    if rows.is_empty() {
-        duckdb::duckdb_data_chunk_set_size(output, 0);
-        return false;
-    }
-
-    duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
-    let real_cols = column_types.len();
-    let expected_cells = real_cols + if wants_rowid { 1 } else { 0 };
-    // For `count(*)`-style queries DuckDB projects ZERO columns from the
-    // storage scan (only cardinality is required) yet the caller-supplied
-    // `output` DataChunk may still expose a phantom column (e.g. the rowid
-    // slot). Writing our scan-side vector into that slot mis-types it and
-    // trips DuckDB's `Expected vector of type X, but found Y` assertion.
-    // Bound the fill loop by the *output*'s column count so we never spill
-    // past the columns DuckDB actually wants populated.
-    let output_ncols = duckdb::duckdb_data_chunk_get_column_count(output) as usize;
-
-    // Sanity-check row width. For `count(*)`-style scans (empty projection
-    // from DuckDB, wants_rowid=false) some guests still emit a natural-order
-    // row (they interpret empty-projection as "all columns"); we IGNORE any
-    // cells past what we actually consume, matching the pre-M2c fill loop's
-    // lenient `min(ncols, output_ncols)` shape. For projected scans and for
-    // rowid-carrying UPDATE/DELETE scans we require an EXACT match so an
-    // off-by-one on the guest surfaces as a scan error, not silent data
-    // corruption.
-    let strict_width = real_cols > 0 || wants_rowid;
-    for (row, row_values) in rows.iter().enumerate() {
-        let ok = if strict_width {
-            row_values.len() == expected_cells
-        } else {
-            true
-        };
-        if !ok {
-            storage_set_last_error(format!(
-                "wasm_storage_scan_fill: row {row} has {} cells, expected {expected_cells} \
-                 (real_cols={real_cols}, wants_rowid={wants_rowid})",
-                row_values.len()
-            ));
-            return false;
-        }
-    }
-
-    // Real columns: the guest emits them as the first `real_cols` cells of
-    // each row in projection order. Route each real column to its DuckDB
-    // output slot — that slot is the slot corresponding to this projection
-    // position, skipping any rowid slots the plan interleaved.
-    //
-    // With `rowid_slots` recording OUTPUT-vector positions of rowid, we can
-    // compute the real slot for the i-th projected column as the i-th index
-    // in [0..output_ncols) that isn't in `rowid_slots`.
-    let is_rowid_slot = |slot: u32| -> bool { rowid_slots.iter().any(|s| *s == slot) };
-    let mut real_slot_for_proj: Vec<u32> = Vec::with_capacity(real_cols);
-    for slot in 0..output_ncols as u32 {
-        if !is_rowid_slot(slot) {
-            real_slot_for_proj.push(slot);
-            if real_slot_for_proj.len() == real_cols {
-                break;
-            }
-        }
-    }
-
-    for (proj_idx, logical) in column_types.iter().enumerate() {
-        let slot = match real_slot_for_proj.get(proj_idx) {
-            Some(&s) => s,
-            None => break, // more real columns than the output wants (count(*))
-        };
-        let vector = duckdb::duckdb_data_chunk_get_vector(output, slot as duckdb::idx_t);
-        for (row, row_values) in rows.iter().enumerate() {
-            let value = row_values[proj_idx].clone();
-            if let Err(err) = write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, value)
-            {
-                storage_set_last_error(format_duckerror(&err));
-                return false;
-            }
-        }
-    }
-
-    // Rowid slots: the guest emits the rowid as the FINAL cell of each row.
-    // Write that value into every DuckDB output slot the plan flagged as a
-    // rowid slot. The rowid cell MUST be a Duckvalue::Int64; anything else
-    // is a guest ABI bug we surface as a scan error.
-    if wants_rowid {
-        for &slot in &rowid_slots {
-            if slot as usize >= output_ncols {
-                storage_set_last_error(format!(
-                    "wasm_storage_scan_fill: rowid slot {slot} out of range \
-                     (output_ncols={output_ncols})"
-                ));
-                return false;
-            }
-            let vector = duckdb::duckdb_data_chunk_get_vector(output, slot as duckdb::idx_t);
-            let logical_bigint = Logicaltype::Int64;
-            for (row, row_values) in rows.iter().enumerate() {
-                let rowid_cell = row_values[real_cols].clone();
-                match &rowid_cell {
-                    Duckvalue::Int64(_) => {}
-                    other => {
-                        storage_set_last_error(format!(
-                            "wasm_storage_scan_fill: row {row} trailing rowid cell is \
-                             {other:?}, expected Duckvalue::Int64"
-                        ));
-                        return false;
-                    }
-                }
-                if let Err(err) = write_duckvalue_to_vector(
-                    vector,
-                    &logical_bigint,
-                    row as duckdb::idx_t,
-                    rowid_cell,
-                ) {
-                    storage_set_last_error(format_duckerror(&err));
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-/// Close + free a scan cursor.
-#[no_mangle]
-pub extern "C" fn wasm_storage_scan_close(scan: u32) {
-    use bindings::duckdb::extension::storage_host as sh;
-    let _ = sh::storage_scan_close(scan);
-    if let Ok(mut m) = storage_scans().lock() {
-        m.remove(&scan);
-    }
-}
-
-//===----------------------------------------------------------------------===//
-// M2c WRITE bridge: transactions + DDL + DML.
-//
-// The C++ WasmTransactionManager, WasmSchemaEntry::CreateTable, and
-// WasmPhysical{Insert,Update,Delete} operators call these extern-C fns; each
-// routes to the host-provided `storage-host` write imports, which the host
-// forwards to the writable storage component's `storage-write-dispatch`
-// export via ExtensionInstance's `storage_*` trampolines. Errors surface via
-// the shared `wasm_storage_last_error()` reader (single per-thread slot; the
-// scan bridge writes into the same slot).
-//
-// ABI mirror of `wasm_storage_bridge.h`: values cross the boundary as tagged
-// `WasmWriteValue` cells in row-major order (`values[r * ncols + c]`); column
-// definitions cross as `WasmWriteColumn` (name + duckdb_type code). Length-
-// prefixed rowid arrays are borrowed for the call.
-//===----------------------------------------------------------------------===//
-
-/// C-ABI mirror of `WasmWriteColumn` in wasm_storage_bridge.h.
-#[repr(C)]
-pub struct WasmWriteColumn {
-    name: *const c_char,
-    type_code: u32,
-}
-
-/// C-ABI mirror of `WasmWriteValue` in wasm_storage_bridge.h. Fields carry
-/// only the arm selected by `value_type`; the rest are inert.
-#[repr(C)]
-pub struct WasmWriteValue {
-    value_type: u8,
-    i64_val: i64,
-    f64_val: f64,
-    text: *const c_char,
-    blob: *const u8,
-    blob_len: u32,
-}
-
-/// Maps a `duckdb_type` enum code back into a bindings-side Logicaltype for
-/// CREATE TABLE column definitions. Inverse of `storage_logicaltype_to_code`.
-fn storage_code_to_logicaltype(code: u32) -> Logicaltype {
-    match code {
-        1 => Logicaltype::Boolean,
-        2 => Logicaltype::Int8,
-        3 => Logicaltype::Int16,
-        4 => Logicaltype::Int32,
-        5 => Logicaltype::Int64,
-        6 => Logicaltype::Uint8,
-        7 => Logicaltype::Uint16,
-        8 => Logicaltype::Uint32,
-        9 => Logicaltype::Uint64,
-        10 => Logicaltype::Float32,
-        11 => Logicaltype::Float64,
-        12 => Logicaltype::Timestamp,
-        13 => Logicaltype::Date,
-        14 => Logicaltype::Time,
-        15 => Logicaltype::Interval,
-        17 => Logicaltype::Text,
-        18 => Logicaltype::Blob,
-        19 => Logicaltype::Decimal,
-        27 => Logicaltype::Uuid,
-        31 => Logicaltype::Timestamptz,
-        // Fallback: TEXT is the safest widening for an unknown enumeration.
-        _ => Logicaltype::Text,
-    }
-}
-
-/// Decode one tagged C-ABI cell into a bindings-side `Duckvalue`. Unknown
-/// value_type falls through to NULL; TEXT/BLOB pointers are borrowed for the
-/// call (the resulting `String` / `Vec<u8>` copies bytes out).
-unsafe fn storage_write_value_to_duckvalue(v: &WasmWriteValue) -> Duckvalue {
-    match v.value_type {
-        1 => Duckvalue::Boolean(v.i64_val != 0),
-        2 => Duckvalue::Int64(v.i64_val),
-        3 => Duckvalue::Float64(v.f64_val),
-        4 => {
-            if v.text.is_null() {
-                Duckvalue::Text(String::new())
-            } else {
-                Duckvalue::Text(CStr::from_ptr(v.text).to_string_lossy().into_owned())
-            }
-        }
-        5 => {
-            if v.blob.is_null() || v.blob_len == 0 {
-                Duckvalue::Blob(Vec::new())
-            } else {
-                let slice = slice::from_raw_parts(v.blob, v.blob_len as usize);
-                Duckvalue::Blob(slice.to_vec())
-            }
-        }
-        _ => Duckvalue::Null,
-    }
-}
-
-/// Reshape a flat row-major cell buffer into `Vec<Vec<Duckvalue>>` matching
-/// the WIT list-of-lists row shape.
-unsafe fn storage_write_reshape_rows(
-    values: *const WasmWriteValue,
-    nrows: u32,
-    ncols: u32,
-) -> Vec<Vec<Duckvalue>> {
-    if values.is_null() || nrows == 0 || ncols == 0 {
-        return Vec::new();
-    }
-    let total = (nrows as usize) * (ncols as usize);
-    let slice = slice::from_raw_parts(values, total);
-    let mut out: Vec<Vec<Duckvalue>> = Vec::with_capacity(nrows as usize);
-    for r in 0..(nrows as usize) {
-        let mut row = Vec::with_capacity(ncols as usize);
-        for c in 0..(ncols as usize) {
-            row.push(storage_write_value_to_duckvalue(&slice[r * (ncols as usize) + c]));
-        }
-        out.push(row);
-    }
-    out
-}
-
-/// Begin a component-side write transaction on `catalog`. Returns the txn
-/// handle, or 0 on error (message in `wasm_storage_last_error`).
-#[no_mangle]
-pub extern "C" fn wasm_storage_write_begin_transaction(catalog: u32) -> u32 {
-    use bindings::duckdb::extension::storage_host as sh;
-    match sh::storage_begin_transaction(catalog) {
-        Ok(txn) => txn,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            0
-        }
-    }
-}
-
-/// Commit an open transaction. 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn wasm_storage_write_commit_transaction(txn: u32) -> i32 {
-    use bindings::duckdb::extension::storage_host as sh;
-    match sh::storage_commit_transaction(txn) {
-        Ok(()) => 0,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Roll back an open transaction. 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn wasm_storage_write_rollback_transaction(txn: u32) -> i32 {
-    use bindings::duckdb::extension::storage_host as sh;
-    match sh::storage_rollback_transaction(txn) {
-        Ok(()) => 0,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// CREATE TABLE inside a write transaction. `cols` is `ncols` entries of
-/// `WasmWriteColumn`; each entry names one column and its duckdb_type code.
-/// Returns 0 on success, -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_write_create_table(
-    txn: u32,
-    table: *const c_char,
-    cols: *const WasmWriteColumn,
-    ncols: u32,
-) -> i32 {
-    use bindings::duckdb::extension::storage_host as sh;
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_write_create_table: null table".to_string());
-        return -1;
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            storage_set_last_error(
-                "wasm_storage_write_create_table: table not UTF-8".to_string(),
-            );
-            return -1;
-        }
-    };
-
-    let cols_slice: &[WasmWriteColumn] = if cols.is_null() || ncols == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(cols, ncols as usize)
-    };
-    let mut columndefs: Vec<bindings::duckdb::extension::storage_host::Columndef> =
-        Vec::with_capacity(cols_slice.len());
-    for col in cols_slice {
-        if col.name.is_null() {
-            storage_set_last_error(
-                "wasm_storage_write_create_table: null column name".to_string(),
-            );
-            return -1;
-        }
-        let name = match CStr::from_ptr(col.name).to_str() {
-            Ok(s) => s.to_owned(),
-            Err(_) => {
-                storage_set_last_error(
-                    "wasm_storage_write_create_table: column name not UTF-8".to_string(),
-                );
-                return -1;
-            }
-        };
-        columndefs.push(bindings::duckdb::extension::storage_host::Columndef {
-            name,
-            logical: storage_code_to_logicaltype(col.type_code),
-        });
-    }
-
-    clog!(
-        "[storage-write] core create-table txn={} table={:?} ncols={}",
-        txn,
-        table_str,
-        columndefs.len()
-    );
-
-    match sh::storage_create_table(txn, &table_str, &columndefs) {
-        Ok(()) => 0,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Append rows. `values` is `nrows * ncols` cells in row-major order (row `r`
-/// is `values[r * ncols .. (r + 1) * ncols]`). Returns rows inserted (>=0), or
-/// -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_write_insert_rows(
-    txn: u32,
-    table: *const c_char,
-    values: *const WasmWriteValue,
-    nrows: u32,
-    ncols: u32,
-) -> i64 {
-    use bindings::duckdb::extension::storage_host as sh;
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_write_insert_rows: null table".to_string());
-        return -1;
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            storage_set_last_error("wasm_storage_write_insert_rows: table not UTF-8".to_string());
-            return -1;
-        }
-    };
-    let rows = storage_write_reshape_rows(values, nrows, ncols);
-
-    clog!(
-        "[storage-write] core insert-rows txn={} table={:?} nrows={} ncols={}",
-        txn,
-        table_str,
-        nrows,
-        ncols
-    );
-
-    match sh::storage_insert_rows(txn, &table_str, &rows) {
-        Ok(count) => count as i64,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Delete rows by rowid. Returns rows deleted (>=0), or -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_write_delete_rows(
-    txn: u32,
-    table: *const c_char,
-    rowids: *const i64,
-    nrowids: u32,
-) -> i64 {
-    use bindings::duckdb::extension::storage_host as sh;
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_write_delete_rows: null table".to_string());
-        return -1;
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            storage_set_last_error("wasm_storage_write_delete_rows: table not UTF-8".to_string());
-            return -1;
-        }
-    };
-    let rowid_slice: &[i64] = if rowids.is_null() || nrowids == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(rowids, nrowids as usize)
-    };
-    let rowid_vec: Vec<i64> = rowid_slice.to_vec();
-
-    clog!(
-        "[storage-write] core delete-rows txn={} table={:?} n={}",
-        txn,
-        table_str,
-        rowid_vec.len()
-    );
-
-    match sh::storage_delete_rows(txn, &table_str, &rowid_vec) {
-        Ok(count) => count as i64,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-/// Update rows by rowid. `values` is `nrows * ncols` PARTIAL-ROW cells in
-/// row-major order, parallel to `rowids`. `updated_columns` (of length
-/// `ncols`) names the schema-index each cell targets — cell `values[r*ncols+c]`
-/// sets column `updated_columns[c]` of row `rowids[r]`. Returns rows updated
-/// (>=0), or -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_storage_write_update_rows(
-    txn: u32,
-    table: *const c_char,
-    rowids: *const i64,
-    updated_columns: *const u32,
-    values: *const WasmWriteValue,
-    nrows: u32,
-    ncols: u32,
-) -> i64 {
-    use bindings::duckdb::extension::storage_host as sh;
-    if table.is_null() {
-        storage_set_last_error("wasm_storage_write_update_rows: null table".to_string());
-        return -1;
-    }
-    let table_str = match CStr::from_ptr(table).to_str() {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            storage_set_last_error("wasm_storage_write_update_rows: table not UTF-8".to_string());
-            return -1;
-        }
-    };
-    let rowid_slice: &[i64] = if rowids.is_null() || nrows == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(rowids, nrows as usize)
-    };
-    let rowid_vec: Vec<i64> = rowid_slice.to_vec();
-    let updated_columns_vec: Vec<u32> = if updated_columns.is_null() || ncols == 0 {
-        Vec::new()
-    } else {
-        slice::from_raw_parts(updated_columns, ncols as usize).to_vec()
-    };
-    let rows = storage_write_reshape_rows(values, nrows, ncols);
-
-    if rowid_vec.len() != rows.len() {
-        storage_set_last_error(format!(
-            "wasm_storage_write_update_rows: rowids ({}) / rows ({}) mismatch",
-            rowid_vec.len(),
-            rows.len()
-        ));
-        return -1;
-    }
-    if updated_columns_vec.len() != ncols as usize {
-        storage_set_last_error(format!(
-            "wasm_storage_write_update_rows: updated_columns ({}) / ncols ({}) mismatch",
-            updated_columns_vec.len(),
-            ncols
-        ));
-        return -1;
-    }
-
-    clog!(
-        "[storage-write] core update-rows txn={} table={:?} nrows={} ncols={} updated_columns={:?}",
-        txn,
-        table_str,
-        nrows,
-        ncols,
-        updated_columns_vec,
-    );
-
-    match sh::storage_update_rows(txn, &table_str, &rowid_vec, &updated_columns_vec, &rows) {
-        Ok(count) => count as i64,
-        Err(err) => {
-            storage_set_last_error(storage_format_error(&err));
-            -1
-        }
-    }
-}
-
-//===----------------------------------------------------------------------===//
-// 3.1.0 additive minor: streaming + FILTER-PUSHDOWN table-fn bridge.
-//
-// The C++ streaming TableFunction (cpp/wasm_table_stream.cpp) calls these
-// extern-C fns; each routes to the host-provided `table-stream-host` import,
-// which the host forwards to the owning component's `table-stream-dispatch`
-// export (call-table-open-filtered / next / close). Mirrors the wasm_storage_*
-// scan bridge, but for a NAMED function with bound argument values.
-//===----------------------------------------------------------------------===//
-
-static TABLE_STREAM_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
-
-fn ts_set_last_error(msg: String) {
-    let cell = TABLE_STREAM_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cell.lock() {
-        *guard = CString::new(msg).ok();
-    }
-}
-
-/// Most recent table-stream bridge error (owned by the core; valid until the next
-/// bridge call). Empty C string when none.
-#[no_mangle]
-pub extern "C" fn wasm_table_stream_last_error() -> *const c_char {
-    let cell = TABLE_STREAM_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    match cell.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(s) => s.as_ptr(),
-            None => b"\0".as_ptr() as *const c_char,
-        },
-        Err(_) => b"\0".as_ptr() as *const c_char,
-    }
-}
-
-/// Per-cursor state: the emitted (post-projection) column types, used to drive
-/// `write_duckvalue_to_vector` in fill.
-struct WasmTsScanState {
-    column_types: Vec<Logicaltype>,
-}
-
-static TABLE_STREAM_SCANS: OnceLock<Mutex<HashMap<u32, WasmTsScanState>>> = OnceLock::new();
-
-fn table_stream_scans() -> &'static Mutex<HashMap<u32, WasmTsScanState>> {
-    TABLE_STREAM_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// C-ABI mirror of `WasmTsValue` in wasm_table_stream_bridge.h.
-#[repr(C)]
-pub struct WasmTsValue {
-    value_type: u8,
-    i64: i64,
-    f64: f64,
-    text: *const c_char,
-}
-
-/// C-ABI mirror of `WasmTsFilter` in wasm_table_stream_bridge.h.
-#[repr(C)]
-pub struct WasmTsFilter {
-    column: u32,
-    op: u8,
-    values: *const WasmTsValue,
-    nvalues: u32,
-}
-
-/// Build a Duckvalue from a tagged C value.
-unsafe fn ts_duckvalue_from_tagged(v: &WasmTsValue) -> Duckvalue {
-    match v.value_type {
-        1 => Duckvalue::Boolean(v.i64 != 0), // WASM_TS_VAL_BOOLEAN
-        2 => Duckvalue::Int64(v.i64),        // WASM_TS_VAL_INT64
-        3 => Duckvalue::Float64(v.f64),      // WASM_TS_VAL_FLOAT64
-        4 => {
-            // WASM_TS_VAL_TEXT
-            if v.text.is_null() {
-                Duckvalue::Text(String::new())
-            } else {
-                Duckvalue::Text(CStr::from_ptr(v.text).to_string_lossy().into_owned())
-            }
-        }
-        _ => Duckvalue::Null, // WASM_TS_VAL_NONE
-    }
-}
-
-/// Map a C-ABI ts-op code (WASM_TS_OP_*) to the table-stream-host TsFilterOp.
-fn ts_op_from_code(op: u8) -> Option<bindings::duckdb::extension::table_stream_host::TsFilterOp> {
-    use bindings::duckdb::extension::table_stream_host::TsFilterOp as Op;
-    Some(match op {
-        0 => Op::Eq,
-        1 => Op::Ne,
-        2 => Op::Lt,
-        3 => Op::Le,
-        4 => Op::Gt,
-        5 => Op::Ge,
-        6 => Op::IsIn,
-        7 => Op::IsNull,
-        8 => Op::IsNotNull,
-        _ => return None,
-    })
-}
-
-/// Open a streaming cursor for table fn `handle` with bound `args`, `projection`
-/// (real column indices, emit order; nproj==0 => all), and conjunctive `filters`.
-/// Returns a cursor handle, or 0 on error (message in wasm_table_stream_last_error).
-#[no_mangle]
-pub unsafe extern "C" fn wasm_table_stream_open(
-    handle: u32,
-    args: *const WasmTsValue,
-    nargs: u32,
-    projection: *const u32,
-    nproj: u32,
-    filters: *const WasmTsFilter,
-    nfilt: u32,
-) -> u32 {
-    use bindings::duckdb::extension::table_stream_host as tsh;
-
-    let args_slice: &[WasmTsValue] = if args.is_null() || nargs == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(args, nargs as usize)
-    };
-    let arg_values: Vec<Duckvalue> = args_slice.iter().map(|a| ts_duckvalue_from_tagged(a)).collect();
-
-    let projection_slice: &[u32] = if projection.is_null() || nproj == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(projection, nproj as usize)
-    };
-
-    let filters_slice: &[WasmTsFilter] = if filters.is_null() || nfilt == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(filters, nfilt as usize)
-    };
-
-    let mut ts_filters: Vec<tsh::TsFilter> = Vec::with_capacity(filters_slice.len());
-    for f in filters_slice {
-        let op = match ts_op_from_code(f.op) {
-            Some(op) => op,
-            None => continue, // unknown op: skip (engine re-applies)
-        };
-        let vals_slice: &[WasmTsValue] = if f.values.is_null() || f.nvalues == 0 {
-            &[]
-        } else {
-            slice::from_raw_parts(f.values, f.nvalues as usize)
-        };
-        let values: Vec<Duckvalue> = vals_slice.iter().map(|v| ts_duckvalue_from_tagged(v)).collect();
-        ts_filters.push(tsh::TsFilter {
-            column: f.column,
-            op,
-            values,
-        });
-    }
-
-    clog!(
-        "[table-stream] core open handle={handle} args={} projection={:?} nfilt={}",
-        arg_values.len(),
-        projection_slice,
-        ts_filters.len()
-    );
-
-    match tsh::ts_open_filtered(handle, &arg_values, projection_slice, &ts_filters) {
-        Ok(open) => {
-            let column_types: Vec<Logicaltype> =
-                open.columns.iter().map(|c| c.logical.clone()).collect();
-            table_stream_scans()
-                .lock()
-                .map(|mut m| m.insert(open.cursor, WasmTsScanState { column_types }))
-                .ok();
-            open.cursor
-        }
-        Err(err) => {
-            ts_set_last_error(format!("table-stream open failed: {err:?}"));
-            0
-        }
-    }
-}
-
-/// Pull the next batch into `chunk` (a `duckdb_data_chunk` raw handle). Returns
-/// true if rows were written, false at EOF (chunk size 0) or on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_table_stream_fill(handle: u32, cursor: u32, chunk: *mut c_void) -> bool {
-    use bindings::duckdb::extension::table_stream_host as tsh;
-
-    let output = chunk as duckdb::duckdb_data_chunk;
-    if output.is_null() {
-        ts_set_last_error("wasm_table_stream_fill: null chunk".to_string());
-        return false;
-    }
-
-    let column_types: Vec<Logicaltype> = match table_stream_scans().lock() {
-        Ok(m) => match m.get(&cursor) {
-            Some(state) => state.column_types.clone(),
-            None => {
-                ts_set_last_error(format!("wasm_table_stream_fill: unknown cursor {cursor}"));
-                return false;
-            }
-        },
-        Err(_) => {
-            ts_set_last_error("wasm_table_stream_fill: scan map poisoned".to_string());
-            return false;
-        }
-    };
-
-    let rows = match tsh::ts_next(handle, cursor, 2048) {
-        Ok(rows) => rows,
-        Err(err) => {
-            ts_set_last_error(format!("table-stream next failed: {err:?}"));
-            return false;
-        }
-    };
-
-    if rows.is_empty() {
-        duckdb::duckdb_data_chunk_set_size(output, 0);
-        return false;
-    }
-
-    duckdb::duckdb_data_chunk_set_size(output, rows.len() as duckdb::idx_t);
-    let ncols = column_types.len();
-    for col_idx in 0..ncols {
-        let vector = duckdb::duckdb_data_chunk_get_vector(output, col_idx as duckdb::idx_t);
-        let logical = &column_types[col_idx];
-        for (row, row_values) in rows.iter().enumerate() {
-            if row_values.len() != ncols {
-                ts_set_last_error(format!(
-                    "wasm_table_stream_fill: row {row} has {} cols, expected {ncols}",
-                    row_values.len()
-                ));
-                return false;
-            }
-            let value = row_values[col_idx].clone();
-            if let Err(err) = write_duckvalue_to_vector(vector, logical, row as duckdb::idx_t, value) {
-                ts_set_last_error(format_duckerror(&err));
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Close + free a streaming cursor.
-#[no_mangle]
-pub extern "C" fn wasm_table_stream_close(handle: u32, cursor: u32) {
-    use bindings::duckdb::extension::table_stream_host as tsh;
-    let _ = tsh::ts_close(handle, cursor);
-    if let Ok(mut m) = table_stream_scans().lock() {
-        m.remove(&cursor);
-    }
-}
-
-//===----------------------------------------------------------------------===//
-// httpfs M2 files bridge.
-//
-// The C++ WasmFileSystem (cpp/wasm_files.cpp) calls these extern-C fns; each
-// routes to the host-provided `duckdb:extension/files-host` import, which the
-// host forwards to the registered files component's `file-dispatch` export
-// (webfs fetches the resource over wasi:sockets, caches it, serves ranges).
-// Mirrors the wasm_storage_* bridge. The files-host error channel is plain
-// strings (not Duckerror), so we surface them directly.
-//===----------------------------------------------------------------------===//
-
-static FILE_LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
-
-fn file_set_last_error(msg: String) {
-    let cell = FILE_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cell.lock() {
-        *guard = CString::new(msg).ok();
-    }
-}
-
-/// Returns the most recent files-bridge error message (or an empty C string),
-/// owned by the core; the pointer stays valid until the next bridge call.
-#[no_mangle]
-pub extern "C" fn wasm_file_last_error() -> *const c_char {
-    let cell = FILE_LAST_ERROR.get_or_init(|| Mutex::new(None));
-    match cell.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(s) => s.as_ptr(),
-            None => b"\0".as_ptr() as *const c_char,
-        },
-        Err(_) => b"\0".as_ptr() as *const c_char,
-    }
-}
-
-/// Fetch + cache the resource at `url` via the files backend. On success writes
-/// the component-side handle + total size and returns true; on error returns
-/// false (message in `wasm_file_last_error`).
-#[no_mangle]
-pub unsafe extern "C" fn wasm_file_open(
-    url: *const c_char,
-    out_handle: *mut u32,
-    out_size: *mut u64,
-) -> bool {
-    if url.is_null() || out_handle.is_null() || out_size.is_null() {
-        file_set_last_error("wasm_file_open: null argument".to_string());
-        return false;
-    }
-    let url_str = match CStr::from_ptr(url).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            file_set_last_error("wasm_file_open: url is not valid UTF-8".to_string());
-            return false;
-        }
-    };
-    match bindings::duckdb::extension::files_host::file_open(url_str) {
-        Ok(res) => {
-            *out_handle = res.handle;
-            *out_size = res.size;
-            true
-        }
-        Err(msg) => {
-            file_set_last_error(msg);
-            false
-        }
-    }
-}
-
-/// Copy up to `len` bytes from the cached resource at `offset` into `buf`.
-/// Returns the count copied (<= len; may be short at EOF), or -1 on error.
-#[no_mangle]
-pub unsafe extern "C" fn wasm_file_read(
-    handle: u32,
-    offset: u64,
-    len: u32,
-    buf: *mut u8,
-) -> i64 {
-    if buf.is_null() {
-        file_set_last_error("wasm_file_read: null buffer".to_string());
-        return -1;
-    }
-    if len == 0 {
-        return 0;
-    }
-    match bindings::duckdb::extension::files_host::file_read(handle, offset, len) {
-        Ok(bytes) => {
-            let n = std::cmp::min(bytes.len(), len as usize);
-            copy_nonoverlapping(bytes.as_ptr(), buf, n);
-            n as i64
-        }
-        Err(msg) => {
-            file_set_last_error(msg);
-            -1
-        }
-    }
-}
-
-/// Drop the component-side cache entry for `handle` (best-effort).
-#[no_mangle]
-pub extern "C" fn wasm_file_close(handle: u32) {
-    let _ = bindings::duckdb::extension::files_host::file_close(handle);
-}
 
 #[derive(Clone, Copy)]
 struct ConnectionHandle(duckdb::duckdb_connection, duckdb::duckdb_database);
@@ -3827,113 +2184,10 @@ mod config_tests {
 #[cfg(test)]
 mod marshalling_tests {
     use super::{
-        complex_depth_within_cap, complex_list_len_within_cap, contains_load_keyword_ascii_ci,
-        json_matches_complex_kind, split_sql_statements, statement_is_load, ComplexKind,
-        COMPLEX_MAX_DEPTH, COMPLEX_MAX_LIST_LEN,
+        complex_depth_within_cap, complex_list_len_within_cap, json_matches_complex_kind,
+        ComplexKind, COMPLEX_MAX_DEPTH, COMPLEX_MAX_LIST_LEN,
     };
     use serde_json::json;
-
-    // ----- statement splitter (#73 LOAD-aware split) -----
-
-    #[test]
-    fn split_single_statement() {
-        assert_eq!(split_sql_statements("SELECT 1"), vec!["SELECT 1"]);
-    }
-
-    #[test]
-    fn split_multiple_statements() {
-        let stmts = split_sql_statements("SELECT 1; SELECT 2");
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1].trim(), "SELECT 2");
-    }
-
-    #[test]
-    fn split_empty_sql_is_empty() {
-        assert!(split_sql_statements("").is_empty());
-        // whitespace-only trailing buffer is dropped, not panicked on.
-        assert!(split_sql_statements("   ").is_empty());
-    }
-
-    #[test]
-    fn split_bare_semicolons_yield_blank_stmts_not_panic() {
-        // `;;;` produces empty statements (one per separator); the callers skip
-        // blanks via `stmt.trim().is_empty()`. The point here is no panic and
-        // each produced statement is blank.
-        let stmts = split_sql_statements(";;;");
-        assert!(stmts.iter().all(|s| s.trim().is_empty()));
-    }
-
-    #[test]
-    fn split_semicolon_inside_single_quote_is_not_a_boundary() {
-        let stmts = split_sql_statements("SELECT ';'; SELECT 2");
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT ';'");
-    }
-
-    #[test]
-    fn split_semicolon_inside_double_quote_is_not_a_boundary() {
-        let stmts = split_sql_statements("SELECT \"a;b\"; SELECT 2");
-        assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "SELECT \"a;b\"");
-    }
-
-    #[test]
-    fn split_escaped_quote_doubling_stays_in_string() {
-        // '' inside a single-quoted string is an escaped quote, not a close.
-        let stmts = split_sql_statements("SELECT 'it''s; fine'");
-        assert_eq!(stmts.len(), 1);
-        assert_eq!(stmts[0], "SELECT 'it''s; fine'");
-    }
-
-    #[test]
-    fn split_unbalanced_quote_does_not_panic() {
-        // A dangling open quote must not loop forever or panic; the trailing
-        // buffer is flushed as a single (malformed) statement.
-        let stmts = split_sql_statements("SELECT 'unterminated");
-        assert_eq!(stmts.len(), 1);
-        assert_eq!(stmts[0], "SELECT 'unterminated");
-    }
-
-    // ----- LOAD detection -----
-
-    #[test]
-    fn statement_is_load_detects_load_case_insensitive() {
-        assert!(statement_is_load("LOAD spatial"));
-        assert!(statement_is_load("  load httpfs"));
-        assert!(statement_is_load("LoAd json"));
-    }
-
-    #[test]
-    fn statement_is_load_rejects_non_load() {
-        assert!(!statement_is_load("SELECT 1"));
-        assert!(!statement_is_load("INSTALL spatial"));
-        assert!(!statement_is_load("")); // empty -> not load, no panic
-        assert!(!statement_is_load("   "));
-        // a word that merely starts with "load" must not match.
-        assert!(!statement_is_load("loader()"));
-    }
-
-    // ----- LOAD keyword pre-filter (split fast-path guard) -----
-
-    #[test]
-    fn load_prefilter_matches_whole_word_ci() {
-        assert!(contains_load_keyword_ascii_ci("LOAD spatial"));
-        assert!(contains_load_keyword_ascii_ci("install x; load httpfs"));
-        assert!(contains_load_keyword_ascii_ci("  LoAd  json  "));
-        assert!(contains_load_keyword_ascii_ci("SELECT 1; LOAD y"));
-    }
-
-    #[test]
-    fn load_prefilter_rejects_substrings_and_absence() {
-        // The common hot path: a plain query has no LOAD -> prefilter bails,
-        // skipping the allocating split entirely.
-        assert!(!contains_load_keyword_ascii_ci("SELECT 1"));
-        assert!(!contains_load_keyword_ascii_ci("SELECT load_factor FROM t"));
-        assert!(!contains_load_keyword_ascii_ci("preload"));
-        assert!(!contains_load_keyword_ascii_ci("reloaded"));
-        assert!(!contains_load_keyword_ascii_ci(""));
-    }
 
     // ----- complex depth cap (deeply-nested JSON guard) -----
 
@@ -4139,13 +2393,10 @@ impl ConnectionState {
                 return Err(DuckDbError::message(message));
             }
 
-            // M2: storage StorageExtensions are now registered DYNAMICALLY at
-            // query time (see ConnectionState::sync_storage_extensions), based on
-            // the ATTACH `TYPE` names that components declare via the host's
-            // `register-storage` WIT call. The old hardcoded "sqlitewasm"
-            // registration here is intentionally removed; the dynamic path
-            // (storage-host.storage-list-types -> wasm_register_storage_extension)
-            // covers sqlitewasm and any other backend (mysql, postgres, ...).
+            // @5.0.0: no storage/index/collation/files subclass registration
+            // happens on the core side. Foreign-catalog / index / file-system
+            // routing is orchestrated by the host through the per-extension
+            // `*-dispatch` exports.
 
             let mut handle: duckdb::duckdb_connection = ptr::null_mut();
             let state = duckdb::duckdb_connect(database, &mut handle);
@@ -4172,333 +2423,20 @@ impl ConnectionState {
         }
     }
 
-    /// Pulls the set of ATTACH `TYPE` names that storage components have
-    /// registered with the host (via the `register-storage` WIT call) and
-    /// registers a wasm StorageExtension for each one not yet registered. This
-    /// is the DYNAMIC replacement for the old hardcoded "sqlitewasm" call at
-    /// DB-open: register-storage happens at LOAD time (mid-session), and
-    /// `StorageExtension::Register` just inserts into the DBConfig callback
-    /// registry (lock-guarded, copy-on-write), which ATTACH reads at bind time
-    /// -- so mid-session registration is safe. Called lazily before each query
-    /// so any `ATTACH ... (TYPE x)` sees the backend its component declared.
-    ///
-    /// The C++ side guards against double-registration via StorageExtension::Find,
-    /// and we additionally short-circuit already-seen types here.
-    fn sync_storage_extensions(&self) {
-        // httpfs M1: register the stub FileSystem subsystem (http:// / https://)
-        // on this database. The C++ side is idempotent (process-wide once-guard +
-        // dup-name try/catch), so calling it before every query is cheap and
-        // proves the mechanism without dynamic gating (that is M2).
-        unsafe {
-            wasm_register_file_system(self.database);
-        }
-
-        // Item 3 / M2a: register each custom index TYPE a component has declared
-        // (via `register-index-type`, surfaced through the
-        // `index-host.index-type-list` import) so `CREATE INDEX ... USING <type>`
-        // routes to a WasmBoundIndex bound to that type. The C++ side is
-        // idempotent (FindByName dup-check), so calling before every query is
-        // cheap. This replaces M1's hardcoded "wasm_hnsw".
-        for type_name in bindings::duckdb::extension::index_host::index_type_list() {
-            if let Ok(c_type) = CString::new(type_name.as_str()) {
-                unsafe {
-                    wasm_register_index_type(self.database, c_type.as_ptr());
-                }
-            }
-        }
-
-        // 2.3.0 / v3: if any component declared an optimizer rule, register the
-        // component-driven OptimizerExtension once (idempotent C++ guard). At
-        // optimize time it flattens the plan + offers it to the rules via the
-        // wasm_optimizer_rewrite bridge.
-        if !bindings::duckdb::extension::optimizer_host::optimizer_list().is_empty() {
-            unsafe {
-                wasm_register_component_optimizer(self.database);
-            }
-        }
-
-        // Item 2: register any collations components have declared (mid-session).
-        self.sync_collations();
-
-        // 3.1.0 additive minor: register a real streaming + filter-pushdown
-        // TableFunction for each filterable table fn a component declared (via the
-        // `table-stream` marker, surfaced through table-stream-host).
-        self.sync_filterable_tables();
-
-        // Item 4: pull any pragmas components have declared (mid-session) into the
-        // process-wide registry, so `PRAGMA <name>(...)` can be intercepted.
-        sync_pragmas();
-
-        let types = bindings::duckdb::extension::storage_host::storage_list_types();
-        if types.is_empty() {
-            return;
-        }
-        let seen = STORAGE_REGISTERED_TYPES.get_or_init(|| Mutex::new(Default::default()));
-        let mut guard = match seen.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        for type_name in types {
-            if guard.contains(&type_name) {
-                continue;
-            }
-            if let Ok(c_type) = CString::new(type_name.as_str()) {
-                unsafe {
-                    wasm_register_storage_extension(self.database, c_type.as_ptr());
-                }
-                guard.insert(type_name);
-            }
-        }
-    }
-
-    /// 3.1.0 additive minor: pulls the streaming + filter-pushdown table functions
-    /// components have declared (via the `table-stream.register-filterable-table`
-    /// marker, surfaced through `table-stream-host.filterable-table-list`) and
-    /// registers a real C++ streaming `TableFunction` (filter_pushdown = true) for
-    /// each not-yet-seen one. Mid-session safe: registration uses the system
-    /// catalog with IGNORE_ON_CONFLICT, and we dedup-guard here. Called lazily
-    /// before each query, like `sync_collations`.
-    fn sync_filterable_tables(&self) {
-        let tables = bindings::duckdb::extension::table_stream_host::filterable_table_list();
-        if tables.is_empty() {
-            return;
-        }
-        let seen = FILTERABLE_TABLES_REGISTERED.get_or_init(|| Mutex::new(Default::default()));
-        let mut guard = match seen.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        for t in tables {
-            if guard.contains(&t.name) {
-                continue;
-            }
-            // Positional arg type codes (comma-joined duckdb_type codes).
-            let arg_codes = t
-                .arguments
-                .iter()
-                .map(|a| storage_logicaltype_to_code(&a.logical).to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            // Emitted column schema as '\n'-joined `name\t<code>` lines.
-            let cols_spec = t
-                .columns
-                .iter()
-                .map(|c| format!("{}\t{}", c.name, storage_logicaltype_to_code(&c.logical)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let (name_c, args_c, cols_c) = match (
-                CString::new(t.name.as_str()),
-                CString::new(arg_codes),
-                CString::new(cols_spec),
-            ) {
-                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-                _ => continue,
-            };
-            let rc = unsafe {
-                wasm_register_filterable_table_function(
-                    self.database,
-                    name_c.as_ptr(),
-                    t.handle,
-                    args_c.as_ptr(),
-                    cols_c.as_ptr(),
-                )
-            };
-            if rc == 0 {
-                clog!(
-                    "[table-stream] registered filterable table fn '{}' (handle={})",
-                    t.name,
-                    t.handle
-                );
-                guard.insert(t.name);
-            } else {
-                clog!("[table-stream] failed to register filterable table fn '{}'", t.name);
-            }
-        }
-    }
-
-    /// Item 2: pulls the collations components have declared (via the
-    /// `register-collation` WIT call, surfaced through `collation-host.collation-list`)
-    /// and registers a DuckDB collation for each one not yet registered. A
-    /// collation reuses an already-registered sort-key scalar as its transform;
-    /// the C++ shim looks the scalar up in the catalog and wraps it in a
-    /// CreateCollationInfo. Mid-session safe: the binder reads collations from the
-    /// system catalog at bind time, and CreateCollation uses IGNORE_ON_CONFLICT.
-    /// Called lazily before each query (after the scalar-registration drain that
-    /// happens at LOAD time, so the transform scalar already exists).
-    fn sync_collations(&self) {
-        let collations = bindings::duckdb::extension::collation_host::collation_list();
-        if collations.is_empty() {
-            return;
-        }
-        let seen = COLLATION_REGISTERED_NAMES.get_or_init(|| Mutex::new(Default::default()));
-        let mut guard = match seen.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        for spec in collations {
-            if guard.contains(&spec.name) {
-                continue;
-            }
-            let c_name = match CString::new(spec.name.as_str()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let c_scalar = match CString::new(spec.transform_scalar.as_str()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            unsafe {
-                wasm_register_collation(
-                    self.database,
-                    c_name.as_ptr(),
-                    c_scalar.as_ptr(),
-                    spec.combinable,
-                );
-            }
-            guard.insert(spec.name);
-        }
-    }
-
     fn execute(&self, sql: &str) -> Result<QueryResult, DuckDbError> {
-        // Item 4: intercept `PRAGMA <name>(...)` for component-declared pragmas.
-        if let Some(result) = self.run_intercepted_pragma(sql)? {
-            return Ok(result);
-        }
-        match self.collect_rows(sql) {
-            Ok((columns, rows)) => Ok(QueryResult { columns, rows }),
-            // 2.3.0 / v3: the built-in parser rejected this statement. Offer it to
-            // any component-declared PARSER extension; if one claims it (returns a
-            // string->SQL rewrite), run the rewrite in its place. This is the
-            // by-value-safe ParserExtension path (text in, SQL out) -- mirrors the
-            // pragma returns-SQL interception. If no parser claims it, surface the
-            // original error.
-            Err(orig) => match self.run_intercepted_parser(sql)? {
-                Some(result) => Ok(result),
-                None => Err(orig),
-            },
-        }
-    }
-
-    /// 2.3.0 / v3: offer `sql` (which the built-in parser rejected) to each
-    /// component-declared parser extension via `parser-host.call-parse`. The first
-    /// that returns `some(rewrite)` wins: the core runs the rewrite SQL on this
-    /// connection and returns its result. Returns `Ok(None)` if none claim it.
-    fn run_intercepted_parser(&self, sql: &str) -> Result<Option<QueryResult>, DuckDbError> {
-        sync_parsers();
-        let handles: Vec<(String, u32)> = {
-            let guard = declared_parsers()
-                .lock()
-                .expect("declared parsers mutex poisoned");
-            if guard.is_empty() {
-                return Ok(None);
-            }
-            guard.clone()
-        };
-        for (_name, handle) in handles {
-            let rewrite = parser_host::call_parse(handle, sql)
-                .map_err(|err| DuckDbError::message(format_duckerror(&err)))?;
-            let script = match rewrite {
-                Some(s) => s,
-                None => continue, // this parser declined; try the next
-            };
-            // Run the rewrite on this connection. Multiple statements are separated
-            // by ';'; return the LAST statement's result (so `VISUALIZE SELECT ...`
-            // yields the rewritten query's rows).
-            let mut last: Option<(Vec<Columndef>, Vec<Row>)> = None;
-            for statement in split_sql_statements(&script) {
-                let trimmed = statement.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                last = Some(self.collect_rows(trimmed)?);
-            }
-            let (columns, rows) = last.unwrap_or_else(|| (Vec::new(), Vec::new()));
-            return Ok(Some(QueryResult { columns, rows }));
-        }
-        Ok(None)
-    }
-
-    /// Item 4: if `sql` is `PRAGMA <name>(...)` for a component-declared pragma,
-    /// dispatch it (the component RETURNS a SQL script as text -- it does NOT
-    /// re-enter SQL during the callback), run that script on this connection, and
-    /// return an empty result. Returns `Ok(None)` if `sql` is not such a pragma.
-    fn run_intercepted_pragma(&self, sql: &str) -> Result<Option<QueryResult>, DuckDbError> {
-        let parsed = match parse_pragma_call(sql) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        // Ensure the pragma registry is populated (pragmas are declared at LOAD;
-        // the pull is otherwise lazy inside collect_rows).
-        sync_pragmas();
-        let handle = {
-            let guard = declared_pragmas()
-                .lock()
-                .expect("declared pragmas mutex poisoned");
-            match guard.get(&parsed.name.to_ascii_lowercase()) {
-                Some(h) => *h,
-                None => return Ok(None),
-            }
-        };
-
-        // Dispatch the pragma to the owning component, passing the parsed args as
-        // text values. The component returns the generated SQL script as a text
-        // value (Some) or none.
-        let args: Vec<Duckvalue> = parsed.args.into_iter().map(Duckvalue::Text).collect();
-        let returned = callback_dispatch::call_pragma(handle, &args)
-            .map_err(|err| DuckDbError::message(format_duckerror(&err)))?;
-
-        let script = match returned {
-            Some(Duckvalue::Text(s)) => s,
-            Some(_) => {
-                return Err(DuckDbError::message(format!(
-                    "pragma '{}' must return a SQL script (text)",
-                    parsed.name
-                )))
-            }
-            None => String::new(),
-        };
-
-        // Run the returned script on this same connection. Multiple statements are
-        // separated by ';'; duckdb_query runs the last statement's result, so we
-        // execute each non-empty statement individually for robustness.
-        for statement in split_sql_statements(&script) {
-            let trimmed = statement.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let _ = self.collect_rows(trimmed)?;
-        }
-
-        Ok(QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        })
-        .map(Some)
+        // @5.0.0: the storage/index/collation/files/table-stream/pragma/parser
+        // sync-and-intercept paths that used to sit here are gone — those flows
+        // moved to the host, which drives extension components directly via
+        // per-extension *-dispatch surfaces (see
+        // docs/wasm-ecosystem-at-5-adr.md, Decision 4 + Amendment A1). The core
+        // just runs plain SQL now.
+        let (columns, rows) = self.collect_rows(sql)?;
+        Ok(QueryResult { columns, rows })
     }
 
     /// Runs `sql` and serializes the entire result to an Arrow IPC stream, using
     /// DuckDB's (non-deprecated) result + data-chunk to Arrow conversion API.
     fn query_arrow_ipc(&self, sql: &str) -> Result<Vec<u8>, DuckDbError> {
-        self.sync_storage_extensions();
-        // Storage-registration timing: a `LOAD <storage-ext>` registers its
-        // ATTACH `TYPE` host-side, but `sync_storage_extensions` above only ran
-        // ONCE, before this batch executes. So a batch like
-        // `LOAD x; ATTACH ... (TYPE x)` would bind the ATTACH before the type is
-        // registered. When the batch carries a LOAD AND more statements, run each
-        // statement on its own (re-syncing before each) so a dependent ATTACH
-        // sees the type its preceding LOAD just declared. Single statements (the
-        // common case) keep the fast single-`duckdb_query` path untouched.
-        if let Some(last) = self.split_for_load_sync(sql) {
-            for stmt in &last.0 {
-                if stmt.trim().is_empty() {
-                    continue;
-                }
-                self.sync_storage_extensions();
-                let _ = self.query_arrow_ipc_one(stmt)?;
-            }
-            self.sync_storage_extensions();
-            return self.query_arrow_ipc_one(&last.1);
-        }
         self.query_arrow_ipc_one(sql)
     }
 
@@ -4612,49 +2550,10 @@ impl ConnectionState {
     }
 
     fn collect_rows(&self, sql: &str) -> Result<(Vec<Columndef>, Vec<Row>), DuckDbError> {
-        self.sync_storage_extensions();
-        // See `query_arrow_ipc` for the rationale: split a LOAD-carrying batch so
-        // each statement re-syncs storage types before it binds. Single
-        // statements keep the fast path.
-        if let Some(last) = self.split_for_load_sync(sql) {
-            for stmt in &last.0 {
-                if stmt.trim().is_empty() {
-                    continue;
-                }
-                self.sync_storage_extensions();
-                let _ = self.collect_rows_one(stmt)?;
-            }
-            self.sync_storage_extensions();
-            return self.collect_rows_one(&last.1);
-        }
+        // @5.0.0: no more per-batch storage-type sync (that was the split-and-
+        // re-sync trampoline for the storage-host bridge). Statement text goes
+        // straight through duckdb_query.
         self.collect_rows_one(sql)
-    }
-
-    /// If `sql` is a multi-statement batch that contains a `LOAD`, returns the
-    /// leading statements (`.0`) and the trailing statement (`.1`) to run one at a
-    /// time with a storage-type re-sync before each. Returns `None` for a single
-    /// statement or a batch with no LOAD (the common, fast single-query path).
-    fn split_for_load_sync(&self, sql: &str) -> Option<(Vec<String>, String)> {
-        // Fast-path bail BEFORE the allocating statement split: the split only
-        // matters for a multi-statement batch that contains a LOAD. A single
-        // statement has no `;` separating two statements, and a batch with no
-        // LOAD never needs the per-statement re-sync. Both are cheap byte scans
-        // (no allocation) and skip building the Vec<String> for the common
-        // single-statement / non-LOAD query -- the hot path.
-        if !sql.contains(';') || !contains_load_keyword_ascii_ci(sql) {
-            return None;
-        }
-        let stmts = split_sql_statements(sql);
-        if stmts.len() < 2 {
-            return None;
-        }
-        let has_load = stmts.iter().any(|s| statement_is_load(s));
-        if !has_load {
-            return None;
-        }
-        let mut leading: Vec<String> = stmts;
-        let last = leading.pop().unwrap();
-        Some((leading, last))
     }
 
     fn collect_rows_one(&self, sql: &str) -> Result<(Vec<Columndef>, Vec<Row>), DuckDbError> {
@@ -4874,6 +2773,16 @@ impl exported_database::GuestPreparedStatement for PreparedStatementState {
                     Duckvalue::Uuid(u) => {
                         duckdb::duckdb_bind_uint64(stmt, idx, u.lo)
                     }
+                    // @5.0.0: HUGEINT / UHUGEINT scalars bind the low 64 bits;
+                    // the minimal C-API has no dedicated 128-bit prepared-bind.
+                    // Composite params of this shape are not exercised by the
+                    // suite.
+                    Duckvalue::Hugeint(h) => {
+                        duckdb::duckdb_bind_int64(stmt, idx, h.lower as i64)
+                    }
+                    Duckvalue::Uhugeint(h) => {
+                        duckdb::duckdb_bind_uint64(stmt, idx, h.lower)
+                    }
                     // ESCAPE-HATCH: bind the JSON text (DuckDB casts to the param's
                     // declared type). Complex params are not exercised by the suite.
                     Duckvalue::Complex(c) => duckdb::duckdb_bind_varchar_length(
@@ -5018,6 +2927,14 @@ impl exported_database::GuestAppender for AppenderState {
                     }
                     Duckvalue::Uuid(u) => {
                         duckdb::duckdb_append_uint64(appender, u.lo)
+                    }
+                    // @5.0.0: HUGEINT / UHUGEINT appends. The append C-API has
+                    // no 128-bit path; fall back to the low 64 bits.
+                    Duckvalue::Hugeint(h) => {
+                        duckdb::duckdb_append_int64(appender, h.lower as i64)
+                    }
+                    Duckvalue::Uhugeint(h) => {
+                        duckdb::duckdb_append_uint64(appender, h.lower)
                     }
                     // ESCAPE-HATCH: append the JSON text (DuckDB casts to the
                     // column type). Complex appends are not exercised.
@@ -5461,7 +3378,16 @@ fn duckdb_type_to_logical(type_id: duckdb::duckdb_type) -> Option<Logicaltype> {
         duckdb::DUCKDB_TYPE_DATE => Some(Logicaltype::Date),
         duckdb::DUCKDB_TYPE_TIME => Some(Logicaltype::Time),
         duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => Some(Logicaltype::Timestamptz),
-        duckdb::DUCKDB_TYPE_DECIMAL => Some(Logicaltype::Decimal),
+        // @5.0.0: `Logicaltype::Decimal` now carries a `Decimalshape { width,
+        // scale }`. The C API `duckdb_type` alone doesn't carry the shape (it
+        // rides on the logical-type handle via `duckdb_decimal_width` /
+        // `duckdb_decimal_scale`); this converter takes only the type_id, so we
+        // fall back to the DECIMAL(18, 3) default the native-extension bridge
+        // uses at f886a3b — callers that need the real width/scale must plumb
+        // it through the logical-type handle side, not this type-id shortcut.
+        duckdb::DUCKDB_TYPE_DECIMAL => {
+            Some(Logicaltype::Decimal(Decimalshape { width: 18, scale: 3 }))
+        }
         duckdb::DUCKDB_TYPE_INTERVAL => Some(Logicaltype::Interval),
         duckdb::DUCKDB_TYPE_UUID => Some(Logicaltype::Uuid),
         // The builtin GEOMETRY type is physically a WKB string_t blob, identical
@@ -6038,7 +3964,7 @@ impl config_exports::Guest for ConfigHost {
     }
 }
 
-config_exports::__export_duckdb_extension_config_4_0_0_cabi!(
+config_exports::__export_duckdb_extension_config_5_0_0_cabi!(
     ConfigHost with_types_in bindings::exports::duckdb::extension::config
 );
 
@@ -6050,7 +3976,7 @@ impl logging_exports::Guest for LoggingHost {
     fn log_fields(_level: Loglevel, _message: String, _fields: Vec<Logfield>) {}
 }
 
-logging_exports::__export_duckdb_extension_logging_4_0_0_cabi!(
+logging_exports::__export_duckdb_extension_logging_5_0_0_cabi!(
     LoggingHost with_types_in bindings::exports::duckdb::extension::logging
 );
 
@@ -6352,147 +4278,6 @@ struct AggregateState {
     rows: Vec<Vec<Duckvalue>>,
 }
 
-// ---- Item 4: component-declared pragmas (PRAGMA -> generated SQL) ----
-
-fn declared_pragmas() -> &'static Mutex<std::collections::HashMap<String, u32>> {
-    DECLARED_PRAGMAS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-fn declared_parsers() -> &'static Mutex<Vec<(String, u32)>> {
-    DECLARED_PARSERS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// 2.3.0 / v3: pull the parser extensions components have declared into the
-/// registry (declared at LOAD; the pull is lazy, mirroring sync_pragmas).
-fn sync_parsers() {
-    let specs = parser_host::parser_list();
-    if specs.is_empty() {
-        return;
-    }
-    let mut guard = match declared_parsers().lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    for spec in specs {
-        if !guard.iter().any(|(_, h)| *h == spec.callback_handle) {
-            guard.push((spec.name, spec.callback_handle));
-        }
-    }
-}
-
-/// Pull the pragmas components have declared (via the `pragma-host.pragma-list`
-/// import) into the process-wide registry. Idempotent: names are keyed
-/// lower-case so interception is case-insensitive. Mirrors `sync_collations`.
-fn sync_pragmas() {
-    let specs = pragma_host::pragma_list();
-    if specs.is_empty() {
-        return;
-    }
-    let mut guard = match declared_pragmas().lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    for spec in specs {
-        guard.insert(spec.name.to_ascii_lowercase(), spec.callback_handle);
-    }
-}
-
-/// A parsed `PRAGMA <name>(<arg>, ...)` call.
-struct ParsedPragma {
-    name: String,
-    args: Vec<String>,
-}
-
-/// Parse `PRAGMA <name>(<arg>, ...)` (also accepting `CALL <name>(...)`),
-/// returning the pragma name and its arguments as strings. Single/double-quoted
-/// args are unquoted; bare identifiers/numbers are taken verbatim. Returns None
-/// if `sql` is not a pragma/call form. Only a single statement is considered.
-fn parse_pragma_call(sql: &str) -> Option<ParsedPragma> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix("pragma") {
-        if !r.starts_with(|c: char| c.is_whitespace()) {
-            return None;
-        }
-        &trimmed[6..]
-    } else if let Some(r) = lower.strip_prefix("call") {
-        if !r.starts_with(|c: char| c.is_whitespace()) {
-            return None;
-        }
-        &trimmed[4..]
-    } else {
-        return None;
-    };
-    let rest = rest.trim_start();
-    let open = rest.find('(')?;
-    let name = rest[..open].trim().to_string();
-    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let close = rest.rfind(')')?;
-    if close < open {
-        return None;
-    }
-    let inner = &rest[open + 1..close];
-    let args = split_pragma_args(inner);
-    Some(ParsedPragma { name, args })
-}
-
-/// Split a pragma argument list on top-level commas, honoring single/double
-/// quotes (with doubled-quote escapes), and unquote each argument.
-fn split_pragma_args(inner: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut buf = String::new();
-    let mut chars = inner.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    if chars.peek() == Some(&q) {
-                        buf.push(q);
-                        chars.next();
-                    } else {
-                        quote = None;
-                    }
-                } else {
-                    buf.push(c);
-                }
-            }
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                ',' => {
-                    args.push(buf.trim().to_string());
-                    buf.clear();
-                }
-                _ => buf.push(c),
-            },
-        }
-    }
-    let last = buf.trim().to_string();
-    if !last.is_empty() || !args.is_empty() {
-        args.push(last);
-    }
-    args
-}
-
-/// Split a SQL script into statements on top-level semicolons, honoring
-/// single/double-quoted strings (with doubled-quote escapes). Good enough for
-/// the generated FTS index DDL (no semicolons inside string literals there, but
-/// the quote handling keeps it robust).
-/// True if `stmt` (one SQL statement) is a `LOAD <name>` -- the trigger for
-/// running a multi-statement batch one statement at a time so a later
-/// `ATTACH ... (TYPE <name>)` sees the storage type the LOAD just registered.
-/// Tolerant of leading whitespace/comments-stripped input; matches the first
-/// keyword case-insensitively.
-fn statement_is_load(stmt: &str) -> bool {
-    stmt.trim_start()
-        .split(|c: char| c.is_whitespace())
-        .next()
-        .map(|kw| kw.eq_ignore_ascii_case("load"))
-        .unwrap_or(false)
-}
-
 /// Reject component-supplied `complex` JSON whose recursion depth would overflow
 /// the wasm stack when walked by `write_json_to_vector`. Pure + connection-free
 /// so it is unit-testable; the unsafe writer enforces the same cap inline (the
@@ -6557,68 +4342,6 @@ fn json_value_kind(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
-}
-
-/// Cheap, allocation-free pre-filter: does `sql` contain the ASCII keyword
-/// "load" as a whole word (case-insensitive)? Used to skip the allocating
-/// statement split on the common non-LOAD query path. A false positive only
-/// costs one extra `split_sql_statements` pass (still correct); it is
-/// intentionally conservative (substring "preload" does NOT match, since the
-/// preceding char is alphanumeric).
-fn contains_load_keyword_ascii_ci(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let needle = b"load";
-    if bytes.len() < needle.len() {
-        return false;
-    }
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    for i in 0..=bytes.len() - needle.len() {
-        if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle) {
-            let before_ok = i == 0 || !is_word(bytes[i - 1]);
-            let after_idx = i + needle.len();
-            let after_ok = after_idx == bytes.len() || !is_word(bytes[after_idx]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn split_sql_statements(script: &str) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut buf = String::new();
-    let mut chars = script.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                buf.push(c);
-                if c == q {
-                    if chars.peek() == Some(&q) {
-                        buf.push(q);
-                        chars.next();
-                    } else {
-                        quote = None;
-                    }
-                }
-            }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    buf.push(c);
-                }
-                ';' => {
-                    stmts.push(std::mem::take(&mut buf));
-                }
-                _ => buf.push(c),
-            },
-        }
-    }
-    if !buf.trim().is_empty() {
-        stmts.push(buf);
-    }
-    stmts
 }
 
 fn scalar_function_definitions() -> &'static Mutex<Vec<Arc<ScalarFunctionDefinition>>> {
@@ -6990,7 +4713,7 @@ impl runtime_exports::Guest for RuntimeHost {
     }
 }
 
-runtime_exports::__export_duckdb_extension_runtime_4_0_0_cabi!(
+runtime_exports::__export_duckdb_extension_runtime_5_0_0_cabi!(
     RuntimeHost with_types_in bindings::exports::duckdb::extension::runtime
 );
 
@@ -7013,9 +4736,17 @@ fn convert_runtime_logicaltype(logical: runtime_exports::Logicaltype) -> Logical
         runtime_exports::Logicaltype::Date => Logicaltype::Date,
         runtime_exports::Logicaltype::Time => Logicaltype::Time,
         runtime_exports::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
-        runtime_exports::Logicaltype::Decimal => Logicaltype::Decimal,
+        // @5.0.0: DECIMAL carries a Decimalshape { width, scale } payload.
+        // Preserve the shape on the way through.
+        runtime_exports::Logicaltype::Decimal(shape) => Logicaltype::Decimal(Decimalshape {
+            width: shape.width,
+            scale: shape.scale,
+        }),
         runtime_exports::Logicaltype::Interval => Logicaltype::Interval,
         runtime_exports::Logicaltype::Uuid => Logicaltype::Uuid,
+        // @5.0.0: new 128-bit integer arms.
+        runtime_exports::Logicaltype::Hugeint => Logicaltype::Hugeint,
+        runtime_exports::Logicaltype::Uhugeint => Logicaltype::Uhugeint,
         runtime_exports::Logicaltype::Complex(expr) => Logicaltype::Complex(expr),
     }
 }
@@ -7039,9 +4770,16 @@ fn convert_loader_logicaltype(logical: extension_loader_hooks::Logicaltype) -> L
         extension_loader_hooks::Logicaltype::Date => Logicaltype::Date,
         extension_loader_hooks::Logicaltype::Time => Logicaltype::Time,
         extension_loader_hooks::Logicaltype::Timestamptz => Logicaltype::Timestamptz,
-        extension_loader_hooks::Logicaltype::Decimal => Logicaltype::Decimal,
+        // @5.0.0: DECIMAL carries a Decimalshape { width, scale } payload.
+        extension_loader_hooks::Logicaltype::Decimal(shape) => Logicaltype::Decimal(Decimalshape {
+            width: shape.width,
+            scale: shape.scale,
+        }),
         extension_loader_hooks::Logicaltype::Interval => Logicaltype::Interval,
         extension_loader_hooks::Logicaltype::Uuid => Logicaltype::Uuid,
+        // @5.0.0: new 128-bit integer arms.
+        extension_loader_hooks::Logicaltype::Hugeint => Logicaltype::Hugeint,
+        extension_loader_hooks::Logicaltype::Uhugeint => Logicaltype::Uhugeint,
         extension_loader_hooks::Logicaltype::Complex(expr) => Logicaltype::Complex(expr),
     }
 }
@@ -7161,9 +4899,11 @@ fn describe_loader_logicaltype(logical: &extension_loader_hooks::Logicaltype) ->
         extension_loader_hooks::Logicaltype::Date => "DATE",
         extension_loader_hooks::Logicaltype::Time => "TIME",
         extension_loader_hooks::Logicaltype::Timestamptz => "TIMESTAMPTZ",
-        extension_loader_hooks::Logicaltype::Decimal => "DECIMAL",
+        extension_loader_hooks::Logicaltype::Decimal(_) => "DECIMAL",
         extension_loader_hooks::Logicaltype::Interval => "INTERVAL",
         extension_loader_hooks::Logicaltype::Uuid => "UUID",
+        extension_loader_hooks::Logicaltype::Hugeint => "HUGEINT",
+        extension_loader_hooks::Logicaltype::Uhugeint => "UHUGEINT",
         extension_loader_hooks::Logicaltype::Complex(_) => "COMPLEX",
     }
 }
@@ -7211,9 +4951,12 @@ fn duckdb_type_for_logical(logical: &Logicaltype) -> duckdb::duckdb_type {
         Logicaltype::Date => duckdb::DUCKDB_TYPE_DATE,
         Logicaltype::Time => duckdb::DUCKDB_TYPE_TIME,
         Logicaltype::Timestamptz => duckdb::DUCKDB_TYPE_TIMESTAMP_TZ,
-        Logicaltype::Decimal => duckdb::DUCKDB_TYPE_DECIMAL,
+        Logicaltype::Decimal(_) => duckdb::DUCKDB_TYPE_DECIMAL,
         Logicaltype::Interval => duckdb::DUCKDB_TYPE_INTERVAL,
         Logicaltype::Uuid => duckdb::DUCKDB_TYPE_UUID,
+        // @5.0.0: 128-bit integer logical types.
+        Logicaltype::Hugeint => duckdb::DUCKDB_TYPE_HUGEINT,
+        Logicaltype::Uhugeint => duckdb::DUCKDB_TYPE_UHUGEINT,
         // ESCAPE-HATCH: a `complex` type cannot be built from a single type code;
         // `create_duckdb_logical_type` resolves it via `resolve_logical_type`
         // BEFORE this is reached, so this arm is a placeholder.
@@ -7264,8 +5007,13 @@ unsafe fn create_duckdb_logical_type(
     }
     // DECIMAL cannot be built from a bare type code (duckdb_create_logical_type
     // rejects DUCKDB_TYPE_DECIMAL); it needs an explicit width/scale.
-    if matches!(logical, Logicaltype::Decimal) {
-        let ty = duckdb::duckdb_create_decimal_type(DEFAULT_DECIMAL_WIDTH, DEFAULT_DECIMAL_SCALE);
+    // @5.0.0: DECIMAL now carries its width/scale in the variant payload; use
+    // them when present, and fall back to the DEFAULT_DECIMAL_* defaults when
+    // width is zero (a placeholder-shaped Decimal).
+    if let Logicaltype::Decimal(shape) = logical {
+        let width = if shape.width == 0 { DEFAULT_DECIMAL_WIDTH } else { shape.width };
+        let scale = if shape.width == 0 { DEFAULT_DECIMAL_SCALE } else { shape.scale };
+        let ty = duckdb::duckdb_create_decimal_type(width, scale);
         return if ty.is_null() {
             Err(Duckerror::Internal(
                 "duckdb_create_decimal_type returned null".to_string(),
@@ -8103,16 +5851,38 @@ unsafe fn read_scalar_argument(
             let value = *data.add(row as usize);
             Ok(Duckvalue::Timestamptz(value))
         }
-        Logicaltype::Decimal => {
-            // We materialize DECIMAL as decimal(38, S), whose physical storage is
-            // an int128 of the unscaled value. Read the raw 128-bit integer.
+        Logicaltype::Decimal(shape) => {
+            // We materialize DECIMAL as decimal(width, scale), whose physical
+            // storage is an int128 of the unscaled value. Read the raw 128-bit
+            // integer and echo the shape's width/scale so the value round-trips.
             let data = column.data as *mut i128;
             let raw = *data.add(row as usize) as u128;
+            let width = if shape.width == 0 { DEFAULT_DECIMAL_WIDTH } else { shape.width };
+            let scale = if shape.width == 0 { DEFAULT_DECIMAL_SCALE } else { shape.scale };
             Ok(Duckvalue::Decimal(Decimalvalue {
                 lower: raw as u64,
                 upper: (raw >> 64) as u64,
-                width: DEFAULT_DECIMAL_WIDTH,
-                scale: DEFAULT_DECIMAL_SCALE,
+                width,
+                scale,
+            }))
+        }
+        // @5.0.0: 128-bit integer physical reads. Both HUGEINT and UHUGEINT
+        // ride the same on-disk layout (two u64/s64 halves); the sign
+        // difference is carried by which arm we hand the caller.
+        Logicaltype::Hugeint => {
+            let data = column.data as *mut duckdb::duckdb_hugeint;
+            let hh = *data.add(row as usize);
+            Ok(Duckvalue::Hugeint(Hugeintvalue {
+                lower: hh.lower,
+                upper: hh.upper,
+            }))
+        }
+        Logicaltype::Uhugeint => {
+            let data = column.data as *mut duckdb::duckdb_uhugeint;
+            let hh = *data.add(row as usize);
+            Ok(Duckvalue::Uhugeint(Uhugeintvalue {
+                lower: hh.lower,
+                upper: hh.upper,
             }))
         }
         Logicaltype::Interval => {
@@ -8368,8 +6138,10 @@ unsafe fn build_colvec(
             }
             Column::Blob(v)
         }
-        Logicaltype::Decimal => {
+        Logicaltype::Decimal(shape) => {
             let p = column.data as *const i128;
+            let width = if shape.width == 0 { DEFAULT_DECIMAL_WIDTH } else { shape.width };
+            let scale = if shape.width == 0 { DEFAULT_DECIMAL_SCALE } else { shape.scale };
             let mut v = Vec::with_capacity(rows);
             for row in 0..rows {
                 if validity_row_is_valid(column.validity, row) {
@@ -8377,14 +6149,41 @@ unsafe fn build_colvec(
                     v.push(column_types::Decimalvalue {
                         lower: raw as u64,
                         upper: (raw >> 64) as u64,
-                        width: DEFAULT_DECIMAL_WIDTH,
-                        scale: DEFAULT_DECIMAL_SCALE,
+                        width,
+                        scale,
                     });
                 } else {
-                    v.push(column_types::Decimalvalue { lower: 0, upper: 0, width: DEFAULT_DECIMAL_WIDTH, scale: DEFAULT_DECIMAL_SCALE });
+                    v.push(column_types::Decimalvalue { lower: 0, upper: 0, width, scale });
                 }
             }
             Column::Decimal(v)
+        }
+        // @5.0.0: 128-bit integer physical layouts, memcpy-friendly.
+        Logicaltype::Hugeint => {
+            let p = column.data as *const duckdb::duckdb_hugeint;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let hh = *p.add(row);
+                    v.push(column_types::DuckInt128 { lower: hh.lower, upper: hh.upper });
+                } else {
+                    v.push(column_types::DuckInt128 { lower: 0, upper: 0 });
+                }
+            }
+            Column::Hugeint(v)
+        }
+        Logicaltype::Uhugeint => {
+            let p = column.data as *const duckdb::duckdb_uhugeint;
+            let mut v = Vec::with_capacity(rows);
+            for row in 0..rows {
+                if validity_row_is_valid(column.validity, row) {
+                    let hh = *p.add(row);
+                    v.push(column_types::DuckUint128 { lower: hh.lower, upper: hh.upper });
+                } else {
+                    v.push(column_types::DuckUint128 { lower: 0, upper: 0 });
+                }
+            }
+            Column::Uhugeint(v)
         }
         Logicaltype::Interval => {
             let p = column.data as *const duckdb::duckdb_interval;
@@ -8550,6 +6349,25 @@ unsafe fn write_colvec_to_vector(
                 write_duckvalue_to_vector(
                     vector, logical, row as duckdb::idx_t,
                     Duckvalue::Uuid(Uuidvalue { hi: d.hi, lo: d.lo }),
+                )?;
+            }
+        }
+        // @5.0.0: 128-bit integer arms. Fixed-width and memcpy-friendly, so
+        // route through the per-cell writer only if the declared return type
+        // matches; otherwise fall through to the type-mismatch error.
+        Column::Hugeint(v) if matches!(logical, Logicaltype::Hugeint) => {
+            for (row, d) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Hugeint(Hugeintvalue { lower: d.lower, upper: d.upper }),
+                )?;
+            }
+        }
+        Column::Uhugeint(v) if matches!(logical, Logicaltype::Uhugeint) => {
+            for (row, d) in v.into_iter().enumerate() {
+                write_duckvalue_to_vector(
+                    vector, logical, row as duckdb::idx_t,
+                    Duckvalue::Uhugeint(Uhugeintvalue { lower: d.lower, upper: d.upper }),
                 )?;
             }
         }
@@ -8925,17 +6743,42 @@ unsafe fn write_duckvalue_to_vector(
             Ok(())
         }
         Duckvalue::Decimal(d) => {
-            if !matches!(logical, Logicaltype::Decimal) {
+            if !matches!(logical, Logicaltype::Decimal(_)) {
                 return Err(Duckerror::Invalidargument(format!(
                     "expected decimal result, got {}",
                     duckvalue_kind(&Duckvalue::Decimal(d))
                 )));
             }
-            // The result vector is decimal(38, S); its physical storage is an
+            // The result vector is decimal(W, S); its physical storage is an
             // int128 of the unscaled value = (upper << 64 | lower).
             let raw = ((d.upper as u128) << 64) | d.lower as u128;
             let data = duckdb::duckdb_vector_get_data(vector) as *mut i128;
             *data.add(row as usize) = raw as i128;
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        // @5.0.0: 128-bit integer scalar writes.
+        Duckvalue::Hugeint(h) => {
+            if !matches!(logical, Logicaltype::Hugeint) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected hugeint result, got {}",
+                    duckvalue_kind(&Duckvalue::Hugeint(h))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut duckdb::duckdb_hugeint;
+            *data.add(row as usize) = duckdb::duckdb_hugeint { lower: h.lower, upper: h.upper };
+            duckdb::duckdb_validity_set_row_valid(validity, row);
+            Ok(())
+        }
+        Duckvalue::Uhugeint(h) => {
+            if !matches!(logical, Logicaltype::Uhugeint) {
+                return Err(Duckerror::Invalidargument(format!(
+                    "expected uhugeint result, got {}",
+                    duckvalue_kind(&Duckvalue::Uhugeint(h))
+                )));
+            }
+            let data = duckdb::duckdb_vector_get_data(vector) as *mut duckdb::duckdb_uhugeint;
+            *data.add(row as usize) = duckdb::duckdb_uhugeint { lower: h.lower, upper: h.upper };
             duckdb::duckdb_validity_set_row_valid(validity, row);
             Ok(())
         }
@@ -9248,6 +7091,9 @@ fn duckvalue_kind(value: &Duckvalue) -> &'static str {
         Duckvalue::Decimal(_) => "decimal",
         Duckvalue::Interval(_) => "interval",
         Duckvalue::Uuid(_) => "uuid",
+        // @5.0.0: 128-bit integer scalar kinds.
+        Duckvalue::Hugeint(_) => "hugeint",
+        Duckvalue::Uhugeint(_) => "uhugeint",
         Duckvalue::Complex(_) => "complex",
     }
 }
@@ -9293,7 +7139,7 @@ unsafe fn duckdb_value_to_duckvalue(
         Logicaltype::Timestamptz => {
             Duckvalue::Timestamptz(duckdb::duckdb_get_timestamp_tz(value).micros)
         }
-        Logicaltype::Decimal => {
+        Logicaltype::Decimal(_) => {
             let d = duckdb::duckdb_get_decimal(value);
             Duckvalue::Decimal(Decimalvalue {
                 lower: d.value.lower,
@@ -9301,6 +7147,15 @@ unsafe fn duckdb_value_to_duckvalue(
                 width: d.width,
                 scale: d.scale,
             })
+        }
+        // @5.0.0: 128-bit integer physical reads via the value API.
+        Logicaltype::Hugeint => {
+            let hh = duckdb::duckdb_get_hugeint(value);
+            Duckvalue::Hugeint(Hugeintvalue { lower: hh.lower, upper: hh.upper })
+        }
+        Logicaltype::Uhugeint => {
+            let hh = duckdb::duckdb_get_uhugeint(value);
+            Duckvalue::Uhugeint(Uhugeintvalue { lower: hh.lower, upper: hh.upper })
         }
         Logicaltype::Interval => {
             let iv = duckdb::duckdb_get_interval(value);
@@ -9768,9 +7623,14 @@ fn marshal_logical_for_type(type_id: duckdb::duckdb_type) -> Logicaltype {
         duckdb::DUCKDB_TYPE_TIME => Logicaltype::Time,
         duckdb::DUCKDB_TYPE_TIMESTAMP => Logicaltype::Timestamp,
         duckdb::DUCKDB_TYPE_TIMESTAMP_TZ => Logicaltype::Timestamptz,
-        duckdb::DUCKDB_TYPE_DECIMAL => Logicaltype::Decimal,
+        // @5.0.0: DECIMAL width/scale ride the logical-type variant now; this
+        // type-id-only marshal path can't recover them, so use the default
+        // shape (see `duckdb_type_to_logical`).
+        duckdb::DUCKDB_TYPE_DECIMAL => Logicaltype::Decimal(Decimalshape { width: 18, scale: 3 }),
         duckdb::DUCKDB_TYPE_INTERVAL => Logicaltype::Interval,
         duckdb::DUCKDB_TYPE_UUID => Logicaltype::Uuid,
+        duckdb::DUCKDB_TYPE_HUGEINT => Logicaltype::Hugeint,
+        duckdb::DUCKDB_TYPE_UHUGEINT => Logicaltype::Uhugeint,
         // TIMESTAMP_NS / TIME_TZ have no dedicated `logicaltype` variant in
         // the WIT contract (`variant logicaltype` at
         // wit/duckdb-extension/types.wit); surface them through the
