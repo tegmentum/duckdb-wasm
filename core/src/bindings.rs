@@ -14008,6 +14008,28 @@ pub mod exports {
                 pub type Columndef = super::super::super::super::duckdb::extension::types::Columndef;
                 pub type Duckerror = super::super::super::super::duckdb::extension::types::Duckerror;
                 pub type Duckvalue = super::super::super::super::duckdb::extension::types::Duckvalue;
+                pub type Logicaltype = super::super::super::super::duckdb::extension::types::Logicaltype;
+                /// Column shape for a host-registered table function. Mirrors the
+                /// per-column pair carried by the `columndef` record but named to make
+                /// the `register-table-function` call site self-explanatory (the caller
+                /// is declaring the schema of a synthetic table, not returning result
+                /// columns).
+                #[derive(Clone)]
+                pub struct ColumnDescriptor {
+                    pub name: _rt::String,
+                    pub ty: Logicaltype,
+                }
+                impl ::core::fmt::Debug for ColumnDescriptor {
+                    fn fmt(
+                        &self,
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
+                        f.debug_struct("ColumnDescriptor")
+                            .field("name", &self.name)
+                            .field("ty", &self.ty)
+                            .finish()
+                    }
+                }
                 #[derive(Debug)]
                 #[repr(transparent)]
                 pub struct Connection {
@@ -18922,6 +18944,157 @@ pub mod exports {
                         }
                     }
                 }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn _export_register_table_function_cabi<T: Guest>(
+                    arg0: i32,
+                    arg1: *mut u8,
+                    arg2: usize,
+                    arg3: *mut u8,
+                    arg4: usize,
+                    arg5: i32,
+                ) -> *mut u8 {
+                    #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+                    let len0 = arg2;
+                    let bytes0 = _rt::Vec::from_raw_parts(arg1.cast(), len0, len0);
+                    let base11 = arg3;
+                    let len11 = arg4;
+                    let mut result11 = _rt::Vec::with_capacity(len11);
+                    for i in 0..len11 {
+                        let base = base11
+                            .add(i * (5 * ::core::mem::size_of::<*const u8>()));
+                        let e11 = {
+                            let l1 = *base.add(0).cast::<*mut u8>();
+                            let l2 = *base
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<usize>();
+                            let len3 = l2;
+                            let bytes3 = _rt::Vec::from_raw_parts(l1.cast(), len3, len3);
+                            let l4 = i32::from(
+                                *base
+                                    .add(2 * ::core::mem::size_of::<*const u8>())
+                                    .cast::<u8>(),
+                            );
+                            use super::super::super::super::duckdb::extension::types::Logicaltype as V10;
+                            let v10 = match l4 {
+                                0 => V10::Boolean,
+                                1 => V10::Int64,
+                                2 => V10::Uint64,
+                                3 => V10::Float64,
+                                4 => V10::Text,
+                                5 => V10::Blob,
+                                6 => V10::Int32,
+                                7 => V10::Timestamp,
+                                8 => V10::Int8,
+                                9 => V10::Int16,
+                                10 => V10::Uint8,
+                                11 => V10::Uint16,
+                                12 => V10::Uint32,
+                                13 => V10::Float32,
+                                14 => V10::Date,
+                                15 => V10::Time,
+                                16 => V10::Timestamptz,
+                                17 => {
+                                    let e10 = {
+                                        let l5 = i32::from(
+                                            *base
+                                                .add(3 * ::core::mem::size_of::<*const u8>())
+                                                .cast::<u8>(),
+                                        );
+                                        let l6 = i32::from(
+                                            *base
+                                                .add(1 + 3 * ::core::mem::size_of::<*const u8>())
+                                                .cast::<u8>(),
+                                        );
+                                        super::super::super::super::duckdb::extension::types::Decimalshape {
+                                            width: l5 as u8,
+                                            scale: l6 as u8,
+                                        }
+                                    };
+                                    V10::Decimal(e10)
+                                }
+                                18 => V10::Interval,
+                                19 => V10::Uuid,
+                                20 => V10::Hugeint,
+                                21 => V10::Uhugeint,
+                                n => {
+                                    debug_assert_eq!(n, 22, "invalid enum discriminant");
+                                    let e10 = {
+                                        let l7 = *base
+                                            .add(3 * ::core::mem::size_of::<*const u8>())
+                                            .cast::<*mut u8>();
+                                        let l8 = *base
+                                            .add(4 * ::core::mem::size_of::<*const u8>())
+                                            .cast::<usize>();
+                                        let len9 = l8;
+                                        let bytes9 = _rt::Vec::from_raw_parts(
+                                            l7.cast(),
+                                            len9,
+                                            len9,
+                                        );
+                                        _rt::string_lift(bytes9)
+                                    };
+                                    V10::Complex(e10)
+                                }
+                            };
+                            ColumnDescriptor {
+                                name: _rt::string_lift(bytes3),
+                                ty: v10,
+                            }
+                        };
+                        result11.push(e11);
+                    }
+                    _rt::cabi_dealloc(
+                        base11,
+                        len11 * (5 * ::core::mem::size_of::<*const u8>()),
+                        ::core::mem::size_of::<*const u8>(),
+                    );
+                    let result12 = T::register_table_function(
+                        unsafe { ConnectionBorrow::lift(arg0 as u32 as usize) },
+                        _rt::string_lift(bytes0),
+                        result11,
+                        arg5 as u32,
+                    );
+                    let ptr13 = (&raw mut _RET_AREA.0).cast::<u8>();
+                    match result12 {
+                        Ok(_) => {
+                            *ptr13.add(0).cast::<u8>() = (0i32) as u8;
+                        }
+                        Err(e) => {
+                            *ptr13.add(0).cast::<u8>() = (1i32) as u8;
+                            let vec14 = (e.into_bytes()).into_boxed_slice();
+                            let ptr14 = vec14.as_ptr().cast::<u8>();
+                            let len14 = vec14.len();
+                            ::core::mem::forget(vec14);
+                            *ptr13
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len14;
+                            *ptr13
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>() = ptr14.cast_mut();
+                        }
+                    };
+                    ptr13
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn __post_return_register_table_function<T: Guest>(
+                    arg0: *mut u8,
+                ) {
+                    let l0 = i32::from(*arg0.add(0).cast::<u8>());
+                    match l0 {
+                        0 => {}
+                        _ => {
+                            let l1 = *arg0
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>();
+                            let l2 = *arg0
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>();
+                            _rt::cabi_dealloc(l1, l2, 1);
+                        }
+                    }
+                }
                 pub trait Guest {
                     type Connection: GuestConnection;
                     type ResultStream: GuestResultStream;
@@ -18969,6 +19142,30 @@ pub mod exports {
                         body: _rt::Vec<u8>,
                     ) -> Option<UiResponse>;
                     fn handle_quack_request(body: _rt::Vec<u8>) -> Option<_rt::Vec<u8>>;
+                    /// Register a zero-argument table function on this database instance.
+                    /// Backs the Phase 2 (@5) ATTACH lift: the host reads `<alias>.<table>`
+                    /// column shapes via `storage-dispatch.table-columns`, mints a callback
+                    /// handle in its own registry, and calls this to graft an in-catalog
+                    /// name (e.g. `__mydb_foo`) that the host later fronts with a plain
+                    /// `CREATE VIEW mydb.foo AS SELECT * FROM __mydb_foo()`.
+                    ///
+                    /// When DuckDB executes the table function, the core drives the
+                    /// existing `callback-dispatch.call-table(callback-handle, args)` import
+                    /// with the supplied `callback-handle` (bind phase) and the streaming
+                    /// scan callbacks it registered internally (same C-API trampolines as
+                    /// extension-declared table functions -- see the precedent on
+                    /// `extension-loader-hooks.table-registration`).
+                    ///
+                    /// `columns` gives the table's schema; the arity must be >= 1. Returns
+                    /// `err(message)` when the underlying `duckdb_register_table_function`
+                    /// fails (name collision, invalid type, etc.) so the host can surface
+                    /// the message on the intercepting ATTACH.
+                    fn register_table_function(
+                        conn: ConnectionBorrow<'_>,
+                        name: _rt::String,
+                        columns: _rt::Vec<ColumnDescriptor>,
+                        callback_handle: u32,
+                    ) -> Result<(), _rt::String>;
                 }
                 pub trait GuestConnection: 'static {
                     #[doc(hidden)]
@@ -19365,8 +19562,19 @@ pub mod exports {
                         "cabi_post_duckdb:component/database#handle-quack-request")]
                         unsafe extern "C" fn _post_return_handle_quack_request(arg0 : *
                         mut u8,) { unsafe { $($path_to_types)*::
-                        __post_return_handle_quack_request::<$ty > (arg0) } } const _ :
-                        () = { #[doc(hidden)] #[unsafe (export_name =
+                        __post_return_handle_quack_request::<$ty > (arg0) } } #[unsafe
+                        (export_name =
+                        "duckdb:component/database#register-table-function")] unsafe
+                        extern "C" fn export_register_table_function(arg0 : i32, arg1 : *
+                        mut u8, arg2 : usize, arg3 : * mut u8, arg4 : usize, arg5 : i32,)
+                        -> * mut u8 { unsafe { $($path_to_types)*::
+                        _export_register_table_function_cabi::<$ty > (arg0, arg1, arg2,
+                        arg3, arg4, arg5) } } #[unsafe (export_name =
+                        "cabi_post_duckdb:component/database#register-table-function")]
+                        unsafe extern "C" fn _post_return_register_table_function(arg0 :
+                        * mut u8,) { unsafe { $($path_to_types)*::
+                        __post_return_register_table_function::<$ty > (arg0) } } const _
+                        : () = { #[doc(hidden)] #[unsafe (export_name =
                         "duckdb:component/database#[dtor]connection")]
                         #[allow(non_snake_case)] unsafe extern "C" fn dtor(rep : * mut
                         u8) { unsafe { $($path_to_types)*:: Connection::dtor::< <$ty as
@@ -28430,8 +28638,8 @@ pub(crate) use __export_libduckdb_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 13184] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x80f\x01A\x02\x01AE\x01\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 13325] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x8dg\x01A\x02\x01AE\x01\
 B\x0a\x01o\x02ss\x01p\0\x01@\0\0\x01\x04\0\x0fget-environment\x01\x02\x01ps\x01@\
 \0\0\x03\x04\0\x0dget-arguments\x01\x04\x01ks\x01@\0\0\x05\x04\0\x0binitial-cwd\x01\
 \x06\x03\0\x1awasi:cli/environment@0.2.6\x05\0\x01B\x04\x04\0\x05error\x03\x01\x01\
@@ -28629,61 +28837,64 @@ estroy-region\x01\x0b\x01j\x01\x03\x01\x07\x01@\x02\x09region-id{\x04sizey\0\x0c
 \0\0\x02\x03\x02\x01!\x04\0\x09tvm-error\x03\0\x02\x01p}\x01j\x01\x04\x01\x03\x01\
 @\x02\x03ptr\x01\x03leny\0\x05\x04\0\x04read\x01\x06\x01j\0\x01\x03\x01@\x02\x03\
 ptr\x01\x04data\x04\0\x07\x04\0\x05write\x01\x08\x03\0\x16tvm:memory/bytes@0.1.0\
-\x05#\x02\x03\0\x0a\x0ecapabilitykind\x01BZ\x02\x03\x02\x01$\x04\0\x0ecapability\
+\x05#\x02\x03\0\x0a\x0ecapabilitykind\x01Bb\x02\x03\x02\x01$\x04\0\x0ecapability\
 kind\x03\0\0\x02\x03\x02\x01\x13\x04\0\x09columndef\x03\0\x02\x02\x03\x02\x01\x17\
-\x04\0\x09duckerror\x03\0\x04\x02\x03\x02\x01\x18\x04\0\x09duckvalue\x03\0\x06\x04\
-\0\x0aconnection\x03\x01\x01p\x07\x04\0\x03row\x03\0\x09\x01p\x03\x01p\x0a\x01r\x02\
-\x07columns\x0b\x04rows\x0c\x04\0\x0cquery-result\x03\0\x0d\x04\0\x0dresult-stre\
-am\x03\x01\x04\0\x12prepared-statement\x03\x01\x04\0\x08appender\x03\x01\x01p\x01\
-\x01r\x02\x04names\x08requires\x12\x04\0\x0eextension-info\x03\0\x13\x01p}\x01r\x03\
-\x06status{\x07headerss\x04body\x15\x04\0\x0bui-response\x03\0\x16\x01h\x0f\x01@\
-\x01\x04self\x18\0\x0b\x04\0\x1c[method]result-stream.schema\x01\x19\x01k\x0c\x01\
-j\x01\x1a\x01\x05\x01@\x02\x04self\x18\x08max-rowsy\0\x1b\x04\0\x1a[method]resul\
-t-stream.next\x01\x1c\x01@\x01\x04self\x18\x01\0\x04\0\x1b[method]result-stream.\
-close\x01\x1d\x01h\x10\x01@\x01\x04self\x1e\0y\x04\0*[method]prepared-statement.\
-parameter-count\x01\x1f\x01p\x07\x01j\x01\x0e\x01\x05\x01@\x02\x04self\x1e\x06pa\
-rams\x20\0!\x04\0\"[method]prepared-statement.execute\x01\"\x01h\x11\x01j\0\x01\x05\
-\x01@\x02\x04self#\x06values\x20\0$\x04\0\x1b[method]appender.append-row\x01%\x01\
-@\x01\x04self#\0$\x04\0\x16[method]appender.flush\x01&\x04\0\x16[method]appender\
-.close\x01&\x01ks\x01i\x08\x01j\x01(\x01s\x01@\x01\x04path'\0)\x04\0\x04open\x01\
-*\x01o\x02ss\x01p+\x01@\x02\x04path'\x07options,\0)\x04\0\x10open-with-config\x01\
--\x01@\x01\x04conn(\x01\0\x04\0\x05close\x01.\x01h\x08\x01@\x01\x04conn/\x01\0\x04\
-\0\x09interrupt\x010\x01@\x02\x04conn/\x03sqls\0!\x04\0\x07execute\x011\x01i\x0f\
-\x01j\x012\x01\x05\x01@\x02\x04conn/\x03sqls\03\x04\0\x0bopen-stream\x014\x01i\x10\
-\x01j\x015\x01\x05\x01@\x02\x04conn/\x03sqls\06\x04\0\x07prepare\x017\x01j\x01\x15\
-\x01\x05\x01@\x02\x04conn/\x03sqls\08\x04\0\x0bquery-arrow\x019\x01i\x11\x01j\x01\
-:\x01\x05\x01@\x03\x04conn/\x06schema'\x05tables\0;\x04\0\x0fcreate-appender\x01\
-<\x01j\x01\x7f\x01s\x01@\x02\x04names\x08requires\x12\0=\x04\0\x12register-exten\
-sion\x01>\x01p\x14\x01@\0\0?\x04\0\x1alist-registered-extensions\x01@\x01k\x17\x01\
-@\x04\x06methods\x04paths\x07headerss\x04body\x15\0\xc1\0\x04\0\x11handle-ui-req\
-uest\x01B\x01k\x15\x01@\x01\x04body\x15\0\xc3\0\x04\0\x14handle-quack-request\x01\
-D\x04\0\x19duckdb:component/database\x05%\x02\x03\0\x0a\x0bconfigerror\x01B$\x02\
-\x03\x02\x01&\x04\0\x0bconfigerror\x03\0\0\x01@\0\0s\x04\0\x10provider-version\x01\
-\x02\x01ks\x01ps\x01@\x01\x06prefix\x03\0\x04\x04\0\x09list-keys\x01\x05\x01j\x01\
-\x03\x01\x01\x01@\x01\x04paths\0\x06\x04\0\x0aget-string\x01\x07\x01k\x7f\x01j\x01\
-\x08\x01\x01\x01@\x01\x04paths\0\x09\x04\0\x08get-bool\x01\x0a\x01kx\x01j\x01\x0b\
-\x01\x01\x01@\x01\x04paths\0\x0c\x04\0\x07get-i64\x01\x0d\x01kw\x01j\x01\x0e\x01\
-\x01\x01@\x01\x04paths\0\x0f\x04\0\x07get-u64\x01\x10\x01ku\x01j\x01\x11\x01\x01\
-\x01@\x01\x04paths\0\x12\x04\0\x07get-f64\x01\x13\x01p}\x01k\x14\x01j\x01\x15\x01\
-\x01\x01@\x01\x04paths\0\x16\x04\0\x09get-bytes\x01\x17\x01k\x04\x01j\x01\x18\x01\
-\x01\x01@\x01\x04paths\0\x19\x04\0\x0fget-string-list\x01\x1a\x04\0\x1dduckdb:ex\
-tension/config@5.0.0\x05'\x02\x03\0\x0a\x08logfield\x02\x03\0\x0a\x08loglevel\x01\
-B\x0a\x02\x03\x02\x01(\x04\0\x08logfield\x03\0\0\x02\x03\x02\x01)\x04\0\x08logle\
-vel\x03\0\x02\x01ks\x01@\x03\x05level\x03\x07messages\x06target\x04\x01\0\x04\0\x03\
-log\x01\x05\x01p\x01\x01@\x03\x05level\x03\x07messages\x06fields\x06\x01\0\x04\0\
-\x0alog-fields\x01\x07\x04\0\x1educkdb:extension/logging@5.0.0\x05*\x02\x03\0\x0a\
-\x07extopts\x02\x03\0\x0a\x07funcarg\x02\x03\0\x0a\x08funcopts\x02\x03\0\x0a\x08\
-rowbatch\x01Bf\x02\x03\x02\x01$\x04\0\x0ecapabilitykind\x03\0\0\x02\x03\x02\x01\x17\
-\x04\0\x09duckerror\x03\0\x02\x02\x03\x02\x01\x18\x04\0\x09duckvalue\x03\0\x04\x02\
-\x03\x02\x01+\x04\0\x07extopts\x03\0\x06\x02\x03\x02\x01,\x04\0\x07funcarg\x03\0\
-\x08\x02\x03\x02\x01-\x04\0\x08funcopts\x03\0\x0a\x02\x03\x02\x01\x19\x04\0\x0ai\
-nvokeinfo\x03\0\x0c\x02\x03\x02\x01\x12\x04\0\x0blogicaltype\x03\0\x0e\x02\x03\x02\
-\x01\x1a\x04\0\x09resultset\x03\0\x10\x02\x03\x02\x01.\x04\0\x08rowbatch\x03\0\x12\
-\x02\x03\x02\x01\x13\x04\0\x09columndef\x03\0\x14\x04\0\x0fscalar-callback\x03\x01\
-\x04\0\x0etable-callback\x03\x01\x04\0\x12aggregate-callback\x03\x01\x04\0\x0fpr\
-agma-callback\x03\x01\x04\0\x0dcast-callback\x03\x01\x04\0\x0fscalar-registry\x03\
-\x01\x04\0\x0etable-registry\x03\x01\x04\0\x12aggregate-registry\x03\x01\x04\0\x0f\
-pragma-registry\x03\x01\x04\0\x0emacro-registry\x03\x01\x01i\x1b\x01i\x1c\x01i\x1d\
+\x04\0\x09duckerror\x03\0\x04\x02\x03\x02\x01\x18\x04\0\x09duckvalue\x03\0\x06\x02\
+\x03\x02\x01\x12\x04\0\x0blogicaltype\x03\0\x08\x01r\x02\x04names\x02ty\x09\x04\0\
+\x11column-descriptor\x03\0\x0a\x04\0\x0aconnection\x03\x01\x01p\x07\x04\0\x03ro\
+w\x03\0\x0d\x01p\x03\x01p\x0e\x01r\x02\x07columns\x0f\x04rows\x10\x04\0\x0cquery\
+-result\x03\0\x11\x04\0\x0dresult-stream\x03\x01\x04\0\x12prepared-statement\x03\
+\x01\x04\0\x08appender\x03\x01\x01p\x01\x01r\x02\x04names\x08requires\x16\x04\0\x0e\
+extension-info\x03\0\x17\x01p}\x01r\x03\x06status{\x07headerss\x04body\x19\x04\0\
+\x0bui-response\x03\0\x1a\x01h\x13\x01@\x01\x04self\x1c\0\x0f\x04\0\x1c[method]r\
+esult-stream.schema\x01\x1d\x01k\x10\x01j\x01\x1e\x01\x05\x01@\x02\x04self\x1c\x08\
+max-rowsy\0\x1f\x04\0\x1a[method]result-stream.next\x01\x20\x01@\x01\x04self\x1c\
+\x01\0\x04\0\x1b[method]result-stream.close\x01!\x01h\x14\x01@\x01\x04self\"\0y\x04\
+\0*[method]prepared-statement.parameter-count\x01#\x01p\x07\x01j\x01\x12\x01\x05\
+\x01@\x02\x04self\"\x06params$\0%\x04\0\"[method]prepared-statement.execute\x01&\
+\x01h\x15\x01j\0\x01\x05\x01@\x02\x04self'\x06values$\0(\x04\0\x1b[method]append\
+er.append-row\x01)\x01@\x01\x04self'\0(\x04\0\x16[method]appender.flush\x01*\x04\
+\0\x16[method]appender.close\x01*\x01ks\x01i\x0c\x01j\x01,\x01s\x01@\x01\x04path\
++\0-\x04\0\x04open\x01.\x01o\x02ss\x01p/\x01@\x02\x04path+\x07options0\0-\x04\0\x10\
+open-with-config\x011\x01@\x01\x04conn,\x01\0\x04\0\x05close\x012\x01h\x0c\x01@\x01\
+\x04conn3\x01\0\x04\0\x09interrupt\x014\x01@\x02\x04conn3\x03sqls\0%\x04\0\x07ex\
+ecute\x015\x01i\x13\x01j\x016\x01\x05\x01@\x02\x04conn3\x03sqls\07\x04\0\x0bopen\
+-stream\x018\x01i\x14\x01j\x019\x01\x05\x01@\x02\x04conn3\x03sqls\0:\x04\0\x07pr\
+epare\x01;\x01j\x01\x19\x01\x05\x01@\x02\x04conn3\x03sqls\0<\x04\0\x0bquery-arro\
+w\x01=\x01i\x15\x01j\x01>\x01\x05\x01@\x03\x04conn3\x06schema+\x05tables\0?\x04\0\
+\x0fcreate-appender\x01@\x01j\x01\x7f\x01s\x01@\x02\x04names\x08requires\x16\0\xc1\
+\0\x04\0\x12register-extension\x01B\x01p\x18\x01@\0\0\xc3\0\x04\0\x1alist-regist\
+ered-extensions\x01D\x01k\x1b\x01@\x04\x06methods\x04paths\x07headerss\x04body\x19\
+\0\xc5\0\x04\0\x11handle-ui-request\x01F\x01k\x19\x01@\x01\x04body\x19\0\xc7\0\x04\
+\0\x14handle-quack-request\x01H\x01p\x0b\x01j\0\x01s\x01@\x04\x04conn3\x04names\x07\
+columns\xc9\0\x0fcallback-handley\0\xca\0\x04\0\x17register-table-function\x01K\x04\
+\0\x19duckdb:component/database\x05%\x02\x03\0\x0a\x0bconfigerror\x01B$\x02\x03\x02\
+\x01&\x04\0\x0bconfigerror\x03\0\0\x01@\0\0s\x04\0\x10provider-version\x01\x02\x01\
+ks\x01ps\x01@\x01\x06prefix\x03\0\x04\x04\0\x09list-keys\x01\x05\x01j\x01\x03\x01\
+\x01\x01@\x01\x04paths\0\x06\x04\0\x0aget-string\x01\x07\x01k\x7f\x01j\x01\x08\x01\
+\x01\x01@\x01\x04paths\0\x09\x04\0\x08get-bool\x01\x0a\x01kx\x01j\x01\x0b\x01\x01\
+\x01@\x01\x04paths\0\x0c\x04\0\x07get-i64\x01\x0d\x01kw\x01j\x01\x0e\x01\x01\x01\
+@\x01\x04paths\0\x0f\x04\0\x07get-u64\x01\x10\x01ku\x01j\x01\x11\x01\x01\x01@\x01\
+\x04paths\0\x12\x04\0\x07get-f64\x01\x13\x01p}\x01k\x14\x01j\x01\x15\x01\x01\x01\
+@\x01\x04paths\0\x16\x04\0\x09get-bytes\x01\x17\x01k\x04\x01j\x01\x18\x01\x01\x01\
+@\x01\x04paths\0\x19\x04\0\x0fget-string-list\x01\x1a\x04\0\x1dduckdb:extension/\
+config@5.0.0\x05'\x02\x03\0\x0a\x08logfield\x02\x03\0\x0a\x08loglevel\x01B\x0a\x02\
+\x03\x02\x01(\x04\0\x08logfield\x03\0\0\x02\x03\x02\x01)\x04\0\x08loglevel\x03\0\
+\x02\x01ks\x01@\x03\x05level\x03\x07messages\x06target\x04\x01\0\x04\0\x03log\x01\
+\x05\x01p\x01\x01@\x03\x05level\x03\x07messages\x06fields\x06\x01\0\x04\0\x0alog\
+-fields\x01\x07\x04\0\x1educkdb:extension/logging@5.0.0\x05*\x02\x03\0\x0a\x07ex\
+topts\x02\x03\0\x0a\x07funcarg\x02\x03\0\x0a\x08funcopts\x02\x03\0\x0a\x08rowbat\
+ch\x01Bf\x02\x03\x02\x01$\x04\0\x0ecapabilitykind\x03\0\0\x02\x03\x02\x01\x17\x04\
+\0\x09duckerror\x03\0\x02\x02\x03\x02\x01\x18\x04\0\x09duckvalue\x03\0\x04\x02\x03\
+\x02\x01+\x04\0\x07extopts\x03\0\x06\x02\x03\x02\x01,\x04\0\x07funcarg\x03\0\x08\
+\x02\x03\x02\x01-\x04\0\x08funcopts\x03\0\x0a\x02\x03\x02\x01\x19\x04\0\x0ainvok\
+einfo\x03\0\x0c\x02\x03\x02\x01\x12\x04\0\x0blogicaltype\x03\0\x0e\x02\x03\x02\x01\
+\x1a\x04\0\x09resultset\x03\0\x10\x02\x03\x02\x01.\x04\0\x08rowbatch\x03\0\x12\x02\
+\x03\x02\x01\x13\x04\0\x09columndef\x03\0\x14\x04\0\x0fscalar-callback\x03\x01\x04\
+\0\x0etable-callback\x03\x01\x04\0\x12aggregate-callback\x03\x01\x04\0\x0fpragma\
+-callback\x03\x01\x04\0\x0dcast-callback\x03\x01\x04\0\x0fscalar-registry\x03\x01\
+\x04\0\x0etable-registry\x03\x01\x04\0\x12aggregate-registry\x03\x01\x04\0\x0fpr\
+agma-registry\x03\x01\x04\0\x0emacro-registry\x03\x01\x01i\x1b\x01i\x1c\x01i\x1d\
 \x01i\x1e\x01i\x1f\x01q\x05\x06scalar\x01\x20\0\x05table\x01!\0\x09aggregate\x01\
 \"\0\x06pragma\x01#\0\x05macro\x01$\0\x04\0\x0acapability\x03\0%\x01i\x16\x01@\x01\
 \x06handley\0'\x04\0\x1c[constructor]scalar-callback\x01(\x01h\x16\x01p\x05\x01j\

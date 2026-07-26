@@ -3241,6 +3241,61 @@ impl exported_database::Guest for Component {
         unsafe { duckdb_quack_free(buf) };
         Some(response)
     }
+
+    // Phase 2 (@5) ATTACH lift. The host mints a callback handle for a
+    // foreign table, calls into here, and later fronts the resulting
+    // `<name>()` table function with a plain `CREATE VIEW`. Bind/init/scan
+    // reuse the same C-API trampolines as extension-declared table functions
+    // (`register_table_function_on_connection` in this file). See
+    // docs/wasm-ecosystem-at-5-adr.md Decision 3 + Amendment A1.
+    //
+    // Registration mirrors `register_pending_table`: push to the global
+    // definition registry, then register on every existing database via a
+    // transient connection (function catalog is database-wide). Accepting
+    // `conn` future-proofs the WIT for a per-database restriction, but
+    // functionally we register everywhere — same semantics as extension
+    // loads. Zero-argument only in v1: the ATTACH intercept always calls the
+    // function as `SELECT * FROM __alias_table()` — no VALUES-style args.
+    fn register_table_function(
+        _conn: ConnectionBorrow<'_>,
+        name: String,
+        columns: Vec<exported_database::ColumnDescriptor>,
+        callback_handle: u32,
+    ) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("table function name cannot be empty".to_string());
+        }
+        if columns.is_empty() {
+            return Err(
+                "table function must define at least one column".to_string(),
+            );
+        }
+        let id = NEXT_TABLE_FUNCTION_ID.fetch_add(1, Ordering::Relaxed);
+        let definition = Arc::new(TableFunctionDefinition {
+            id,
+            name,
+            arguments: Vec::new(),
+            columns: columns
+                .into_iter()
+                .map(|c| Columndef {
+                    name: c.name,
+                    logical: c.ty,
+                })
+                .collect(),
+            callback_handle,
+            options: None,
+        });
+
+        push_table_function_definition(definition.clone());
+        if let Err(err) = register_table_function_with_existing_connections(&definition) {
+            let mut defs = table_function_definitions()
+                .lock()
+                .expect("table function registry mutex poisoned");
+            defs.retain(|entry| entry.id != id);
+            return Err(format_duckerror(&err));
+        }
+        Ok(())
+    }
 }
 
 #[no_mangle]
