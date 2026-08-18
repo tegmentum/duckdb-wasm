@@ -3355,6 +3355,7 @@ fn process_pending_registrations(
         && pending.tables.is_empty()
         && pending.aggregates.is_empty()
         && pending.macros.is_empty()
+        && pending.table_macros.is_empty()
     {
         clog!("[duckdb-core] no registrations returned for '{extension}'");
     }
@@ -3388,6 +3389,15 @@ fn process_pending_registrations(
         // "extension loading disabled" error). Log and continue.
         if let Err(err) = register_pending_macro(entry) {
             clog!("[duckdb-core] macro registration failed (continuing): {err:?}");
+        }
+    }
+    for entry in pending.table_macros.into_iter().collect::<Vec<_>>() {
+        // Table-macro failures share the "log and continue" discipline of
+        // scalar macros — same underlying reason: an extension load that
+        // returns false through the loader hook surfaces as the unrelated
+        // "extension loading disabled" error.
+        if let Err(err) = register_pending_table_macro(entry) {
+            clog!("[duckdb-core] table-macro registration failed (continuing): {err:?}");
         }
     }
     for entry in pending.replacement_scans.into_iter().collect::<Vec<_>>() {
@@ -3849,6 +3859,51 @@ fn build_create_macro_sql(
     }
     sql.push_str(") AS (");
     sql.push_str(definition_sql);
+    sql.push(')');
+    sql
+}
+
+/// Table-macro sibling of `register_pending_macro`. Emits `CREATE OR
+/// REPLACE MACRO name(params) AS TABLE (body-sql)` — same catalog
+/// registration path (transient connection per active database) as
+/// scalar macros, distinguished by the `AS TABLE (...)` DDL suffix
+/// which turns DuckDB's macro binder into a relation-producing
+/// (from-clause-legal) macro instead of a scalar one.
+fn register_pending_table_macro(
+    entry: extension_loader_hooks::TableMacroRegistration,
+) -> Result<(), Duckerror> {
+    let extension_loader_hooks::TableMacroRegistration {
+        schema,
+        name,
+        parameters,
+        body_sql,
+    } = entry;
+    let parameters: Vec<String> = parameters.into_iter().collect();
+    let sql = build_create_table_macro_sql(&schema, &name, &parameters, &body_sql);
+    create_macro_on_active_databases(&name, &sql)
+}
+
+fn build_create_table_macro_sql(
+    schema: &str,
+    name: &str,
+    parameters: &[String],
+    body_sql: &str,
+) -> String {
+    let mut sql = String::from("CREATE OR REPLACE MACRO ");
+    if !schema.is_empty() {
+        sql.push_str(&quote_ident(schema));
+        sql.push('.');
+    }
+    sql.push_str(&quote_ident(name));
+    sql.push('(');
+    for (idx, param) in parameters.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_ident(param));
+    }
+    sql.push_str(") AS TABLE (");
+    sql.push_str(body_sql);
     sql.push(')');
     sql
 }
