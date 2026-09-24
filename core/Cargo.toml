@@ -28,10 +28,13 @@ siphasher = { version = "1.0.3", optional = true }
 # core as a native scalar -- no WIT boundary) lives in this crate. The shipped
 # build embeds nothing (the embed-* features are off by default), so the repo
 # still ships pure DuckDB. The embeddable algorithms here are INLINED (no
-# path-deps back into ducklink/extensions): aba_validate + fnv1a_64 are tiny and
-# copied byte-for-byte from their components; siphash uses the `siphasher` crate.
-# These features exist to produce the near-native "embedded" cells of the
-# native-vs-wasm benchmark matrix (benches/native-vs-wasm in ducklink).
+# path-deps back into wasmos/ducklink/extensions): aba_validate + fnv1a_64 are
+# tiny and copied byte-for-byte from their components; siphash uses the
+# `siphasher` crate. These features exist to produce the near-native "embedded"
+# cells of the native-vs-wasm benchmark matrix (benches/native-vs-wasm in
+# ducklink). Path note: wasm extension crates moved to
+# ~/git/wasmos/ducklink/extensions/ during the 2026-09-24 partial extract;
+# the native ducklink repo at ~/git/ducklink/ still owns benches/.
 
 [features]
 default = ["wasi"]
